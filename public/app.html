@@ -3,21 +3,21 @@
 <head>
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1" />
-  <title>Bench · DecoClub Pro</title>
+  <title>Floor · DecoClub Pro</title>
   <link rel="icon" href="/logo.svg" />
-  <link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Sans:wght@400;500;700&family=Syne:wght@700&display=swap" rel="stylesheet" />
+  <link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Sans:wght@400;500;600;700&family=IBM+Plex+Serif:wght@600&display=swap" rel="stylesheet" />
   <link rel="stylesheet" href="/styles.css" />
 </head>
 <body>
-  <div class="metal-bar"></div>
   <div class="app-shell">
     <aside class="side">
-      <a class="brand" href="/" style="margin-bottom:22px"><img src="/logo.svg" alt="" id="sideLogo" /> <span id="sideName">DECOCLUB PRO</span></a>
-      <button class="linkish active" data-view="jobs">Jobs</button>
-      <button class="linkish" data-view="new" id="navNew">New job</button>
+      <a class="brand" href="/" style="margin-bottom:14px"><img src="/logo.svg" alt="" id="sideLogo" /> <span id="sideName">DECOCLUB PRO</span></a>
+      <button class="linkish active" data-view="board">Board</button>
+      <button class="linkish" data-view="intake">Intake</button>
+      <button class="linkish" data-view="job" id="navJob" style="display:none">Open job</button>
       <button class="linkish" data-view="clients" id="navClients">Clients</button>
       <button class="linkish" data-view="settings">Settings</button>
-      <p class="muted" id="who" style="margin-top:28px;font-size:12px"></p>
+      <p class="muted" id="who" style="margin-top:auto;font-size:12px;padding:10px"></p>
       <button class="btn ghost small" id="logout">Log out</button>
     </aside>
     <main class="main" id="main"></main>

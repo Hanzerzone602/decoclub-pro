@@ -3,95 +3,70 @@
 <head>
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1" />
-  <title>DecoClub Pro — Shop production OS</title>
+  <title>DecoClub Pro — Shop operating system</title>
   <link rel="icon" href="/logo.svg" />
-  <link rel="preconnect" href="https://fonts.googleapis.com" />
-  <link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Sans:wght@400;500;600;700&family=Syne:wght@600;700;800&display=swap" rel="stylesheet" />
+  <link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Sans:wght@400;500;700&family=IBM+Plex+Serif:wght@600&display=swap" rel="stylesheet" />
   <link rel="stylesheet" href="/styles.css" />
 </head>
 <body>
-  <div class="metal-bar"></div>
   <header class="topbar">
     <a class="brand" href="/"><img src="/logo.svg" alt="" /> DECOCLUB PRO</a>
     <nav class="nav">
-      <a href="#work">Bench</a>
-      <a href="#exports">Handoff</a>
+      <a href="#floor">Floor</a>
+      <a href="#methods">Methods</a>
       <a href="#plans">Membership</a>
       <a href="/login.html">Log in</a>
-      <a class="btn small" href="/signup.html">Start free week</a>
+      <a class="btn small" href="/signup.html">Open a shop</a>
     </nav>
   </header>
-
   <section class="hero">
     <div>
-      <div class="kicker">Artwork · mockup · price · proof · cut</div>
-      <h1>The shop OS<br>that hits steel.</h1>
-      <p class="lede">DecoClub Pro takes a file from the inbox to the machine. Intake art, drop it on a blank, price the run, send a branded proof, then export real cut contours, gang sheets, and laser packets — not placeholders.</p>
+      <div class="kicker">Artwork · mockup · price · proof · produce</div>
+      <h1>One floor for every deco method you actually run.</h1>
+      <p class="lede">DecoClub Pro is a shop operating system: intake a file, drop it on a blank, price the run, send a client proof, then hand the machine real cut contours, gang sheets, laser packets, and tickets. DTF, vinyl, laser, UV, embroidery notes, sublimation, rhinestone, stickers, signs, apparel, hard goods.</p>
       <div class="cta-row">
-        <a class="btn" href="/signup.html">Open a shop account</a>
-        <a class="btn ghost" href="/login.html">Use the demo bench</a>
+        <a class="btn" href="/signup.html">Create shop account</a>
+        <a class="btn ghost" href="/login.html">Log in</a>
       </div>
-      <p class="muted" style="margin-top:14px;font-size:13px">Demo shop: owner@anvil.local / anvil123 · Client: client@anvil.local / anvil123</p>
+      <p class="muted" id="demoHint" style="margin-top:14px;font-size:13px"></p>
     </div>
     <div class="product-card">
       <div class="window">
-        <div class="window-top"><span class="dot"></span><span class="dot"></span><span class="dot"></span></div>
-        <div class="job-grid">
-          <div class="tile">
-            <span class="chip">Apparel · live</span>
-            <p style="margin:10px 0 0;font-family:Syne,sans-serif;font-size:26px;letter-spacing:-.03em">Forge mark tees</p>
-            <p class="muted">10×10 in · qty 24 · proof mockup on chest</p>
-          </div>
-          <div class="tile">
-            <span class="chip">Ready to cut</span>
-            <p class="muted">Traced SVG contour, 22in DTF gang, HPGL for the laser, sticker offset 1.5mm. Client tap-approves.</p>
-          </div>
-        </div>
+        <p class="kicker">Stations</p>
+        <p style="margin:8px 0 0;font-family:IBM Plex Serif,serif;font-size:22px">Intake → Art → Mockup → Price → Approve → Produce → Deliver</p>
+        <p class="muted">Booth poster with proof link. Packet: cut-contour, laser SVG/PLT, 22in gang, sticker cutline, cutter marks, job ticket.</p>
       </div>
     </div>
   </section>
-
-  <section class="section" id="work">
-    <h2>One job. Connected steel.</h2>
+  <section class="section" id="floor">
+    <h2>The whole loop, on one bench.</h2>
     <div class="grid-3">
-      <article class="card"><h3>Intake</h3><p>Create a job, attach art, pick DTF, UV DTF, laser, sticker, hat, apparel, or patch. Area pricing with volume breaks.</p></article>
-      <article class="card"><h3>Mockup &amp; proof</h3><p>Art lands on a generated blank — tee chest, hat front, tumbler wrap, plaque, or vinyl sheet. Clients approve on a branded page.</p></article>
-      <article class="card"><h3>Handoff</h3><p>Download a production packet with real numbers plus SVG cut paths, PLT, and N-up gang sheets for a 22 inch roll.</p></article>
+      <article class="card"><h3>Intake</h3><p>New job, client, due date, booth poster, unguessable proof URL.</p></article>
+      <article class="card"><h3>Art &amp; mockup</h3><p>Upload, replace, knockout, color swap. Blanks: tee, hoodie, hat, tumbler, plaque, sticker, sign, hoop.</p></article>
+      <article class="card"><h3>Price &amp; produce</h3><p>Line items, margin, live total. Machine files per method — not a fake paid plan.</p></article>
     </div>
   </section>
-
-  <section class="section" id="exports">
-    <h2>Exports that are files, not fiction.</h2>
+  <section class="section" id="methods">
+    <h2>Methods on the board</h2>
     <div class="grid-3">
-      <article class="card"><h3>Cut contour</h3><p>Raster art is thresholded and traced (Moore / marching squares) into an SVG path sized in inches.</p></article>
-      <article class="card"><h3>Laser + PLT</h3><p>Same contour as SVG plus an HPGL-style .plt with PU/PD commands in plotter units.</p></article>
-      <article class="card"><h3>Gang &amp; sticker</h3><p>N-up on a 22in sheet with 0.125in gaps, labeled by job and qty. Sticker cutline offset ~1.5mm.</p></article>
+      <article class="card"><h3>Print &amp; film</h3><p>DTF gang sheets, UV / UV-DTF notes, sublimation wrap placement.</p></article>
+      <article class="card"><h3>Cut &amp; engrave</h3><p>Vinyl contour, sticker cutline, cutter marks, laser SVG + HPGL PLT.</p></article>
+      <article class="card"><h3>Soft &amp; hard goods</h3><p>Apparel, hats, patches, signs, plaques, embroidery and rhinestone notes when a stitch/stone engine is not attached.</p></article>
     </div>
   </section>
-
   <section class="section" id="plans">
-    <h2>Memberships</h2>
+    <h2>Membership</h2>
     <div class="plans">
-      <div class="plan">
-        <div class="kicker">Trial</div>
-        <div class="price">$0 <span>/ 7 days</span></div>
-        <p class="muted">Full bench. Checkout is ready — billing connects when Stripe keys are set.</p>
-      </div>
-      <div class="plan featured">
-        <div class="kicker">Shop</div>
-        <div class="price">$79 <span>/ month</span></div>
-        <p class="muted">Jobs, clients, proofs, true machine exports. One location.</p>
-      </div>
-      <div class="plan">
-        <div class="kicker">Studio</div>
-        <div class="price">$149 <span>/ month</span></div>
-        <p class="muted">Everything in Shop, plus room for brand kit, extra seats, and later storefronts.</p>
-      </div>
+      <div class="plan"><div class="kicker">Trial</div><div class="price">$0 <span>/ 7 days</span></div><p class="muted">Full floor. Checkout only when Stripe keys are set — we will not fake a paid plan.</p></div>
+      <div class="plan featured"><div class="kicker">Shop</div><div class="price">$79 <span>/ month</span></div><p class="muted">Jobs, clients, proofs, production packets. One location.</p></div>
+      <div class="plan"><div class="kicker">Studio</div><div class="price">$149 <span>/ month</span></div><p class="muted">Shop plus room for brand kit and extra seats later.</p></div>
     </div>
   </section>
-
-  <footer>
-    DecoClub Pro is an original shop production OS. Placeholder name and mark until the final brand lands. Not affiliated with other print platforms.
-  </footer>
+  <footer>DecoClub Pro. Original shop OS. Not affiliated with other print platforms.</footer>
+  <script>
+    fetch("/api/config").then(r => r.json()).then(c => {
+      if (c.demo && c.seed) document.getElementById("demoHint").textContent = "Seed: " + c.seed.owner + " and " + c.seed.client + " / " + c.seed.password;
+    }).catch(() => {});
+  </script>
 </body>
 </html>
