@@ -17,6 +17,7 @@ const DATA = process.env.DATA_DIR ? path.resolve(process.env.DATA_DIR) : path.jo
 const UPLOADS = path.join(DATA, "uploads");
 const EXPORTS = path.join(DATA, "exports");
 const DB_PATH = path.join(DATA, "store.json");
+fs.mkdirSync(DATA, { recursive: true });
 fs.mkdirSync(UPLOADS, { recursive: true });
 fs.mkdirSync(EXPORTS, { recursive: true });
 
