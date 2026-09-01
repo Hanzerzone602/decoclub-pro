@@ -1,0 +1,46 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Proof · DecoClub Pro</title>
+  <link rel="icon" href="/logo.svg" />
+  <link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Sans:wght@400;600;700&family=Syne:wght@700&display=swap" rel="stylesheet" />
+  <link rel="stylesheet" href="/styles.css" />
+</head>
+<body>
+  <div class="metal-bar"></div>
+  <header class="topbar">
+    <a class="brand" href="/"><img src="/logo.svg" id="logo" alt="" /> <span id="shopName">Proof</span></a>
+  </header>
+  <main class="main" id="main" style="max-width:820px;margin:0 auto"></main>
+  <script>
+    const t = new URLSearchParams(location.search).get("t");
+    const main = document.getElementById("main");
+    (async () => {
+      const res = await fetch("/api/proof/" + t);
+      const data = await res.json();
+      if (!res.ok) { main.innerHTML = "<p>Proof not found.</p>"; return; }
+      const { job, shop } = data;
+      document.getElementById("shopName").textContent = shop.name;
+      if (shop.logo_path) document.getElementById("logo").src = shop.logo_path;
+      document.documentElement.style.setProperty("--copper", shop.brand_color || "#d4783c");
+      const preview = job.mockup_path
+        ? `<img src="${job.mockup_path}" alt="Product mockup" />`
+        : (job.file_path ? `<img src="${job.file_path}" alt="" />` : "No preview file");
+      main.innerHTML = `
+        <p class="kicker">Customer proof</p>
+        <h1 style="font-size:40px;margin:8px 0">${job.title}</h1>
+        <p class="muted">${job.method} · ${job.width_in}×${job.height_in} in · qty ${job.qty} · $${Number(job.total).toFixed(2)}</p>
+        <div class="preview" style="margin:20px 0">${preview}</div>
+        <p>This is a placement mockup, not a raw dump of the file. Approve only if size, colors, and placement are correct. Approval locks the job for production.</p>
+        <button class="btn" id="ok">Approve this proof</button>
+        <p id="done" class="muted"></p>`;
+      document.getElementById("ok").onclick = async () => {
+        await fetch("/api/proof/" + t + "/approve", { method: "POST" });
+        document.getElementById("done").textContent = "Approved. The shop can start production.";
+      };
+    })();
+  </script>
+</body>
+</html>

@@ -1,0 +1,14 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 64 64" role="img" aria-label="DecoClub Pro">
+  <defs>
+    <linearGradient id="horn" x1="8" y1="10" x2="56" y2="44" gradientUnits="userSpaceOnUse">
+      <stop offset="0" stop-color="#f0c090"/>
+      <stop offset="1" stop-color="#c56a2e"/>
+    </linearGradient>
+  </defs>
+  <rect width="64" height="64" rx="14" fill="#14161b"/>
+  <path d="M12 28h28c6 0 12-3 16-8-8 2-12 2-16 2H22c-4 0-7 3-10 6z" fill="url(#horn)"/>
+  <path d="M18 30h28l-3 8H22l-4-8z" fill="#8a4a24"/>
+  <path d="M24 38h16v6H24z" fill="#6a381c"/>
+  <path d="M22 44h20l2 6H20l2-6z" fill="#3d2a1c"/>
+  <circle cx="50" cy="16" r="3" fill="#3d9b8a"/>
+</svg>

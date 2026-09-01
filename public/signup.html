@@ -1,0 +1,50 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Start · DecoClub Pro</title>
+  <link rel="icon" href="/logo.svg" />
+  <link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Sans:wght@400;600;700&family=Syne:wght@700&display=swap" rel="stylesheet" />
+  <link rel="stylesheet" href="/styles.css" />
+</head>
+<body>
+  <div class="metal-bar"></div>
+  <header class="topbar">
+    <a class="brand" href="/"><img src="/logo.svg" alt="" /> DECOCLUB PRO</a>
+  </header>
+  <form class="auth-box" id="form">
+    <div class="kicker">Seven-day trial</div>
+    <h1 style="font-size:32px;margin:0">Open DecoClub Pro</h1>
+    <label>Your name</label>
+    <input name="name" required />
+    <label>Shop name</label>
+    <input name="shopName" placeholder="Westside Press" />
+    <label>Email</label>
+    <input name="email" type="email" required />
+    <label>Password</label>
+    <input name="password" type="password" minlength="6" required />
+    <label>Account type</label>
+    <select name="role">
+      <option value="shop">Shop (membership)</option>
+      <option value="client">Client (proofs only)</option>
+    </select>
+    <p class="notice" id="err"></p>
+    <button class="btn" type="submit">Create account</button>
+  </form>
+  <script>
+    document.getElementById("form").onsubmit = async (e) => {
+      e.preventDefault();
+      const fd = new FormData(e.target);
+      const res = await fetch("/api/signup", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(Object.fromEntries(fd.entries())),
+      });
+      const data = await res.json();
+      if (!res.ok) { document.getElementById("err").textContent = data.error; return; }
+      location.href = "/app.html";
+    };
+  </script>
+</body>
+</html>
