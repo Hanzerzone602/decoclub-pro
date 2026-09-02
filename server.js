@@ -64,17 +64,35 @@ function ensureSettings(db) {
   if (db.settings.studio_price_cents == null) db.settings.studio_price_cents = 14900;
   return db.settings;
 }
-function ensureAdmin(db) {
-  if ((db.users || []).some(function (u) { return u.role === "admin"; })) return false;
-  const email = String(process.env.ADMIN_EMAIL || "david@coreltrainer.com").toLowerCase();
+function ensureAdminShop(db, user) {
+  if (!user || user.role !== "admin") return false;
+  if (user.shop_id && (db.shops || []).some(function (s) { return s.id === user.shop_id; })) return false;
   const now = new Date().toISOString();
-  const password = process.env.ADMIN_PASSWORD || Buffer.from("4463502d755f75524e6f4e6c6a5a483350453163", "hex").toString("utf8");
-  db.users.push({
-    id: uid(), email: email, name: email === "david@coreltrainer.com" ? "David Hanes" : "Admin",
-    password_hash: hashPass(password), role: "admin", shop_id: null,
-    plan: "studio", plan_expires: null, created_at: now,
-  });
+  const shop = { id: uid(), name: "My shop", logo_path: null, brand_color: "#c9b896", margin_pct: 20, created_at: now };
+  db.shops.push(shop);
+  user.shop_id = shop.id;
   return true;
+}
+function ensureAdmin(db) {
+  let dirty = false;
+  if (!(db.users || []).some(function (u) { return u.role === "admin"; })) {
+    const email = String(process.env.ADMIN_EMAIL || "david@coreltrainer.com").toLowerCase();
+    const now = new Date().toISOString();
+    const password = process.env.ADMIN_PASSWORD || Buffer.from("4463502d755f75524e6f4e6c6a5a483350453163", "hex").toString("utf8");
+    db.users.push({
+      id: uid(), email: email, name: email === "david@coreltrainer.com" ? "David Hanes" : "Admin",
+      password_hash: hashPass(password), role: "admin", shop_id: null,
+      plan: "studio", plan_expires: null, created_at: now,
+    });
+    dirty = true;
+  }
+  (db.users || []).forEach(function (u) {
+    if (ensureAdminShop(db, u)) dirty = true;
+  });
+  return dirty;
+}
+function canRunFloor(user) {
+  return !!(user && (user.role === "shop" || (user.role === "admin" && user.shop_id)));
 }
 function requireAdmin(user, res) {
   if (!user || user.role !== "admin") {
@@ -266,7 +284,7 @@ function event(db, job, message) {
 }
 function canSeeJob(user, job) {
   if (!user || !job) return false;
-  if (user.role === "shop") return job.shop_id === user.shop_id;
+  if (canRunFloor(user)) return job.shop_id === user.shop_id;
   return job.client_id === user.id;
 }
 function download(res, filename, body, type) {
@@ -319,6 +337,7 @@ async function handleApi(req, res, url) {
     const body = parseJsonBody(await readBody(req));
     const u = db.users.find(function (x) { return x.email === String(body.email || "").toLowerCase(); });
     if (!u || !checkPass(body.password || "", u.password_hash)) return json(res, 401, { error: "Invalid email or password" });
+    if (ensureAdminShop(db, u)) save(db);
     const token = uid();
     db.sessions.push({ token: token, user_id: u.id, created_at: new Date().toISOString() });
     save(db); setSession(res, token, req);
@@ -335,7 +354,7 @@ async function handleApi(req, res, url) {
     return json(res, 200, { shop: db.shops.find(function (s) { return s.id === user.shop_id; }) || null, billing: billingConfigured() });
   }
   if (pth === "/api/shop" && method === "POST") {
-    if (!user || user.role !== "shop") return json(res, 403, { error: "Shop login required" });
+    if (!canRunFloor(user)) return json(res, 403, { error: "Shop login required" });
     const parsed = String(req.headers["content-type"] || "").indexOf("multipart") !== -1 ? parseMultipart(await readBody(req), req.headers["content-type"]) : { fields: parseJsonBody(await readBody(req)), file: null };
     const shop = db.shops.find(function (s) { return s.id === user.shop_id; });
     if (parsed.fields.name) shop.name = parsed.fields.name;
@@ -346,7 +365,7 @@ async function handleApi(req, res, url) {
     return json(res, 200, { shop: shop });
   }
   if ((pth === "/api/plan" || pth === "/api/billing/checkout") && method === "POST") {
-    if (!user || user.role !== "shop") return json(res, 403, { error: "Shop login required" });
+    if (!canRunFloor(user)) return json(res, 403, { error: "Shop login required" });
     if (!billingConfigured()) return json(res, 501, { error: "Billing not configured" });
     if (pth === "/api/plan") return json(res, 400, { error: "Use checkout. Plan updates after Stripe webhook." });
     const body = parseJsonBody(await readBody(req));
@@ -369,14 +388,14 @@ async function handleApi(req, res, url) {
     return json(res, 200, { received: true });
   }
   if (pth === "/api/clients" && method === "GET") {
-    if (!user || user.role !== "shop") return json(res, 403, { error: "Shop login required" });
+    if (!canRunFloor(user)) return json(res, 403, { error: "Shop login required" });
     const clients = db.users.filter(function (u) { return u.shop_id === user.shop_id && u.role === "client"; }).map(function (u) {
       return { id: u.id, email: u.email, name: u.name, role: u.role, created_at: u.created_at, jobs: db.jobs.filter(function (j) { return j.client_id === u.id; }).length };
     });
     return json(res, 200, { clients: clients });
   }
   if (pth === "/api/clients" && method === "POST") {
-    if (!user || user.role !== "shop") return json(res, 403, { error: "Shop login required" });
+    if (!canRunFloor(user)) return json(res, 403, { error: "Shop login required" });
     const body = parseJsonBody(await readBody(req));
     if (!body.email || !body.name) return json(res, 400, { error: "Name and email required" });
     const email = String(body.email).toLowerCase();
@@ -387,7 +406,7 @@ async function handleApi(req, res, url) {
   }
   if (pth === "/api/jobs" && method === "GET") {
     if (!user) return json(res, 401, { error: "Sign in required" });
-    let jobs = user.role === "shop" ? db.jobs.filter(function (j) { return j.shop_id === user.shop_id; }) : db.jobs.filter(function (j) { return j.client_id === user.id; });
+    let jobs = canRunFloor(user) ? db.jobs.filter(function (j) { return j.shop_id === user.shop_id; }) : db.jobs.filter(function (j) { return j.client_id === user.id; });
     const q = (url.searchParams.get("q") || "").toLowerCase();
     const st = url.searchParams.get("status");
     const cid = url.searchParams.get("client_id");
@@ -398,7 +417,7 @@ async function handleApi(req, res, url) {
     return json(res, 200, { jobs: jobs.map(function (j) { return presentJob(j, req); }) });
   }
   if (pth === "/api/jobs" && method === "POST") {
-    if (!user || user.role !== "shop") return json(res, 403, { error: "Shop login required" });
+    if (!canRunFloor(user)) return json(res, 403, { error: "Shop login required" });
     const raw = await readBody(req);
     const parsed = String(req.headers["content-type"] || "").indexOf("multipart") !== -1 ? parseMultipart(raw, req.headers["content-type"]) : { fields: parseJsonBody(raw), file: null };
     const f = parsed.fields;
@@ -430,7 +449,7 @@ async function handleApi(req, res, url) {
     return json(res, 200, { job: presentJob(job, req), events: db.events.filter(function (e) { return e.job_id === job.id; }) });
   }
   if (jobGet && method === "POST") {
-    if (!user || user.role !== "shop") return json(res, 403, { error: "Shop login required" });
+    if (!canRunFloor(user)) return json(res, 403, { error: "Shop login required" });
     const job = db.jobs.find(function (j) { return j.id === jobGet[1] && j.shop_id === user.shop_id; });
     if (!job) return json(res, 404, { error: "Job not found" });
     const body = parseJsonBody(await readBody(req));
@@ -449,7 +468,7 @@ async function handleApi(req, res, url) {
 
   const art = pth.match(/^\/api\/jobs\/([^/]+)\/artwork$/);
   if (art && method === "POST") {
-    if (!user || user.role !== "shop") return json(res, 403, { error: "Shop login required" });
+    if (!canRunFloor(user)) return json(res, 403, { error: "Shop login required" });
     const job = db.jobs.find(function (j) { return j.id === art[1] && j.shop_id === user.shop_id; });
     if (!job) return json(res, 404, { error: "Job not found" });
     const parsed = parseMultipart(await readBody(req), req.headers["content-type"]);
@@ -461,7 +480,7 @@ async function handleApi(req, res, url) {
   }
   const ops = pth.match(/^\/api\/jobs\/([^/]+)\/artops$/);
   if (ops && method === "POST") {
-    if (!user || user.role !== "shop") return json(res, 403, { error: "Shop login required" });
+    if (!canRunFloor(user)) return json(res, 403, { error: "Shop login required" });
     const job = db.jobs.find(function (j) { return j.id === ops[1] && j.shop_id === user.shop_id; });
     if (!job || !job.file_path) return json(res, 400, { error: "PNG artwork required for knockout / color swap" });
     const abs = path.join(UPLOADS, path.basename(job.file_path));
@@ -478,7 +497,7 @@ async function handleApi(req, res, url) {
   }
   const mk = pth.match(/^\/api\/jobs\/([^/]+)\/mockup$/);
   if (mk && method === "POST") {
-    if (!user || user.role !== "shop") return json(res, 403, { error: "Shop login required" });
+    if (!canRunFloor(user)) return json(res, 403, { error: "Shop login required" });
     const job = db.jobs.find(function (j) { return j.id === mk[1] && j.shop_id === user.shop_id; });
     if (!job) return json(res, 404, { error: "Job not found" });
     const body = parseJsonBody(await readBody(req));
@@ -501,7 +520,7 @@ async function handleApi(req, res, url) {
   }
   const pr = pth.match(/^\/api\/jobs\/([^/]+)\/price$/);
   if (pr && method === "POST") {
-    if (!user || user.role !== "shop") return json(res, 403, { error: "Shop login required" });
+    if (!canRunFloor(user)) return json(res, 403, { error: "Shop login required" });
     const job = db.jobs.find(function (j) { return j.id === pr[1] && j.shop_id === user.shop_id; });
     if (!job) return json(res, 404, { error: "Job not found" });
     const body = parseJsonBody(await readBody(req));
@@ -523,7 +542,7 @@ async function handleApi(req, res, url) {
     if (!job) return json(res, 404, { error: "Job not found" });
     const body = parseJsonBody(await readBody(req));
     const next = mapLegacyStatus(body.status);
-    if (user.role === "shop") {
+    if (canRunFloor(user)) {
       if (job.shop_id !== user.shop_id) return json(res, 403, { error: "Forbidden" });
     } else if (job.client_id !== user.id || next !== "approved") {
       return json(res, 403, { error: "Clients can only approve" });
@@ -577,7 +596,7 @@ async function handleApi(req, res, url) {
 
   const poster = pth.match(/^\/api\/export\/([^/]+)\/intake-poster.svg$/);
   if (poster && method === "GET") {
-    if (!user || user.role !== "shop") return json(res, 403, { error: "Shop login required" });
+    if (!canRunFloor(user)) return json(res, 403, { error: "Shop login required" });
     const job = db.jobs.find(function (j) { return j.id === poster[1] && j.shop_id === user.shop_id; });
     if (!job) return json(res, 404, { error: "Job not found" });
     const shop = db.shops.find(function (s) { return s.id === user.shop_id; });
@@ -585,7 +604,7 @@ async function handleApi(req, res, url) {
   }
   const expFile = pth.match(/^\/api\/export\/([^/]+)\/([^/]+)$/);
   if (expFile && method === "GET") {
-    if (!user || user.role !== "shop") return json(res, 403, { error: "Shop login required" });
+    if (!canRunFloor(user)) return json(res, 403, { error: "Shop login required" });
     const job = db.jobs.find(function (j) { return j.id === expFile[1] && j.shop_id === user.shop_id; });
     if (!job) return json(res, 404, { error: "Job not found" });
     job._shop = db.shops.find(function (s) { return s.id === user.shop_id; });
@@ -598,7 +617,7 @@ async function handleApi(req, res, url) {
   }
   const exp = pth.match(/^\/api\/export\/([^/]+)$/);
   if (exp && method === "GET") {
-    if (!user || user.role !== "shop") return json(res, 403, { error: "Shop login required" });
+    if (!canRunFloor(user)) return json(res, 403, { error: "Shop login required" });
     const job = db.jobs.find(function (j) { return j.id === exp[1] && j.shop_id === user.shop_id; });
     if (!job) return json(res, 404, { error: "Job not found" });
     job._shop = db.shops.find(function (s) { return s.id === user.shop_id; });

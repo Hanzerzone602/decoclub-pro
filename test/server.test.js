@@ -2,6 +2,7 @@
 const assert = require("assert");
 const http = require("http");
 const { spawn } = require("child_process");
+const crypto = require("crypto");
 const fs = require("fs");
 const os = require("os");
 const path = require("path");
@@ -72,11 +73,23 @@ function stop(child) {
     assert.strictEqual(loginPage.status, 200);
     assert.ok(loginPage.text.indexOf("DecoClub Pro") !== -1);
     assert.ok(loginPage.text.indexOf("owner@anvil.local") === -1);
+    assert.ok(loginPage.text.indexOf("/admin.html") === -1);
+    assert.ok(loginPage.text.indexOf("/app.html") !== -1);
+    const appPage = await req(port, "GET", "/app.html");
+    assert.strictEqual(appPage.status, 200);
+    assert.ok(appPage.text.indexOf("data-view=\"make\"") !== -1);
+    assert.ok(appPage.text.indexOf("Office") !== -1);
+    const appJs = await req(port, "GET", "/app.js");
+    assert.ok(appJs.text.indexOf("Drop your art here") !== -1);
+    assert.ok(appJs.text.indexOf("or tap to pick a file") !== -1);
     const cfg = await req(port, "GET", "/api/config");
     assert.strictEqual(cfg.json.demo, false);
     const store = JSON.parse(fs.readFileSync(path.join(s.dir, "store.json"), "utf8"));
     assert.strictEqual(store.users.length, 1);
     assert.strictEqual(store.users[0].role, "admin");
+    assert.ok(store.users[0].shop_id);
+    assert.strictEqual(store.shops.length, 1);
+    assert.strictEqual(store.shops[0].name, "My shop");
     assert.ok(store.users[0].password_hash.indexOf(":") > 0);
     assert.strictEqual(store.settings.trial_days, 7);
     assert.strictEqual(store.settings.shop_price_cents, 7900);
@@ -167,7 +180,17 @@ function stop(child) {
     assert.strictEqual(adminLogin.status, 200);
     assert.strictEqual(adminLogin.json.user.role, "admin");
     assert.strictEqual(adminLogin.json.user.name, "David Hanes");
+    assert.ok(adminLogin.json.user.shopId);
     const cookie = String(adminLogin.headers["set-cookie"] || "").split(";")[0];
+    const adminJob = await req(port3, "POST", "/api/jobs", {
+      headers: { "Content-Type": "application/json", Cookie: cookie },
+      body: JSON.stringify({ title: "Admin drop", method: "apparel", width_in: 10, height_in: 10, qty: 1 }),
+    });
+    assert.strictEqual(adminJob.status, 200);
+    assert.strictEqual(adminJob.json.job.method, "apparel");
+    const adminJobs = await req(port3, "GET", "/api/jobs", { headers: { Cookie: cookie } });
+    assert.strictEqual(adminJobs.status, 200);
+    assert.ok(adminJobs.json.jobs.some(function (j) { return j.title === "Admin drop"; }));
     const settings = await req(port3, "GET", "/api/admin/settings", { headers: { Cookie: cookie } });
     assert.strictEqual(settings.status, 200);
     assert.strictEqual(settings.json.settings.shop_price_cents, 7900);
@@ -202,6 +225,8 @@ function stop(child) {
     const page = await req(port3, "GET", "/admin.html");
     assert.strictEqual(page.status, 200);
     assert.ok(page.text.indexOf("admin.js") !== -1);
+    assert.ok(page.text.indexOf("Make something") !== -1);
+    assert.ok(page.text.indexOf("/app.html") !== -1);
     const envPort = 41239;
     const s4 = startServer({ PORT: String(envPort), NODE_ENV: "production", ALLOW_DEMO: "0", ADMIN_EMAIL: "ops@decoclub.test" });
     try {
@@ -219,5 +244,45 @@ function stop(child) {
   } finally {
     await stop(s3.child);
   }
+
+  const portLegacy = 41240;
+  const dirLegacy = fs.mkdtempSync(path.join(os.tmpdir(), "dcp-legacy-"));
+  const adminPwLegacy = Buffer.from("4463502d755f75524e6f4e6c6a5a483350453163", "hex").toString("utf8");
+  const salt = crypto.randomBytes(16).toString("hex");
+  const hash = salt + ":" + crypto.scryptSync(adminPwLegacy, salt, 32).toString("hex");
+  fs.writeFileSync(path.join(dirLegacy, "store.json"), JSON.stringify({
+    shops: [], users: [{
+      id: "admin-legacy", email: "david@coreltrainer.com", name: "David Hanes",
+      password_hash: hash, role: "admin", shop_id: null, plan: "studio", plan_expires: null,
+      created_at: new Date().toISOString(),
+    }], sessions: [], jobs: [], events: [],
+    settings: { trial_days: 7, shop_price_cents: 7900, studio_price_cents: 14900 },
+  }, null, 2));
+  const childLegacy = spawn(process.execPath, ["server.js"], {
+    cwd: path.join(__dirname, ".."),
+    env: Object.assign({}, process.env, { DATA_DIR: dirLegacy, HOST: "127.0.0.1", PORT: String(portLegacy), NODE_ENV: "production", ALLOW_DEMO: "0" }),
+    stdio: ["ignore", "pipe", "pipe"],
+  });
+  try {
+    await waitHealth(portLegacy);
+    const attached = JSON.parse(fs.readFileSync(path.join(dirLegacy, "store.json"), "utf8"));
+    assert.ok(attached.users[0].shop_id, "existing admin without shop_id gets a shop on load");
+    assert.strictEqual(attached.shops[0].name, "My shop");
+    const lg = await req(portLegacy, "POST", "/api/login", {
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ email: "david@coreltrainer.com", password: adminPwLegacy }),
+    });
+    assert.strictEqual(lg.status, 200);
+    const ck = String(lg.headers["set-cookie"] || "").split(";")[0];
+    const job = await req(portLegacy, "POST", "/api/jobs", {
+      headers: { "Content-Type": "application/json", Cookie: ck },
+      body: JSON.stringify({ title: "From drop", method: "dtf", width_in: 10, height_in: 10, qty: 1 }),
+    });
+    assert.strictEqual(job.status, 200);
+    console.log("ok legacy admin shop attach + floor job");
+  } finally {
+    await stop(childLegacy);
+  }
+
   console.log("server tests passed");
 })().catch((err) => { console.error(err); process.exit(1); });

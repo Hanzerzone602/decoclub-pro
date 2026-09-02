@@ -45,8 +45,7 @@
         const res = await fetch("/api/login", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ email: fd.get("email"), password: fd.get("password") }) });
         const data = await res.json();
         if (!res.ok) { document.getElementById("err").textContent = data.error; return; }
-        var dest = (data.user && data.user.role === "admin") ? "/admin.html" : (method ? "/app.html?method=" + encodeURIComponent(method) + "&station=art" : "/app.html");
-        location.href = dest;
+        location.href = method ? "/app.html?method=" + encodeURIComponent(method) : "/app.html";
       };
     })();
   </script>

@@ -1,5 +1,5 @@
 const main = document.getElementById("main");
-let user = null, shop = null, view = "board", currentJob = null, station = "overview";
+let user = null, shop = null, view = "make", currentJob = null, station = "overview", makeMethod = "apparel";
 let cfg = { statuses: [], methods: [], blanks: [], billing: false, demo: false };
 const $ = (s, r = document) => r.querySelector(s);
 const STAT_LABEL = { new: "New", art_in: "Art in", mockup: "Mockup", priced: "Priced", proof_sent: "Proof sent", approved: "Approved", in_production: "In production", done: "Done" };
@@ -41,13 +41,19 @@ async function api(url, opts = {}) {
 }
 function money(n) { return "$" + Number(n || 0).toFixed(2); }
 function escapeHtml(s) { return String(s || "").replace(/[&<>"']/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c])); }
+function canFloor() {
+  return !!(user && (user.role === "shop" || (user.role === "admin" && user.shopId)));
+}
 function nav() {
   document.querySelectorAll(".linkish").forEach((b) => {
     b.classList.toggle("active", b.dataset.view === view);
+    if (b.tagName === "A") return;
     b.onclick = () => { view = b.dataset.view; if (view !== "job") currentJob = null; nav(); render(); };
   });
-  $("#navClients").style.display = user && user.role === "shop" ? "block" : "none";
+  $("#navClients").style.display = canFloor() ? "block" : "none";
   $("#navJob").style.display = currentJob ? "block" : "none";
+  const office = $("#navOffice");
+  if (office) office.style.display = user && user.role === "admin" ? "block" : "none";
 }
 
 async function boot() {
@@ -73,17 +79,10 @@ async function boot() {
     if (shop.logo_path) $("#sideLogo").src = shop.logo_path;
   }
   $("#logout").onclick = async () => { await api("/api/logout", { method: "POST" }); location.href = "/"; };
-  nav();
   const startMethod = consumeStartMethod();
-  if (startMethod && user.role === "shop") {
-    try {
-      await startJobForMethod(startMethod);
-      return;
-    } catch (err) {
-      main.innerHTML = `<p class="notice">${escapeHtml(err.message)}</p>`;
-      return;
-    }
-  }
+  if (startMethod) makeMethod = startMethod;
+  if (!canFloor()) view = "board";
+  nav();
   render();
 }
 
@@ -99,17 +98,23 @@ function consumeStartMethod() {
   return method;
 }
 
-async function startJobForMethod(method) {
-  const label = METHOD_LABELS[method] || method;
+function titleFromFile(file) {
+  const n = (file && file.name) || "Art";
+  const cut = n.replace(/\.[^.]+$/, "");
+  return cut || n;
+}
+async function startJobFromFile(file, method) {
+  if (!file) throw new Error("Pick a file first.");
   const fd = new FormData();
-  fd.append("title", label + " · new");
-  fd.append("method", method);
+  fd.append("title", titleFromFile(file));
+  fd.append("method", METHODS.indexOf(method) !== -1 ? method : "apparel");
   fd.append("width_in", "10");
   fd.append("height_in", "10");
   fd.append("qty", "1");
+  fd.append("artwork", file);
   const res = await fetch("/api/jobs", { method: "POST", body: fd });
   const data = await res.json().catch(() => ({}));
-  if (!res.ok) throw new Error(data.error || "Could not create job");
+  if (!res.ok) throw new Error(data.error || "Could not start");
   openJob(data.job.id, "art");
 }
 
@@ -127,10 +132,61 @@ function processGridHtml(asButtons) {
 
 async function render() {
   if (view === "job" && currentJob) return renderJob(currentJob);
+  if (view === "make") return renderMake();
   if (view === "intake") return renderIntake();
   if (view === "clients") return renderClients();
   if (view === "settings") return renderSettings();
   return renderBoard();
+}
+
+async function renderMake() {
+  if (!canFloor()) {
+    view = "board";
+    nav();
+    return renderBoard();
+  }
+  const chips = METHODS.map((m) => `<button type="button" class="process-chip${m===makeMethod?" on":""}" data-chip="${m}">${METHOD_LABELS[m]}</button>`).join("");
+  main.innerHTML = `
+    <div class="make-home">
+      <h1 class="make-title">Drop your art here</h1>
+      <p class="muted make-sub">One file starts it. That is setup.</p>
+      <div class="make-drop" id="makeDrop" tabindex="0" role="button" aria-label="Drop your art here or tap to pick a file">
+        <div class="drop-hint">
+          <strong>Drop your art here</strong>
+          <span>or tap to pick a file</span>
+        </div>
+        <input id="makeFile" type="file" accept="image/*,.svg,.pdf" hidden />
+      </div>
+      <div class="process-chips" id="makeChips">${chips}</div>
+      <p class="notice" id="makeErr"></p>
+    </div>`;
+  main.querySelectorAll("[data-chip]").forEach((b) => {
+    b.onclick = (e) => {
+      e.preventDefault();
+      makeMethod = b.dataset.chip;
+      main.querySelectorAll("[data-chip]").forEach((x) => x.classList.toggle("on", x.dataset.chip === makeMethod));
+    };
+  });
+  const drop = $("#makeDrop");
+  const fileEl = $("#makeFile");
+  async function take(file) {
+    try {
+      await startJobFromFile(file, makeMethod);
+    } catch (err) {
+      $("#makeErr").textContent = err.message;
+    }
+  }
+  drop.onclick = () => fileEl.click();
+  drop.onkeydown = (e) => { if (e.key === "Enter" || e.key === " ") { e.preventDefault(); fileEl.click(); } };
+  drop.ondragover = (e) => { e.preventDefault(); drop.classList.add("dragover"); };
+  drop.ondragleave = () => drop.classList.remove("dragover");
+  drop.ondrop = (e) => {
+    e.preventDefault();
+    drop.classList.remove("dragover");
+    const f = e.dataTransfer && e.dataTransfer.files && e.dataTransfer.files[0];
+    if (f) take(f);
+  };
+  fileEl.onchange = () => { if (fileEl.files && fileEl.files[0]) take(fileEl.files[0]); };
 }
 
 async function renderBoard() {
@@ -141,7 +197,7 @@ async function renderBoard() {
   if (q) qs.set("q", q); if (st) qs.set("status", st); if (cid) qs.set("client_id", cid);
   const [{ jobs }, clientsWrap] = await Promise.all([
     api("/api/jobs?" + qs.toString()),
-    user.role === "shop" ? api("/api/clients").catch(() => ({ clients: [] })) : { clients: [] },
+    canFloor() ? api("/api/clients").catch(() => ({ clients: [] })) : { clients: [] },
   ]);
   const statuses = cfg.statuses.length ? cfg.statuses : Object.keys(STAT_LABEL);
   const emptyBoard = jobs.length === 0 && !q && !st && !cid;
@@ -177,26 +233,17 @@ async function renderBoard() {
       <tbody>${rows}</tbody>
     </table>`;
   }
-  const shopLead = emptyBoard
-    ? "Pick a process. Art station opens first — drop the file, then mock, price, proof, produce."
-    : "Start another run, or work the board below.";
   main.innerHTML = `
     <div class="row">
-      <h1 style="margin:0;font-size:32px">${emptyBoard ? "Start a job" : "Job board"}</h1>
-      ${user.role === "shop" ? `<button class="btn" id="goNew">New intake</button>` : ""}
+      <h1 style="margin:0;font-size:32px">Jobs</h1>
+      ${canFloor() ? `<button class="btn ghost small" id="goNew">More details</button>` : ""}
     </div>
-    ${user.role === "shop" ? `<p class="muted" style="margin:12px 0 4px">${shopLead}</p>${processGridHtml(true)}` : (emptyBoard ? `<p class="muted">No jobs assigned yet.</p>` : "")}
+    ${emptyBoard && !canFloor() ? `<p class="muted">No jobs yet.</p>` : ""}
     ${boardJobs}`;
 
   const go = $("#goNew"); if (go) go.onclick = () => { view = "intake"; nav(); render(); };
   ["q","st","cid"].forEach((id) => { const el = $("#"+id); if (el) el.onchange = () => renderBoard(); if (el && id==="q") el.onkeydown = (e) => { if (e.key==="Enter") renderBoard(); }; });
   main.querySelectorAll("[data-open]").forEach((b) => { b.onclick = () => openJob(b.dataset.open); });
-  main.querySelectorAll("[data-start-method]").forEach((b) => {
-    b.onclick = async () => {
-      try { await startJobForMethod(b.dataset.startMethod); }
-      catch (err) { main.insertAdjacentHTML("afterbegin", `<p class="notice">${escapeHtml(err.message)}</p>`); }
-    };
-  });
 }
 
 function openJob(id, st) { currentJob = id; view = "job"; station = st || "overview"; nav(); render(); }
@@ -237,7 +284,7 @@ async function renderIntake() {
 
 async function renderJob(id) {
   const { job, events } = await api("/api/jobs/" + id);
-  const shopControls = user.role === "shop";
+  const shopControls = canFloor();
   const tabs = [
     ["overview","Overview"],["art","Art"],["mockup","Mockup"],["price","Price"],
     ["proof","Proof"],["produce","Produce"],["comments","Comments"]
@@ -592,7 +639,7 @@ async function renderSettings() {
     <h1 style="font-size:28px;margin-top:0">Shop settings</h1>
     <p class="muted">${escapeHtml(user.email)} · plan <strong>${user.plan}</strong>${user.planExpires ? " · trial until " + user.planExpires : ""}</p>
     ${billed === "ok" ? `<p class="ok">Stripe returned success. Plan updates when the webhook lands.</p>` : ""}
-    ${user.role === "shop" ? `
+    ${canFloor() ? `
       <form class="form" id="sf">
         <label>Shop name (proofs, tickets, booth poster)</label>
         <input name="name" value="${escapeHtml(shop?.name || "")}" />

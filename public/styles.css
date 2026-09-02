@@ -160,6 +160,65 @@ a.process-tile, button.process-tile { color: var(--ink); width: 100%; }
 .drop-hint strong { font-size: 20px; color: var(--ink); font-family: var(--display); font-weight: 600; }
 .drop-hint span { font-size: 13px; color: var(--muted); font-weight: 400; }
 
+.make-home { max-width: 920px; margin: 0 auto; }
+.make-title { font-size: 34px; margin: 0 0 6px; }
+.make-sub { margin: 0 0 18px; }
+.make-drop {
+  min-height: min(62vh, 520px);
+  width: 100%;
+  cursor: pointer;
+  border: 3px dashed var(--gold);
+  background:
+    linear-gradient(180deg, rgba(201,184,150,.08), transparent 46%),
+    repeating-linear-gradient(-45deg, transparent, transparent 14px, rgba(201,184,150,.04) 14px, rgba(201,184,150,.04) 15px);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  flex-direction: column;
+  border-radius: 8px;
+  padding: 28px 16px;
+  box-sizing: border-box;
+}
+.make-drop .drop-hint { max-width: 420px; }
+.make-drop .drop-hint strong { font-size: 28px; }
+.make-drop .drop-hint span { font-size: 16px; }
+.make-drop:hover, .make-drop:focus, .make-drop.dragover {
+  border-color: var(--gold-2);
+  background-color: var(--panel-2);
+  box-shadow: inset 0 0 0 1px var(--gold);
+}
+.process-chips {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+  margin-top: 16px;
+}
+.process-chip {
+  background: var(--panel);
+  border: 1px solid var(--line);
+  color: var(--ink);
+  padding: 8px 12px;
+  border-radius: 999px;
+  cursor: pointer;
+  font-size: 13px;
+  font-weight: 600;
+}
+.process-chip.on {
+  border-color: var(--gold);
+  background: var(--panel-2);
+  box-shadow: inset 0 0 0 1px var(--gold);
+  color: var(--gold-2);
+}
+.side .make-office {
+  display: block;
+  text-align: center;
+  margin: 4px 10px 14px;
+  width: calc(100% - 20px);
+  padding: 12px 10px;
+  font-size: 15px;
+}
+.side a.linkish { display: block; text-decoration: none; box-sizing: border-box; }
+
 .plans { display: grid; grid-template-columns: repeat(3, 1fr); gap: 14px; }
 .plan { border: 1px solid var(--line); padding: 24px; background: var(--panel); }
 .plan.featured { border-color: var(--gold); box-shadow: 0 0 0 1px var(--gold); }
@@ -259,6 +318,11 @@ th { color: var(--muted); font-weight: 600; font-size: 11px; letter-spacing: .06
   .hero { padding: 32px 5vw 8px; }
   .section { padding-left: 5vw; padding-right: 5vw; }
   .topbar { padding: 12px 16px; }
+  .make-title { font-size: 26px; }
+  .make-drop { min-height: min(56vh, 440px); border-width: 3px; }
+  .make-drop .drop-hint strong { font-size: 24px; }
+  .process-chip { padding: 10px 14px; font-size: 14px; }
+  .main { padding: 16px 14px 40px; }
 }
 
 .sku-list { max-height: 220px; overflow: auto; border: 1px solid var(--line); background: var(--panel-2); padding: 6px; margin: 8px 0; font-size: 12px; }
