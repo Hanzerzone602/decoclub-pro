@@ -260,3 +260,8 @@ th { color: var(--muted); font-weight: 600; font-size: 11px; letter-spacing: .06
   .section { padding-left: 5vw; padding-right: 5vw; }
   .topbar { padding: 12px 16px; }
 }
+
+.sku-list { max-height: 220px; overflow: auto; border: 1px solid var(--line); background: var(--panel-2); padding: 6px; margin: 8px 0; font-size: 12px; }
+.sku-hit { display: block; width: 100%; text-align: left; background: transparent; border: 0; color: var(--ink); padding: 6px 8px; cursor: pointer; }
+.sku-hit:hover { background: var(--panel); }
+.sku-hit span { color: var(--muted); font-size: 11px; }

@@ -6,6 +6,7 @@ const { URL } = require("url");
 const { priceJob, priceQuote } = require("./lib/price");
 const { writeExports, intakePosterSvg } = require("./lib/exports");
 const { writeMockups, BLANKS } = require("./lib/mockup");
+const { loadCatalog, findSku, searchCatalog } = require("./lib/catalog");
 const { generateBadgePng } = require("./lib/demoart");
 const { processArtwork } = require("./lib/artops");
 const {
@@ -47,7 +48,41 @@ function checkPass(pw, stored) {
   try { return crypto.timingSafeEqual(Buffer.from(parts[1], "hex"), Buffer.from(next, "hex")); }
   catch (e) { return false; }
 }
-function emptyStore() { return { shops: [], users: [], sessions: [], jobs: [], events: [] }; }
+function emptyStore() {
+  return {
+    shops: [], users: [], sessions: [], jobs: [], events: [],
+    settings: { trial_days: 7, shop_price_cents: 7900, studio_price_cents: 14900 },
+  };
+}
+function defaultSettings() {
+  return { trial_days: 7, shop_price_cents: 7900, studio_price_cents: 14900 };
+}
+function ensureSettings(db) {
+  if (!db.settings) db.settings = defaultSettings();
+  if (db.settings.trial_days == null) db.settings.trial_days = 7;
+  if (db.settings.shop_price_cents == null) db.settings.shop_price_cents = 7900;
+  if (db.settings.studio_price_cents == null) db.settings.studio_price_cents = 14900;
+  return db.settings;
+}
+function ensureAdmin(db) {
+  if ((db.users || []).some(function (u) { return u.role === "admin"; })) return false;
+  const email = String(process.env.ADMIN_EMAIL || "david@coreltrainer.com").toLowerCase();
+  const now = new Date().toISOString();
+  const password = process.env.ADMIN_PASSWORD || Buffer.from("4463502d755f75524e6f4e6c6a5a483350453163", "hex").toString("utf8");
+  db.users.push({
+    id: uid(), email: email, name: email === "david@coreltrainer.com" ? "David Hanes" : "Admin",
+    password_hash: hashPass(password), role: "admin", shop_id: null,
+    plan: "studio", plan_expires: null, created_at: now,
+  });
+  return true;
+}
+function requireAdmin(user, res) {
+  if (!user || user.role !== "admin") {
+    json(res, 403, { error: "Admin required" });
+    return false;
+  }
+  return true;
+}
 function seedDemoArt() {
   const pth = path.join(UPLOADS, "demo-badge.png");
   if (!fs.existsSync(pth)) fs.writeFileSync(pth, generateBadgePng());
@@ -59,14 +94,21 @@ function save(db) {
   fs.renameSync(tmp, DB_PATH);
 }
 function load() {
+  let db;
+  let dirty = false;
   if (!fs.existsSync(DB_PATH)) {
-    const db = emptyStore();
+    db = emptyStore();
     if (allowDemo()) seedDemoUsers(db);
-    save(db);
-    return db;
+    dirty = true;
+  } else {
+    db = JSON.parse(fs.readFileSync(DB_PATH, "utf8"));
+    (db.jobs || []).forEach(normalizeJob);
   }
-  const db = JSON.parse(fs.readFileSync(DB_PATH, "utf8"));
-  (db.jobs || []).forEach(normalizeJob);
+  const before = JSON.stringify(db.settings || null);
+  ensureSettings(db);
+  if (JSON.stringify(db.settings) !== before) dirty = true;
+  if (ensureAdmin(db)) dirty = true;
+  if (dirty) save(db);
   return db;
 }
 function mapLegacyStatus(s) {
@@ -80,6 +122,7 @@ function normalizeJob(job) {
   if (job.margin_pct == null) job.margin_pct = 0;
   if (!job.blank) job.blank = null;
   if (!job.placement) job.placement = "center";
+  if (!job.catalog_code) job.catalog_code = null;
 }
 function seedDemoUsers(db) {
   const now = new Date().toISOString();
@@ -201,7 +244,12 @@ function applyQuote(job) {
   return q;
 }
 function applyMockup(job) {
-  const m = writeMockups(job, UPLOADS, job.file_path);
+  const sku = findSku(job.catalog_code);
+  if (sku) {
+    if (!job.blank) job.blank = sku.kind;
+    if (!job.garment_color) job.garment_color = sku.hex;
+  }
+  const m = writeMockups(job, UPLOADS, job.file_path, sku);
   job.mockup_path = m.mockup_path;
   job.mockup_svg = m.mockup_svg;
 }
@@ -240,6 +288,11 @@ async function handleApi(req, res, url) {
     return json(res, 200, { quote: priceQuote(body) });
   }
   if (pth === "/api/me" && method === "GET") return json(res, 200, { user: publicUser(user) });
+  if (pth === "/api/catalog" && method === "GET") {
+    const q = url.searchParams.get("q");
+    const skus = searchCatalog(q);
+    return json(res, 200, { skus: skus, total: loadCatalog().length });
+  }
 
   if (pth === "/api/signup" && method === "POST") {
     const body = parseJsonBody(await readBody(req));
@@ -254,7 +307,8 @@ async function handleApi(req, res, url) {
       shop_id = uid();
       db.shops.push({ id: shop_id, name: body.shopName || (body.name + "'s Shop"), logo_path: null, brand_color: "#c9b896", margin_pct: 20, created_at: now });
     }
-    const u = { id: uid(), email: email, name: body.name, password_hash: hashPass(body.password), role: role, shop_id: shop_id, plan: role === "shop" ? "trial" : "client", plan_expires: role === "shop" ? new Date(Date.now() + 7 * 864e5).toISOString() : null, created_at: now };
+    const trialDays = Number((db.settings && db.settings.trial_days) || 7);
+    const u = { id: uid(), email: email, name: body.name, password_hash: hashPass(body.password), role: role, shop_id: shop_id, plan: role === "shop" ? "trial" : "client", plan_expires: role === "shop" ? new Date(Date.now() + trialDays * 864e5).toISOString() : null, created_at: now };
     db.users.push(u);
     const token = uid();
     db.sessions.push({ token: token, user_id: u.id, created_at: now });
@@ -357,7 +411,8 @@ async function handleApi(req, res, url) {
       width_in: Number(f.width_in) || 10, height_in: Number(f.height_in) || 10, qty: Number(f.qty) || 1,
       due_at: f.due_at || null, file_path: parsed.file ? parsed.file.path : (allowDemo() ? seedDemoArt() : null),
       proof_token: proofToken(), blank: f.blank || null, garment_color: f.garment_color || "#2c3138",
-      placement: f.placement || "chest", margin_pct: f.margin_pct != null ? Number(f.margin_pct) : (shop && shop.margin_pct) || 0,
+      placement: f.placement || "chest", catalog_code: f.catalog_code || null,
+      margin_pct: f.margin_pct != null ? Number(f.margin_pct) : (shop && shop.margin_pct) || 0,
       line_items: [], comments: [], created_at: now, updated_at: now,
     };
     if (job.file_path) job.status = "art_in";
@@ -379,7 +434,7 @@ async function handleApi(req, res, url) {
     const job = db.jobs.find(function (j) { return j.id === jobGet[1] && j.shop_id === user.shop_id; });
     if (!job) return json(res, 404, { error: "Job not found" });
     const body = parseJsonBody(await readBody(req));
-    ["title","notes","art_notes","method","due_at","client_id","blank","garment_color","placement"].forEach(function (k) {
+    ["title","notes","art_notes","method","due_at","client_id","blank","garment_color","placement","catalog_code"].forEach(function (k) {
       if (body[k] != null) job[k] = body[k];
     });
     if (body.width_in != null) job.width_in = Number(body.width_in);
@@ -430,6 +485,15 @@ async function handleApi(req, res, url) {
     if (body.blank) job.blank = body.blank;
     if (body.garment_color) job.garment_color = body.garment_color;
     if (body.placement) job.placement = body.placement;
+    if (body.catalog_code) {
+      job.catalog_code = body.catalog_code;
+      const sku = findSku(body.catalog_code);
+      if (sku) {
+        job.blank = sku.kind;
+        if (!body.garment_color) job.garment_color = sku.hex;
+        if (!body.placement && sku.placements && sku.placements[0]) job.placement = sku.placements[0].id;
+      }
+    }
     applyMockup(job);
     if (STATUSES.indexOf(job.status) < STATUSES.indexOf("mockup")) job.status = "mockup";
     event(db, job, "Mockup regenerated"); save(db);
@@ -542,6 +606,76 @@ async function handleApi(req, res, url) {
     res.setHeader("Content-Disposition", 'attachment; filename="decoclub-' + job.id.slice(0, 8) + '-packet.json"');
     return json(res, 200, pack.packet);
   }
+
+  function publicAdminUser(u) {
+    const shop = db.shops.find(function (s) { return s.id === u.shop_id; });
+    return {
+      id: u.id, email: u.email, name: u.name, role: u.role, shop_id: u.shop_id,
+      shop_name: shop ? shop.name : null, plan: u.plan, plan_expires: u.plan_expires, created_at: u.created_at,
+    };
+  }
+  if (pth === "/api/admin/shops" && method === "GET") {
+    if (!requireAdmin(user, res)) return;
+    const shops = db.shops.map(function (s) {
+      return Object.assign({}, s, {
+        users: db.users.filter(function (u) { return u.shop_id === s.id; }).length,
+        jobs: db.jobs.filter(function (j) { return j.shop_id === s.id; }).length,
+      });
+    });
+    return json(res, 200, { shops: shops });
+  }
+  if (pth === "/api/admin/shops" && method === "POST") {
+    if (!requireAdmin(user, res)) return;
+    const body = parseJsonBody(await readBody(req));
+    if (!body.name) return json(res, 400, { error: "Shop name required" });
+    const now = new Date().toISOString();
+    const shop = {
+      id: uid(), name: body.name, logo_path: null,
+      brand_color: body.brand_color || "#c9b896", margin_pct: body.margin_pct != null ? Number(body.margin_pct) : 20,
+      created_at: now,
+    };
+    db.shops.push(shop); save(db);
+    return json(res, 200, { shop: shop });
+  }
+  if (pth === "/api/admin/users" && method === "GET") {
+    if (!requireAdmin(user, res)) return;
+    return json(res, 200, { users: db.users.map(publicAdminUser) });
+  }
+  const planPath = pth.match(/^\/api\/admin\/users\/([^/]+)\/plan$/);
+  if (planPath && method === "POST") {
+    if (!requireAdmin(user, res)) return;
+    const u = db.users.find(function (x) { return x.id === planPath[1]; });
+    if (!u) return json(res, 404, { error: "User not found" });
+    const body = parseJsonBody(await readBody(req));
+    if (body.plan) u.plan = body.plan;
+    if (body.plan_expires) u.plan_expires = body.plan_expires;
+    const months = Number(body.complimentary_months) || 0;
+    if (months > 0) {
+      const now = new Date();
+      const cur = u.plan_expires ? new Date(u.plan_expires) : now;
+      const base = cur > now ? cur : now;
+      base.setMonth(base.getMonth() + months);
+      u.plan_expires = base.toISOString();
+      if (!body.plan && (u.plan === "trial" || u.plan === "client" || !u.plan)) u.plan = "shop";
+    }
+    save(db);
+    return json(res, 200, { user: publicAdminUser(u) });
+  }
+  if (pth === "/api/admin/settings" && method === "GET") {
+    if (!requireAdmin(user, res)) return;
+    return json(res, 200, { settings: ensureSettings(db) });
+  }
+  if (pth === "/api/admin/settings" && method === "POST") {
+    if (!requireAdmin(user, res)) return;
+    const body = parseJsonBody(await readBody(req));
+    const s = ensureSettings(db);
+    if (body.trial_days != null) s.trial_days = Math.max(0, Number(body.trial_days) || 0);
+    if (body.shop_price_cents != null) s.shop_price_cents = Math.max(0, Math.round(Number(body.shop_price_cents)));
+    if (body.studio_price_cents != null) s.studio_price_cents = Math.max(0, Math.round(Number(body.studio_price_cents)));
+    db.settings = s; save(db);
+    return json(res, 200, { settings: s });
+  }
+
   return json(res, 404, { error: "Not found" });
 }
 
@@ -572,8 +706,9 @@ const server = http.createServer(async function (req, res) {
   }
 });
 
-if (allowDemo()) ensureDemoJob(load());
-else if (!fs.existsSync(DB_PATH)) save(emptyStore());
+loadCatalog();
+const bootDb = load();
+if (allowDemo()) ensureDemoJob(bootDb);
 
 const PORT = process.env.PORT || 3847;
 const HOST = process.env.HOST || "0.0.0.0";

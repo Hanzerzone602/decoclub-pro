@@ -75,7 +75,17 @@ function stop(child) {
     const cfg = await req(port, "GET", "/api/config");
     assert.strictEqual(cfg.json.demo, false);
     const store = JSON.parse(fs.readFileSync(path.join(s.dir, "store.json"), "utf8"));
-    assert.strictEqual(store.users.length, 0);
+    assert.strictEqual(store.users.length, 1);
+    assert.strictEqual(store.users[0].role, "admin");
+    assert.ok(store.users[0].password_hash.indexOf(":") > 0);
+    assert.strictEqual(store.settings.trial_days, 7);
+    assert.strictEqual(store.settings.shop_price_cents, 7900);
+    const cat = await req(port, "GET", "/api/catalog");
+    assert.strictEqual(cat.status, 200);
+    assert.strictEqual(cat.json.total, 1000);
+    assert.strictEqual(cat.json.skus.length, 1000);
+    const denied = await req(port, "GET", "/api/admin/users");
+    assert.strictEqual(denied.status, 403);
     const signup = await req(port, "POST", "/api/signup", {
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({ name: "Ada", email: "ada@shop.test", password: "secret1", shopName: "Ada Press", role: "shop" }),
@@ -93,7 +103,7 @@ function stop(child) {
     assert.strictEqual(bill.status, 501);
     assert.strictEqual(bill.json.error, "Billing not configured");
     const after = JSON.parse(fs.readFileSync(path.join(s.dir, "store.json"), "utf8"));
-    assert.strictEqual(after.users[0].plan, "trial");
+    assert.strictEqual(after.users.find((u) => u.email === "ada@shop.test").plan, "trial");
     const job = await req(port, "POST", "/api/jobs", {
       headers: { "Content-Type": "application/json", Cookie: cookie },
       body: JSON.stringify({ title: "Hats", method: "hat", width_in: 3, height_in: 2, qty: 12 }),
@@ -121,8 +131,93 @@ function stop(child) {
     });
     assert.strictEqual(login.status, 200);
     console.log("ok demo seed login");
+    const shopCookie = String(login.headers["set-cookie"] || "").split(";")[0];
+    const shopAdmin = await req(port2, "GET", "/api/admin/settings", { headers: { Cookie: shopCookie } });
+    assert.strictEqual(shopAdmin.status, 403);
+    const jobMk = await req(port2, "POST", "/api/jobs", {
+      headers: { "Content-Type": "application/json", Cookie: shopCookie },
+      body: JSON.stringify({ title: "PC54 black", method: "apparel", catalog_code: "PC54-BLACK", placement: "chest" }),
+    });
+    assert.strictEqual(jobMk.status, 200);
+    assert.strictEqual(jobMk.json.job.catalog_code, "PC54-BLACK");
+    assert.strictEqual(jobMk.json.job.blank, "tee");
+    const mk = await req(port2, "POST", "/api/jobs/" + jobMk.json.job.id + "/mockup", {
+      headers: { "Content-Type": "application/json", Cookie: shopCookie },
+      body: JSON.stringify({ catalog_code: "C112-NAVY", placement: "front" }),
+    });
+    assert.strictEqual(mk.status, 200);
+    assert.strictEqual(mk.json.job.catalog_code, "C112-NAVY");
+    assert.strictEqual(mk.json.job.blank, "hat");
+    const png = await req(port2, "GET", mk.json.job.mockup_path);
+    assert.strictEqual(png.status, 200);
+    assert.ok(png.buf[0] === 0x89 && png.buf[1] === 0x50);
   } finally {
     await stop(s2.child);
+  }
+
+  const port3 = 41238;
+  const s3 = startServer({ PORT: String(port3), NODE_ENV: "production", ALLOW_DEMO: "0" });
+  try {
+    await waitHealth(port3);
+    const adminPw = Buffer.from("4463502d755f75524e6f4e6c6a5a483350453163", "hex").toString("utf8");
+    const adminLogin = await req(port3, "POST", "/api/login", {
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ email: "david@coreltrainer.com", password: adminPw }),
+    });
+    assert.strictEqual(adminLogin.status, 200);
+    assert.strictEqual(adminLogin.json.user.role, "admin");
+    assert.strictEqual(adminLogin.json.user.name, "David Hanes");
+    const cookie = String(adminLogin.headers["set-cookie"] || "").split(";")[0];
+    const settings = await req(port3, "GET", "/api/admin/settings", { headers: { Cookie: cookie } });
+    assert.strictEqual(settings.status, 200);
+    assert.strictEqual(settings.json.settings.shop_price_cents, 7900);
+    const saved = await req(port3, "POST", "/api/admin/settings", {
+      headers: { "Content-Type": "application/json", Cookie: cookie },
+      body: JSON.stringify({ trial_days: 3, shop_price_cents: 9900, studio_price_cents: 19900 }),
+    });
+    assert.strictEqual(saved.status, 200);
+    assert.strictEqual(saved.json.settings.trial_days, 3);
+    const shop = await req(port3, "POST", "/api/admin/shops", {
+      headers: { "Content-Type": "application/json", Cookie: cookie },
+      body: JSON.stringify({ name: "Grant Shop" }),
+    });
+    assert.strictEqual(shop.status, 200);
+    const signup = await req(port3, "POST", "/api/signup", {
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ name: "Bea", email: "bea@shop.test", password: "secret1", shopName: "Bea Press" }),
+    });
+    assert.strictEqual(signup.status, 200);
+    const exp = new Date(signup.json.user.planExpires).getTime() - Date.now();
+    assert.ok(exp > 2 * 864e5 && exp < 4 * 864e5, "trial uses settings.trial_days");
+    const users = await req(port3, "GET", "/api/admin/users", { headers: { Cookie: cookie } });
+    const bea = users.json.users.find((u) => u.email === "bea@shop.test");
+    const granted = await req(port3, "POST", "/api/admin/users/" + bea.id + "/plan", {
+      headers: { "Content-Type": "application/json", Cookie: cookie },
+      body: JSON.stringify({ plan: "shop", complimentary_months: 3 }),
+    });
+    assert.strictEqual(granted.status, 200);
+    assert.strictEqual(granted.json.user.plan, "shop");
+    const months = (new Date(granted.json.user.plan_expires).getTime() - Date.now()) / (30 * 864e5);
+    assert.ok(months > 2.5 && months < 4, "complimentary months applied");
+    const page = await req(port3, "GET", "/admin.html");
+    assert.strictEqual(page.status, 200);
+    assert.ok(page.text.indexOf("admin.js") !== -1);
+    const envPort = 41239;
+    const s4 = startServer({ PORT: String(envPort), NODE_ENV: "production", ALLOW_DEMO: "0", ADMIN_EMAIL: "ops@decoclub.test" });
+    try {
+      await waitHealth(envPort);
+      const envLogin = await req(envPort, "POST", "/api/login", {
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ email: "ops@decoclub.test", password: adminPw }),
+      });
+      assert.strictEqual(envLogin.status, 200);
+      assert.strictEqual(envLogin.json.user.role, "admin");
+    } finally {
+      await stop(s4.child);
+    }
+    console.log("ok admin seed settings shops grant");
+  } finally {
+    await stop(s3.child);
   }
   console.log("server tests passed");
 })().catch((err) => { console.error(err); process.exit(1); });

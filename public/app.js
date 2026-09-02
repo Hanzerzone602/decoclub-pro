@@ -379,18 +379,48 @@ function fillMockup(el, job, shopControls) {
       <div>
         ${shopControls ? `
           <form id="mk" class="form">
+            <label>Search catalog (style code)</label>
+            <input id="skuq" type="search" placeholder="PC54, 18000, C112, DC-LASER…" value="${escapeHtml(job.catalog_code || "")}" autocomplete="off" />
+            <div id="skulist" class="sku-list muted">Type a SanMar-style code or DecoClub hardgood.</div>
+            <input type="hidden" name="catalog_code" id="skucode" value="${escapeHtml(job.catalog_code || "")}" />
+            <p id="skupicked" class="muted">${job.catalog_code ? "Selected " + escapeHtml(job.catalog_code) : "No SKU selected"}</p>
             <label>Blank</label>
             <select name="blank">${BLANKS.map((b) => `<option value="${b}" ${b===(job.blank||"")?"selected":""}>${b}</option>`).join("")}</select>
             <label>Garment / substrate color</label>
             <input name="garment_color" type="color" value="${job.garment_color || "#2c3138"}" />
             <label>Placement</label>
-            <select name="placement">${PLACES.map((p) => `<option value="${p}" ${p===job.placement?"selected":""}>${p}</option>`).join("")}</select>
+            <select name="placement" id="placeSel">${PLACES.map((p) => `<option value="${p}" ${p===job.placement?"selected":""}>${p}</option>`).join("")}</select>
             <button class="btn" type="submit">Generate mockup</button>
-          </form>` : `<p class="muted">Placement mockup for review.</p>`}
+          </form>` : `<p class="muted">Placement mockup for review.${job.catalog_code ? " · " + escapeHtml(job.catalog_code) : ""}</p>`}
       </div>
     </div>`;
   const mk = $("#mk");
-  if (mk) mk.onsubmit = async (e) => {
+  if (!mk) return;
+  const qEl = $("#skuq");
+  const list = $("#skulist");
+  let timer = null;
+  async function runSearch() {
+    const q = qEl.value.trim();
+    if (q.length < 2) { list.textContent = "Type at least 2 characters."; return; }
+    const data = await api("/api/catalog?q=" + encodeURIComponent(q));
+    const rows = (data.skus || []).slice(0, 24);
+    if (!rows.length) { list.textContent = "No SKUs match."; return; }
+    list.innerHTML = rows.map((s) => `<button type="button" class="sku-hit" data-code="${escapeHtml(s.code)}" data-kind="${escapeHtml(s.kind)}" data-hex="${escapeHtml(s.hex)}" data-place="${escapeHtml((s.placements[0] && s.placements[0].id) || "center")}">
+      <strong>${escapeHtml(s.code)}</strong> <span>${escapeHtml(s.name)}</span>
+    </button>`).join("");
+    list.querySelectorAll(".sku-hit").forEach((b) => {
+      b.onclick = () => {
+        $("#skucode").value = b.dataset.code;
+        $("#skupicked").textContent = "Selected " + b.dataset.code;
+        mk.blank.value = b.dataset.kind;
+        mk.garment_color.value = b.dataset.hex;
+        if (b.dataset.place) mk.placement.value = b.dataset.place;
+      };
+    });
+  }
+  qEl.oninput = () => { clearTimeout(timer); timer = setTimeout(runSearch, 180); };
+  if ((job.catalog_code || "").length >= 2) runSearch().catch(() => {});
+  mk.onsubmit = async (e) => {
     e.preventDefault();
     await api("/api/jobs/" + job.id + "/mockup", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(Object.fromEntries(new FormData(mk).entries())) });
     renderJob(job.id);
