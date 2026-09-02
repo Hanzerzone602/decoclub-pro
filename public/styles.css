@@ -45,8 +45,54 @@ h1,h2,h3 { font-family: var(--display); font-weight: 600; letter-spacing: -.02em
 .section { padding: 48px 7vw; border-top: 1px solid var(--line); }
 .grid-3 { display: grid; grid-template-columns: repeat(3, 1fr); gap: 12px; }
 .card { background: var(--panel); border: 1px solid var(--line); padding: 18px; }
+a.card { display: block; color: inherit; }
+a.card:hover, a.card:focus { border-color: var(--gold); outline: 2px solid var(--gold); outline-offset: 2px; }
 .card h3 { margin: 0 0 8px; font-size: 16px; }
 .card p, .muted { color: var(--muted); }
+.process-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(140px, 1fr));
+  gap: 10px;
+  margin: 14px 0 8px;
+}
+.process-tile {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  min-height: 72px;
+  padding: 16px 12px;
+  background: var(--panel);
+  border: 1px solid var(--line);
+  color: var(--ink);
+  font-weight: 700;
+  font-size: 15px;
+  text-align: center;
+  cursor: pointer;
+  border-radius: 2px;
+  font-family: var(--font);
+  text-decoration: none;
+}
+a.process-tile { color: var(--ink); }
+.process-tile:hover, .process-tile:focus {
+  border-color: var(--gold);
+  background: var(--panel-2);
+  color: var(--gold-2);
+  outline: 2px solid var(--gold);
+  outline-offset: 2px;
+}
+.art-drop {
+  min-height: 280px;
+  cursor: pointer;
+  border: 1px dashed var(--gold);
+  flex-direction: column;
+}
+.art-drop:hover, .art-drop:focus, .art-drop.dragover {
+  border-color: var(--gold-2);
+  background: var(--panel-2);
+  outline: 2px solid var(--gold);
+  outline-offset: 2px;
+}
+.drop-hint { color: var(--gold-2); font-weight: 600; padding: 24px; text-align: center; }
 .plans { display: grid; grid-template-columns: repeat(3, 1fr); gap: 12px; }
 .plan { border: 1px solid var(--line); padding: 20px; background: var(--panel); }
 .plan.featured { border-color: var(--gold); }

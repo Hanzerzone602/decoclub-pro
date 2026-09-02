@@ -13,6 +13,7 @@
   <form class="auth-box" id="form">
     <div class="kicker">Seven-day trial for shops</div>
     <h1 style="font-size:28px;margin:8px 0 0">Open DecoClub Pro</h1>
+    <p class="muted" id="methodHint"></p>
     <label>Your name</label><input name="name" required />
     <label>Shop name</label><input name="shopName" placeholder="Westside Press" />
     <label>Email</label><input name="email" type="email" required />
@@ -24,16 +25,29 @@
     </select>
     <p class="notice" id="err"></p>
     <button class="btn" type="submit">Create account</button>
-    <p class="muted">Already have a login? <a href="/login.html">Log in</a></p>
+    <p class="muted">Already have a login? <a href="/login.html" id="altAuth">Log in</a></p>
   </form>
   <script>
-    document.getElementById("form").onsubmit = async (e) => {
-      e.preventDefault();
-      const res = await fetch("/api/signup", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(Object.fromEntries(new FormData(e.target).entries())) });
-      const data = await res.json();
-      if (!res.ok) { document.getElementById("err").textContent = data.error; return; }
-      location.href = "/app.html";
-    };
+    (function () {
+      var METHODS = ["dtf","uvdtf","uv","vinyl","laser","sticker","hat","apparel","patch","embroidery","sublimation","rhinestone","sign"];
+      var LABELS = { dtf: "DTF", uvdtf: "UV DTF", uv: "UV print", vinyl: "Vinyl", laser: "Laser", sticker: "Stickers", hat: "Hats", apparel: "Apparel", patch: "Patches", embroidery: "Embroidery", sublimation: "Sublimation", rhinestone: "Rhinestone", sign: "Signs" };
+      var q = new URLSearchParams(location.search).get("method") || "";
+      var stored = sessionStorage.getItem("decoclub_start_method") || "";
+      var method = METHODS.indexOf(q) !== -1 ? q : (METHODS.indexOf(stored) !== -1 ? stored : "");
+      if (method) {
+        sessionStorage.setItem("decoclub_start_method", method);
+        document.getElementById("altAuth").href = "/login.html?method=" + encodeURIComponent(method);
+        var hint = document.getElementById("methodHint");
+        if (hint) hint.textContent = "After you open the shop, we will start a " + (LABELS[method] || method) + " job on Art.";
+      }
+      document.getElementById("form").onsubmit = async (e) => {
+        e.preventDefault();
+        const res = await fetch("/api/signup", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(Object.fromEntries(new FormData(e.target).entries())) });
+        const data = await res.json();
+        if (!res.ok) { document.getElementById("err").textContent = data.error; return; }
+        location.href = method ? "/app.html?method=" + encodeURIComponent(method) + "&station=art" : "/app.html";
+      };
+    })();
   </script>
 </body>
 </html>

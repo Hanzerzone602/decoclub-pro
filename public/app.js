@@ -4,6 +4,11 @@ let cfg = { statuses: [], methods: [], blanks: [], billing: false, demo: false }
 const $ = (s, r = document) => r.querySelector(s);
 const STAT_LABEL = { new: "New", art_in: "Art in", mockup: "Mockup", priced: "Priced", proof_sent: "Proof sent", approved: "Approved", in_production: "In production", done: "Done" };
 const METHODS = ["dtf","uvdtf","uv","vinyl","laser","sticker","hat","apparel","patch","embroidery","sublimation","rhinestone","sign"];
+const METHOD_LABELS = {
+  dtf: "DTF", uvdtf: "UV DTF", uv: "UV print", vinyl: "Vinyl", laser: "Laser",
+  sticker: "Stickers", hat: "Hats", apparel: "Apparel", patch: "Patches",
+  embroidery: "Embroidery", sublimation: "Sublimation", rhinestone: "Rhinestone", sign: "Signs",
+};
 const BLANKS = ["tee","hoodie","hat","tumbler","plaque","sticker","sign","hoop"];
 const PLACES = ["chest","left_chest","full","back","front","wrap","center"];
 
@@ -27,7 +32,16 @@ function nav() {
 async function boot() {
   cfg = await api("/api/config");
   const me = await api("/api/me");
-  if (!me.user) { location.href = "/login.html"; return; }
+  if (!me.user) {
+    const m = new URLSearchParams(location.search).get("method") || sessionStorage.getItem("decoclub_start_method") || "";
+    if (METHODS.indexOf(m) !== -1) {
+      sessionStorage.setItem("decoclub_start_method", m);
+      location.href = "/login.html?method=" + encodeURIComponent(m);
+    } else {
+      location.href = "/login.html";
+    }
+    return;
+  }
   user = me.user;
   const s = await api("/api/shop");
   shop = s.shop;
@@ -39,7 +53,51 @@ async function boot() {
   }
   $("#logout").onclick = async () => { await api("/api/logout", { method: "POST" }); location.href = "/"; };
   nav();
+  const startMethod = consumeStartMethod();
+  if (startMethod && user.role === "shop") {
+    try {
+      await startJobForMethod(startMethod);
+      return;
+    } catch (err) {
+      main.innerHTML = `<p class="notice">${escapeHtml(err.message)}</p>`;
+      return;
+    }
+  }
   render();
+}
+
+function consumeStartMethod() {
+  const params = new URLSearchParams(location.search);
+  const fromUrl = params.get("method") || "";
+  const fromStore = sessionStorage.getItem("decoclub_start_method") || "";
+  const method = METHODS.indexOf(fromUrl) !== -1 ? fromUrl : (METHODS.indexOf(fromStore) !== -1 ? fromStore : "");
+  sessionStorage.removeItem("decoclub_start_method");
+  if (method && (params.get("method") || params.get("station"))) {
+    history.replaceState({}, "", "/app.html");
+  }
+  return method;
+}
+
+async function startJobForMethod(method) {
+  const label = METHOD_LABELS[method] || method;
+  const fd = new FormData();
+  fd.append("title", label + " · new");
+  fd.append("method", method);
+  fd.append("width_in", "10");
+  fd.append("height_in", "10");
+  fd.append("qty", "1");
+  const res = await fetch("/api/jobs", { method: "POST", body: fd });
+  const data = await res.json().catch(() => ({}));
+  if (!res.ok) throw new Error(data.error || "Could not create job");
+  openJob(data.job.id, "art");
+}
+
+function processGridHtml(asButtons) {
+  return `<div class="process-grid">${METHODS.map((m) => (
+    asButtons
+      ? `<button type="button" class="process-tile" data-start-method="${m}">${METHOD_LABELS[m]}</button>`
+      : `<a class="process-tile" href="/start.html?method=${m}">${METHOD_LABELS[m]}</a>`
+  )).join("")}</div>`;
 }
 
 async function render() {
@@ -66,6 +124,7 @@ async function renderBoard() {
       <h1 style="margin:0;font-size:28px">Job board</h1>
       ${user.role === "shop" ? `<button class="btn" id="goNew">New intake</button>` : ""}
     </div>
+    ${user.role === "shop" ? `<p class="muted" style="margin:12px 0 8px">Pick a process to start a job — art upload first, no long intake form.</p>${processGridHtml(true)}` : ""}
     <div class="toolbar">
       <input id="q" placeholder="Search title, method, notes" value="${escapeHtml(q)}" />
       <select id="st"><option value="">All statuses</option>${statuses.map((s) => `<option value="${s}" ${s===st?"selected":""}>${STAT_LABEL[s]||s}</option>`).join("")}</select>
@@ -98,9 +157,15 @@ async function renderBoard() {
   const go = $("#goNew"); if (go) go.onclick = () => { view = "intake"; nav(); render(); };
   ["q","st","cid"].forEach((id) => { const el = $("#"+id); if (el) el.onchange = () => renderBoard(); if (el && id==="q") el.onkeydown = (e) => { if (e.key==="Enter") renderBoard(); }; });
   main.querySelectorAll("[data-open]").forEach((b) => { b.onclick = () => openJob(b.dataset.open); });
+  main.querySelectorAll("[data-start-method]").forEach((b) => {
+    b.onclick = async () => {
+      try { await startJobForMethod(b.dataset.startMethod); }
+      catch (err) { main.insertAdjacentHTML("afterbegin", `<p class="notice">${escapeHtml(err.message)}</p>`); }
+    };
+  });
 }
 
-function openJob(id) { currentJob = id; view = "job"; station = "overview"; nav(); render(); }
+function openJob(id, st) { currentJob = id; view = "job"; station = st || "overview"; nav(); render(); }
 
 async function renderIntake() {
   const { clients } = await api("/api/clients").catch(() => ({ clients: [] }));
@@ -202,13 +267,18 @@ function fillOverview(el, job, shopControls) {
 function fillArt(el, job, shopControls) {
   el.innerHTML = `
     <div class="split">
-      <div class="preview">${job.file_path ? `<img src="${job.file_path}" alt="Art" />` : `<span class="muted">No file</span>`}</div>
+      <div class="preview art-drop" id="artDrop" tabindex="0" role="button" aria-label="Drop art or click to upload">
+        ${job.file_path ? `<img src="${job.file_path}" alt="Art" />` : `<span class="drop-hint">Drop art or click to upload</span>`}
+      </div>
       <div>
         <p class="muted">PNG traces to cut contour. Replace the file, knock near-white to alpha, or swap a hex color.</p>
         <label>Art notes</label>
         <textarea id="artn" rows="3">${escapeHtml(job.art_notes||"")}</textarea>
         ${shopControls ? `
-          <form id="up" style="margin:12px 0"><input name="artwork" type="file" accept="image/*,.svg,.pdf" /><button class="btn small" type="submit">Replace artwork</button></form>
+          <form id="up" style="margin:12px 0">
+            <input name="artwork" id="artFile" type="file" accept="image/*,.svg,.pdf" />
+            <button class="btn small" type="submit">Replace artwork</button>
+          </form>
           <div class="row">
             <button class="btn ghost small" id="ko">Knockout white</button>
           </div>
@@ -221,8 +291,32 @@ function fillArt(el, job, shopControls) {
       </div>
     </div>`;
   if (!shopControls) return;
+  async function uploadArtwork(file) {
+    if (!file) return;
+    const fd = new FormData();
+    fd.append("artwork", file);
+    const res = await fetch("/api/jobs/" + job.id + "/artwork", { method: "POST", body: fd });
+    const data = await res.json();
+    if (!res.ok) { $("#err").textContent = data.error; return; }
+    renderJob(job.id);
+  }
+  const artFile = $("#artFile");
+  const drop = $("#artDrop");
+  artFile.onchange = () => { if (artFile.files && artFile.files[0]) uploadArtwork(artFile.files[0]); };
+  drop.onclick = () => artFile.click();
+  drop.onkeydown = (e) => { if (e.key === "Enter" || e.key === " ") { e.preventDefault(); artFile.click(); } };
+  drop.ondragover = (e) => { e.preventDefault(); drop.classList.add("dragover"); };
+  drop.ondragleave = () => drop.classList.remove("dragover");
+  drop.ondrop = (e) => {
+    e.preventDefault();
+    drop.classList.remove("dragover");
+    const f = e.dataTransfer && e.dataTransfer.files && e.dataTransfer.files[0];
+    if (f) uploadArtwork(f);
+  };
   $("#up").onsubmit = async (e) => {
     e.preventDefault();
+    const file = artFile.files && artFile.files[0];
+    if (file) return uploadArtwork(file);
     const res = await fetch("/api/jobs/" + job.id + "/artwork", { method: "POST", body: new FormData(e.target) });
     const data = await res.json();
     if (!res.ok) { $("#err").textContent = data.error; return; }

@@ -13,6 +13,7 @@
   <form class="auth-box" id="form">
     <div class="kicker">Shop floor</div>
     <h1 style="font-size:28px;margin:8px 0 0">Log in</h1>
+    <p class="muted" id="methodHint"></p>
     <label>Email</label>
     <input name="email" type="email" autocomplete="username" required />
     <label>Password</label>
@@ -20,20 +21,33 @@
     <p class="notice" id="err"></p>
     <p class="muted" id="hint"></p>
     <button class="btn" type="submit">Enter floor</button>
-    <p class="muted">No account? <a href="/signup.html">Create a shop or client login</a></p>
+    <p class="muted">No account? <a href="/signup.html" id="altAuth">Create a shop or client login</a></p>
   </form>
   <script>
-    fetch("/api/config").then(r => r.json()).then(c => {
-      if (c.demo && c.seed) document.getElementById("hint").textContent = "Seed: " + c.seed.owner + " / " + c.seed.password;
-    }).catch(() => {});
-    document.getElementById("form").onsubmit = async (e) => {
-      e.preventDefault();
-      const fd = new FormData(e.target);
-      const res = await fetch("/api/login", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ email: fd.get("email"), password: fd.get("password") }) });
-      const data = await res.json();
-      if (!res.ok) { document.getElementById("err").textContent = data.error; return; }
-      location.href = "/app.html";
-    };
+    (function () {
+      var METHODS = ["dtf","uvdtf","uv","vinyl","laser","sticker","hat","apparel","patch","embroidery","sublimation","rhinestone","sign"];
+      var LABELS = { dtf: "DTF", uvdtf: "UV DTF", uv: "UV print", vinyl: "Vinyl", laser: "Laser", sticker: "Stickers", hat: "Hats", apparel: "Apparel", patch: "Patches", embroidery: "Embroidery", sublimation: "Sublimation", rhinestone: "Rhinestone", sign: "Signs" };
+      var q = new URLSearchParams(location.search).get("method") || "";
+      var stored = sessionStorage.getItem("decoclub_start_method") || "";
+      var method = METHODS.indexOf(q) !== -1 ? q : (METHODS.indexOf(stored) !== -1 ? stored : "");
+      if (method) {
+        sessionStorage.setItem("decoclub_start_method", method);
+        document.getElementById("altAuth").href = "/signup.html?method=" + encodeURIComponent(method);
+        var mh = document.getElementById("methodHint");
+        if (mh) mh.textContent = "We will open a " + (LABELS[method] || method) + " job on Art after you enter the floor.";
+      }
+      fetch("/api/config").then(r => r.json()).then(c => {
+        if (c.demo && c.seed) document.getElementById("hint").textContent = "Seed: " + c.seed.owner + " / " + c.seed.password;
+      }).catch(() => {});
+      document.getElementById("form").onsubmit = async (e) => {
+        e.preventDefault();
+        const fd = new FormData(e.target);
+        const res = await fetch("/api/login", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ email: fd.get("email"), password: fd.get("password") }) });
+        const data = await res.json();
+        if (!res.ok) { document.getElementById("err").textContent = data.error; return; }
+        location.href = method ? "/app.html?method=" + encodeURIComponent(method) + "&station=art" : "/app.html";
+      };
+    })();
   </script>
 </body>
 </html>
