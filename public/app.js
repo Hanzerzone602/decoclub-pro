@@ -9,6 +9,27 @@ const METHOD_LABELS = {
   sticker: "Stickers", hat: "Hats", apparel: "Apparel", patch: "Patches",
   embroidery: "Embroidery", sublimation: "Sublimation", rhinestone: "Rhinestone", sign: "Signs",
 };
+const METHOD_OUTCOMES = {
+  dtf: "22in gang sheet", uvdtf: "22in UV gang sheet", uv: "Flatbed print packet",
+  vinyl: "Cut contour + marks", laser: "SVG + PLT", sticker: "Kiss-cut line",
+  hat: "Cap mockup", apparel: "Garment mockup", patch: "Badge + hoop notes",
+  embroidery: "Hoop notes", sublimation: "Wrap layout", rhinestone: "Stone map notes", sign: "Board cutline",
+};
+const METHOD_ICONS = {
+  dtf: '<rect x="3" y="5" width="18" height="14" rx="1.5"/><path d="M6 9h5v6H6zM13 9h5M13 13h4"/>',
+  uvdtf: '<rect x="3" y="6" width="18" height="12" rx="1.5"/><path d="M8 4v2M12 3v3M16 4v2"/><circle cx="8" cy="12" r="1.4"/>',
+  uv: '<rect x="4" y="8" width="16" height="11" rx="1"/><path d="M12 3v3M8.5 4.5l1.2 1.8M15.5 4.5l-1.2 1.8"/>',
+  vinyl: '<ellipse cx="7" cy="12" rx="3.2" ry="6"/><path d="M7 6h11.5a2.5 2.5 0 0 1 0 12H7"/><circle cx="18.5" cy="12" r="2.2"/>',
+  laser: '<path d="M12 4l7 4v8l-7 4-7-4V8z"/><path d="M5 8l7 4 7-4M12 12v8"/>',
+  sticker: '<path d="M6 4h9l5 5v11H6z"/><path d="M15 4v5h5"/>',
+  hat: '<path d="M4 14c2-6 4.5-8 8-8s6 2 8 8"/><path d="M3 15h18v2H3z"/><path d="M8 14v-2"/>',
+  apparel: '<path d="M8 6l4-2 4 2 4 2-2.5 3H16v9H8V11H6.5L4 8z"/>',
+  patch: '<path d="M12 3l7 3v6c0 4.2-2.8 7.5-7 9-4.2-1.5-7-4.8-7-9V6z"/>',
+  embroidery: '<circle cx="12" cy="12" r="7"/><circle cx="12" cy="12" r="3"/><path d="M12 2v3M12 19v3M2 12h3M19 12h3"/>',
+  sublimation: '<rect x="8" y="4" width="8" height="16" rx="3.5"/><path d="M8 9h8"/>',
+  rhinestone: '<path d="M12 3l4 6-4 12L8 9z"/><path d="M8 9h8"/>',
+  sign: '<rect x="4" y="5" width="16" height="10" rx="1"/><path d="M12 15v5M8 20h8"/>',
+};
 const BLANKS = ["tee","hoodie","hat","tumbler","plaque","sticker","sign","hoop"];
 const PLACES = ["chest","left_chest","full","back","front","wrap","center"];
 
@@ -92,11 +113,15 @@ async function startJobForMethod(method) {
   openJob(data.job.id, "art");
 }
 
+function processTileInner(m) {
+  const ico = METHOD_ICONS[m] || "";
+  return `<svg class="process-ico" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" aria-hidden="true">${ico}</svg><span class="process-name">${METHOD_LABELS[m]}</span><span class="process-out">${METHOD_OUTCOMES[m] || ""}</span><span class="process-go">Start job</span>`;
+}
 function processGridHtml(asButtons) {
   return `<div class="process-grid">${METHODS.map((m) => (
     asButtons
-      ? `<button type="button" class="process-tile" data-start-method="${m}">${METHOD_LABELS[m]}</button>`
-      : `<a class="process-tile" href="/start.html?method=${m}">${METHOD_LABELS[m]}</a>`
+      ? `<button type="button" class="process-tile" data-start-method="${m}">${processTileInner(m)}</button>`
+      : `<a class="process-tile" href="/start.html?method=${m}">${processTileInner(m)}</a>`
   )).join("")}</div>`;
 }
 
@@ -119,41 +144,50 @@ async function renderBoard() {
     user.role === "shop" ? api("/api/clients").catch(() => ({ clients: [] })) : { clients: [] },
   ]);
   const statuses = cfg.statuses.length ? cfg.statuses : Object.keys(STAT_LABEL);
-  main.innerHTML = `
-    <div class="row">
-      <h1 style="margin:0;font-size:28px">Job board</h1>
-      ${user.role === "shop" ? `<button class="btn" id="goNew">New intake</button>` : ""}
-    </div>
-    ${user.role === "shop" ? `<p class="muted" style="margin:12px 0 8px">Pick a process to start a job — art upload first, no long intake form.</p>${processGridHtml(true)}` : ""}
+  const emptyBoard = jobs.length === 0 && !q && !st && !cid;
+  let boardJobs = "";
+  if (!emptyBoard) {
+    const kanban = statuses.map((s) => {
+      const col = jobs.filter((j) => j.status === s);
+      const cards = col.map((j) => `
+          <div class="job-card" data-open="${j.id}">
+            <b>${escapeHtml(j.title)}</b>
+            <span>${j.method} · ${j.width_in}×${j.height_in} · qty ${j.qty}</span><br/>
+            <span>${money(j.total)}${j.due_at ? " · due " + escapeHtml(j.due_at) : ""}</span>
+          </div>`).join("");
+      return `<div class="col"><h4>${STAT_LABEL[s]||s} · ${col.length}</h4>${cards}</div>`;
+    }).join("");
+    const rows = jobs.map((j) => `<tr>
+          <td>${escapeHtml(j.title)}</td><td class="muted">${(j.client_id||"—").slice(0,8)}</td>
+          <td>${j.method}</td><td><span class="status">${STAT_LABEL[j.status]||j.status}</span></td>
+          <td>${escapeHtml(j.due_at||"—")}</td><td class="mono">${money(j.total)}</td>
+          <td><button class="btn ghost small" data-open="${j.id}">Open</button></td>
+        </tr>`).join("");
+    boardJobs = `
     <div class="toolbar">
       <input id="q" placeholder="Search title, method, notes" value="${escapeHtml(q)}" />
       <select id="st"><option value="">All statuses</option>${statuses.map((s) => `<option value="${s}" ${s===st?"selected":""}>${STAT_LABEL[s]||s}</option>`).join("")}</select>
       <select id="cid"><option value="">All clients</option>${clientsWrap.clients.map((c) => `<option value="${c.id}" ${c.id===cid?"selected":""}>${escapeHtml(c.name)}</option>`).join("")}</select>
       <span class="muted">${jobs.length} jobs</span>
     </div>
-    <div class="kanban">
-      ${statuses.map((s) => {
-        const col = jobs.filter((j) => j.status === s);
-        return `<div class="col"><h4>${STAT_LABEL[s]||s} · ${col.length}</h4>${col.map((j) => `
-          <div class="job-card" data-open="${j.id}">
-            <b>${escapeHtml(j.title)}</b>
-            <span>${j.method} · ${j.width_in}×${j.height_in} · qty ${j.qty}</span><br/>
-            <span>${money(j.total)}${j.due_at ? " · due " + escapeHtml(j.due_at) : ""}</span>
-          </div>`).join("") || `<p class="muted" style="font-size:12px">Empty</p>`}</div>`;
-      }).join("")}
-    </div>
+    <div class="kanban">${kanban}</div>
     <h3 style="margin-top:28px">List</h3>
     <table>
       <thead><tr><th>Title</th><th>Client</th><th>Method</th><th>Status</th><th>Due</th><th>Total</th><th></th></tr></thead>
-      <tbody>
-        ${jobs.map((j) => `<tr>
-          <td>${escapeHtml(j.title)}</td><td class="muted">${(j.client_id||"—").slice(0,8)}</td>
-          <td>${j.method}</td><td><span class="status">${STAT_LABEL[j.status]||j.status}</span></td>
-          <td>${escapeHtml(j.due_at||"—")}</td><td class="mono">${money(j.total)}</td>
-          <td><button class="btn ghost small" data-open="${j.id}">Open</button></td>
-        </tr>`).join("")}
-      </tbody>
+      <tbody>${rows}</tbody>
     </table>`;
+  }
+  const shopLead = emptyBoard
+    ? "Pick a process. Art station opens first — drop the file, then mock, price, proof, produce."
+    : "Start another run, or work the board below.";
+  main.innerHTML = `
+    <div class="row">
+      <h1 style="margin:0;font-size:32px">${emptyBoard ? "Start a job" : "Job board"}</h1>
+      ${user.role === "shop" ? `<button class="btn" id="goNew">New intake</button>` : ""}
+    </div>
+    ${user.role === "shop" ? `<p class="muted" style="margin:12px 0 4px">${shopLead}</p>${processGridHtml(true)}` : (emptyBoard ? `<p class="muted">No jobs assigned yet.</p>` : "")}
+    ${boardJobs}`;
+
   const go = $("#goNew"); if (go) go.onclick = () => { view = "intake"; nav(); render(); };
   ["q","st","cid"].forEach((id) => { const el = $("#"+id); if (el) el.onchange = () => renderBoard(); if (el && id==="q") el.onkeydown = (e) => { if (e.key==="Enter") renderBoard(); }; });
   main.querySelectorAll("[data-open]").forEach((b) => { b.onclick = () => openJob(b.dataset.open); });
@@ -268,7 +302,7 @@ function fillArt(el, job, shopControls) {
   el.innerHTML = `
     <div class="split">
       <div class="preview art-drop" id="artDrop" tabindex="0" role="button" aria-label="Drop art or click to upload">
-        ${job.file_path ? `<img src="${job.file_path}" alt="Art" />` : `<span class="drop-hint">Drop art or click to upload</span>`}
+        ${job.file_path ? `<img src="${job.file_path}" alt="Art" />` : `<div class="drop-hint"><span class="kicker">Studio drop</span><strong>Drop art here</strong><span>PNG, SVG, or PDF — click to browse</span></div>`}
       </div>
       <div>
         <p class="muted">PNG traces to cut contour. Replace the file, knock near-white to alpha, or swap a hex color.</p>

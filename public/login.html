@@ -8,12 +8,12 @@
   <link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Sans:wght@400;600;700&family=IBM+Plex+Serif:wght@600&display=swap" rel="stylesheet" />
   <link rel="stylesheet" href="/styles.css" />
 </head>
-<body>
+<body class="auth-page">
   <header class="topbar"><a class="brand" href="/"><img src="/logo.svg" alt="" /> DECOCLUB PRO</a></header>
   <form class="auth-box" id="form">
     <div class="kicker">Shop floor</div>
-    <h1 style="font-size:28px;margin:8px 0 0">Log in</h1>
-    <p class="muted" id="methodHint"></p>
+    <h1>Log in</h1>
+    <p class="muted" id="methodHint">Enter the floor. Jobs, proofs, packets.</p>
     <label>Email</label>
     <input name="email" type="email" autocomplete="username" required />
     <label>Password</label>
@@ -21,7 +21,7 @@
     <p class="notice" id="err"></p>
     <p class="muted" id="hint"></p>
     <button class="btn" type="submit">Enter floor</button>
-    <p class="muted">No account? <a href="/signup.html" id="altAuth">Create a shop or client login</a></p>
+    <p class="muted" style="margin-top:18px">No account? <a href="/signup.html" id="altAuth">Create a shop or client login</a></p>
   </form>
   <script>
     (function () {
