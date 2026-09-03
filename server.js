@@ -139,13 +139,27 @@ function tryVectorizeJob(job) {
   const buf = fs.readFileSync(abs);
   if (buf[0] !== 0x89 || buf[1] !== 0x50) return;
   try {
-    const vec = vectorize(buf, job.width_in, job.height_in);
+    const vec = vectorize(buf, job.width_in, job.height_in, { maxEdge: 640, colors: 8 });
     job.vector = vec;
     const svg = svgFromLayers(vec.layers, vec.widthIn, vec.heightIn);
     const name = Date.now() + "-" + uid() + "-vector.svg";
     fs.writeFileSync(path.join(UPLOADS, name), svg);
     job.vector_svg = "/uploads/" + name;
   } catch (e) { /* keep raster; never fail the upload */ }
+}
+function scheduleVectorize(jobId) {
+  setImmediate(function () {
+    try {
+      const db = load();
+      const job = db.jobs.find(function (j) { return j.id === jobId; });
+      if (!job || job.vector) return;
+      tryVectorizeJob(job);
+      if (job.vector) {
+        event(db, job, "Vectorized · " + ((job.vector.layers && job.vector.layers.length) || 0) + " layers");
+        save(db);
+      }
+    } catch (e) { /* never take down the shop */ }
+  });
 }
 function rewriteVectorSvg(job) {
   if (!job || !job.vector || !job.vector.layers) return;
@@ -264,7 +278,15 @@ function publicUser(u) {
 function readBody(req) {
   return new Promise(function (resolve, reject) {
     const chunks = [];
-    req.on("data", function (c) { chunks.push(c); });
+    let n = 0;
+    req.on("data", function (c) {
+      n += c.length;
+      if (n > 18 * 1024 * 1024) {
+        req.destroy();
+        return reject(new Error("File too large"));
+      }
+      chunks.push(c);
+    });
     req.on("end", function () { resolve(Buffer.concat(chunks)); });
     req.on("error", reject);
   });
@@ -551,8 +573,8 @@ async function handleApi(req, res, url) {
     if (job.file_path) job.status = "art_in";
     applyQuote(job); applyMockup(job);
     if (job.file_path) job.status = "mockup";
-    tryVectorizeJob(job);
     db.jobs.push(job); event(db, job, "Intake created"); save(db);
+    if (job.file_path) scheduleVectorize(job.id);
     return json(res, 200, { job: presentJob(job, req) });
   }
 
@@ -591,8 +613,8 @@ async function handleApi(req, res, url) {
     job.file_path = applyUploadMatte(parsed.file.path, parsed.fields);
     if (STATUSES.indexOf(job.status) < STATUSES.indexOf("art_in")) job.status = "art_in";
     applyMockup(job);
-    tryVectorizeJob(job);
     event(db, job, "Artwork replaced"); save(db);
+    scheduleVectorize(job.id);
     return json(res, 200, { job: presentJob(job, req) });
   }
   const ops = pth.match(/^\/api\/jobs\/([^/]+)\/artops$/);
@@ -609,8 +631,8 @@ async function handleApi(req, res, url) {
       fs.writeFileSync(path.join(UPLOADS, name), out);
       job.file_path = "/uploads/" + name;
       applyMockup(job);
-      tryVectorizeJob(job);
       event(db, job, "Artwork processed"); save(db);
+      scheduleVectorize(job.id);
       return json(res, 200, { job: presentJob(job, req) });
     } catch (err) { return json(res, 400, { error: IS_PROD ? "Could not process artwork" : err.message }); }
   }
@@ -943,7 +965,7 @@ function serveStatic(req, res, url) {
 const server = http.createServer(async function (req, res) {
   try {
     const url = new URL(req.url, "http://localhost");
-    if (url.pathname === "/health") return json(res, 200, { ok: true, name: "DecoClub Pro" });
+    if (url.pathname === "/health" || url.pathname === "/api/health") return json(res, 200, { ok: true, name: "DecoClub Pro" });
     if (url.pathname.indexOf("/api/") === 0) return await handleApi(req, res, url);
     return serveStatic(req, res, url);
   } catch (err) {
