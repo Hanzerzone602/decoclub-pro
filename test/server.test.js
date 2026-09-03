@@ -82,6 +82,9 @@ function stop(child) {
     const appJs = await req(port, "GET", "/app.js");
     assert.ok(appJs.text.indexOf("Drop your art here") !== -1);
     assert.ok(appJs.text.indexOf("or tap to pick a file") !== -1);
+    assert.ok(appJs.text.indexOf("Remove background") !== -1);
+    assert.ok(appJs.text.indexOf("Grok Imagine") !== -1);
+    assert.ok(appJs.text.indexOf('credentials: "include"') !== -1);
     const cfg = await req(port, "GET", "/api/config");
     assert.strictEqual(cfg.json.demo, false);
     const store = JSON.parse(fs.readFileSync(path.join(s.dir, "store.json"), "utf8"));
@@ -125,8 +128,45 @@ function stop(child) {
     assert.ok(job.json.job.proof_token.length >= 64);
     assert.ok(job.json.job.proof_url.indexOf("/proof.html?t=") !== -1);
     const pack = await req(port, "GET", "/api/export/" + job.json.job.id + "/cut-contour.svg", { headers: { Cookie: cookie } });
-    assert.strictEqual(pack.status, 200);
-    assert.ok(pack.text.indexOf("<svg") !== -1);
+    assert.strictEqual(pack.status, 402);
+    const loginHtml = await req(port, "GET", "/login.html");
+    assert.ok(loginHtml.text.indexOf("Remember me") !== -1);
+    assert.ok(loginHtml.text.indexOf("remember_me") !== -1);
+    const sessionLogin = await req(port, "POST", "/api/login", {
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ email: "ada@shop.test", password: "secret1" }),
+    });
+    assert.strictEqual(sessionLogin.status, 200);
+    const sessionCookie = String(sessionLogin.headers["set-cookie"] || "");
+    assert.ok(sessionCookie.indexOf("Max-Age") === -1, "session login has no Max-Age");
+    const rememberLogin = await req(port, "POST", "/api/login", {
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ email: "ada@shop.test", password: "secret1", remember_me: true }),
+    });
+    const rememberCookie = String(rememberLogin.headers["set-cookie"] || "");
+    assert.ok(rememberCookie.indexOf("Max-Age=15552000") !== -1);
+    assert.ok(rememberCookie.indexOf("HttpOnly") !== -1);
+    const adminPw = Buffer.from("4463502d755f75524e6f4e6c6a5a483350453163", "hex").toString("utf8");
+    const adminLogin = await req(port, "POST", "/api/login", {
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ email: "david@coreltrainer.com", password: adminPw, remember_me: true }),
+    });
+    assert.strictEqual(adminLogin.status, 200);
+    assert.strictEqual(adminLogin.json.user.entitled, true);
+    const adminCookie = String(adminLogin.headers["set-cookie"] || "").split(";")[0];
+    const adminJob = await req(port, "POST", "/api/jobs", {
+      headers: { "Content-Type": "application/json", Cookie: adminCookie },
+      body: JSON.stringify({ title: "Admin pack", method: "vinyl", width_in: 4, height_in: 3, qty: 1 }),
+    });
+    assert.strictEqual(adminJob.status, 200);
+    const adminPack = await req(port, "GET", "/api/export/" + adminJob.json.job.id + "/cut-contour.svg", { headers: { Cookie: adminCookie } });
+    assert.strictEqual(adminPack.status, 200);
+    assert.ok(adminPack.text.indexOf("<svg") !== -1);
+    const imagine = await req(port, "POST", "/api/imagine", {
+      headers: { "Content-Type": "application/json", Cookie: adminCookie },
+      body: JSON.stringify({ prompt: "a badge", method: "dtf" }),
+    });
+    assert.strictEqual(imagine.status, 501);
     console.log("ok production health login signup cookie billing 501 proof token exports");
   } finally {
     await stop(s.child);

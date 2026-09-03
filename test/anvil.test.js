@@ -6,6 +6,8 @@ const { encodePng, makeRgba, decodePng } = require("../lib/png");
 const { contourFromPngBuffer, svgFromContour } = require("../lib/contour");
 const { gangSheetSvg, gangLayout, SHEET_W_IN, GAP_IN, laserPlt, cutContourSvg } = require("../lib/exports");
 const { generateBadgePng } = require("../lib/demoart");
+const { removeBackground } = require("../lib/matte");
+const { pickImagineModel } = require("../lib/imagine");
 
 function squarePng() {
   const w = 48, h = 48;
@@ -79,6 +81,22 @@ function squarePng() {
   assert.ok(plt.indexOf("PU") !== -1);
   assert.ok(plt.indexOf("PD") !== -1);
   console.log("ok PLT packet");
+}
+
+{
+  const buf = squarePng();
+  const out = removeBackground(buf);
+  const img = decodePng(out);
+  assert.strictEqual(img.rgba[3], 0, "corner is transparent");
+  const mid = ((24 * 48 + 24) * 4) + 3;
+  assert.strictEqual(img.rgba[mid], 255, "center stays opaque");
+  console.log("ok production matte");
+}
+
+{
+  assert.strictEqual(pickImagineModel(["grok-imagine-image-1.5", "grok-imagine-image-2.0"]), "grok-imagine-image-2.0");
+  assert.strictEqual(pickImagineModel(["grok-imagine-image-2.0", "grok-imagine-image-3.0"]), "grok-imagine-image-3.0");
+  console.log("ok imagine newest model pick");
 }
 
 console.log("all tests passed");

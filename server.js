@@ -9,6 +9,8 @@ const { writeMockups, BLANKS } = require("./lib/mockup");
 const { loadCatalog, findSku, searchCatalog } = require("./lib/catalog");
 const { generateBadgePng } = require("./lib/demoart");
 const { processArtwork } = require("./lib/artops");
+const { removeBackground } = require("./lib/matte");
+const { imagineConfigured, generateImage } = require("./lib/imagine");
 const {
   loadEnvFile, createCheckoutSession, billingConfigured,
   verifyStripeSignature, applyStripeEvent,
@@ -68,7 +70,7 @@ function ensureAdminShop(db, user) {
   if (!user || user.role !== "admin") return false;
   if (user.shop_id && (db.shops || []).some(function (s) { return s.id === user.shop_id; })) return false;
   const now = new Date().toISOString();
-  const shop = { id: uid(), name: "My shop", logo_path: null, brand_color: "#c9b896", margin_pct: 20, created_at: now };
+  const shop = { id: uid(), name: "My shop", logo_path: null, brand_color: "#017ece", margin_pct: 20, created_at: now };
   db.shops.push(shop);
   user.shop_id = shop.id;
   return true;
@@ -93,6 +95,38 @@ function ensureAdmin(db) {
 }
 function canRunFloor(user) {
   return !!(user && (user.role === "shop" || (user.role === "admin" && user.shop_id)));
+}
+function isComped(user) { return !!(user && user.role === "admin"); }
+function isPaidMember(user) {
+  if (!user) return false;
+  if (user.plan !== "shop" && user.plan !== "studio") return false;
+  if (!user.plan_expires) return true;
+  return Date.parse(user.plan_expires) > Date.now();
+}
+function canProduce(user) { return isComped(user) || isPaidMember(user); }
+function requireProduce(user, res) {
+  if (canProduce(user)) return true;
+  json(res, 402, { error: "Membership required to finish production. Admin is complimentary. Shop and Studio plans unlock proofs and packets." });
+  return false;
+}
+function truthy(v) { return v === true || v === 1 || v === "1" || v === "true" || v === "on"; }
+function applyUploadMatte(publicPath, fields) {
+  if (!publicPath || !truthy(fields && (fields.remove_bg || fields.remove_background))) return publicPath;
+  const abs = path.join(UPLOADS, path.basename(publicPath));
+  if (!fs.existsSync(abs)) return publicPath;
+  const buf = fs.readFileSync(abs);
+  if (buf[0] !== 0x89 || buf[1] !== 0x50) return publicPath;
+  try {
+    const out = removeBackground(buf);
+    const name = Date.now() + "-" + uid() + ".png";
+    fs.writeFileSync(path.join(UPLOADS, name), out);
+    return "/uploads/" + name;
+  } catch (e) { return publicPath; }
+}
+function saveImaginePng(buf) {
+  const name = Date.now() + "-" + uid() + ".png";
+  fs.writeFileSync(path.join(UPLOADS, name), buf);
+  return "/uploads/" + name;
 }
 function requireAdmin(user, res) {
   if (!user || user.role !== "admin") {
@@ -145,7 +179,7 @@ function normalizeJob(job) {
 function seedDemoUsers(db) {
   const now = new Date().toISOString();
   const shopId = uid();
-  db.shops.push({ id: shopId, name: "Hearth & Horn Co.", logo_path: null, brand_color: "#c9b896", created_at: now, margin_pct: 20 });
+  db.shops.push({ id: shopId, name: "Hearth & Horn Co.", logo_path: null, brand_color: "#017ece", created_at: now, margin_pct: 20 });
   db.users.push({ id: uid(), email: "owner@anvil.local", name: "Shop Owner", password_hash: hashPass("anvil123"), role: "shop", shop_id: shopId, plan: "studio", plan_expires: null, created_at: now });
   db.users.push({ id: uid(), email: "client@anvil.local", name: "Jordan Client", password_hash: hashPass("anvil123"), role: "client", shop_id: shopId, plan: "client", plan_expires: null, created_at: now });
 }
@@ -194,11 +228,12 @@ function currentUser(req, db) {
   if (!token) return null;
   const sess = db.sessions.find(function (s) { return s.token === token; });
   if (!sess) return null;
+  if (sess.expires && Date.now() > Date.parse(sess.expires)) return null;
   return db.users.find(function (u) { return u.id === sess.user_id; }) || null;
 }
 function publicUser(u) {
   if (!u) return null;
-  return { id: u.id, email: u.email, name: u.name, role: u.role, shopId: u.shop_id, plan: u.plan, planExpires: u.plan_expires };
+  return { id: u.id, email: u.email, name: u.name, role: u.role, shopId: u.shop_id, plan: u.plan, planExpires: u.plan_expires, entitled: canProduce(u) };
 }
 function readBody(req) {
   return new Promise(function (resolve, reject) {
@@ -240,10 +275,17 @@ function isHttpsReq(req) {
   if (String(process.env.PUBLIC_URL || "").indexOf("https://") === 0) return true;
   return String((req && req.headers && req.headers["x-forwarded-proto"]) || "").split(",")[0].trim() === "https";
 }
-function cookieFlags(req) {
-  return "Path=/; HttpOnly; SameSite=Lax; Max-Age=" + (30 * 86400) + (isHttpsReq(req) ? "; Secure" : "");
+function cookieFlags(req, remember) {
+  var flags = "Path=/; HttpOnly; SameSite=Lax";
+  if (remember) flags += "; Max-Age=15552000";
+  if (isHttpsReq(req)) flags += "; Secure";
+  return flags;
 }
-function setSession(res, token, req) { res.setHeader("Set-Cookie", COOKIE + "=" + token + "; " + cookieFlags(req)); }
+function setSession(res, token, req, remember) { res.setHeader("Set-Cookie", COOKIE + "=" + token + "; " + cookieFlags(req, remember)); }
+function sessionRecord(userId, remember) {
+  const now = Date.now();
+  return { token: uid(), user_id: userId, created_at: new Date(now).toISOString(), remember: !!remember, expires: new Date(now + (remember ? 15552000 : 12 * 3600) * 1000).toISOString() };
+}
 function clearSession(res, req) { res.setHeader("Set-Cookie", COOKIE + "=; Path=/; HttpOnly; SameSite=Lax; Max-Age=0" + (isHttpsReq(req) ? "; Secure" : "")); }
 function originOf(req) {
   if (process.env.PUBLIC_URL) return process.env.PUBLIC_URL.replace(/\/$/, "");
@@ -299,13 +341,24 @@ async function handleApi(req, res, url) {
   const pth = url.pathname;
 
   if (pth === "/api/config" && method === "GET") {
-    return json(res, 200, { demo: allowDemo(), billing: billingConfigured(), name: "DecoClub Pro", statuses: STATUSES, methods: METHODS, blanks: BLANKS, seed: allowDemo() ? { owner: "owner@anvil.local", client: "client@anvil.local", password: "anvil123" } : null });
+    return json(res, 200, { demo: allowDemo(), billing: billingConfigured(), imagine: imagineConfigured(), imagineModel: "latest", name: "DecoClub Pro", statuses: STATUSES, methods: METHODS, blanks: BLANKS, seed: allowDemo() ? { owner: "owner@anvil.local", client: "client@anvil.local", password: "anvil123" } : null });
   }
   if (pth === "/api/quote" && (method === "POST" || method === "GET")) {
     const body = method === "GET" ? { method: url.searchParams.get("method"), width_in: url.searchParams.get("width_in"), height_in: url.searchParams.get("height_in"), qty: url.searchParams.get("qty"), margin_pct: url.searchParams.get("margin_pct") } : parseJsonBody(await readBody(req));
     return json(res, 200, { quote: priceQuote(body) });
   }
-  if (pth === "/api/me" && method === "GET") return json(res, 200, { user: publicUser(user) });
+  if (pth === "/api/me" && method === "GET") {
+    if (user) {
+      const token = parseCookies(req)[COOKIE];
+      const sess = (db.sessions || []).find(function (s) { return s.token === token; });
+      if (sess && sess.remember) {
+        sess.expires = new Date(Date.now() + 15552000 * 1000).toISOString();
+        save(db);
+        setSession(res, sess.token, req, true);
+      }
+    }
+    return json(res, 200, { user: publicUser(user) });
+  }
   if (pth === "/api/catalog" && method === "GET") {
     const q = url.searchParams.get("q");
     const skus = searchCatalog(q);
@@ -323,14 +376,15 @@ async function handleApi(req, res, url) {
     let shop_id = null;
     if (role === "shop") {
       shop_id = uid();
-      db.shops.push({ id: shop_id, name: body.shopName || (body.name + "'s Shop"), logo_path: null, brand_color: "#c9b896", margin_pct: 20, created_at: now });
+      db.shops.push({ id: shop_id, name: body.shopName || (body.name + "'s Shop"), logo_path: null, brand_color: "#017ece", margin_pct: 20, created_at: now });
     }
     const trialDays = Number((db.settings && db.settings.trial_days) || 7);
     const u = { id: uid(), email: email, name: body.name, password_hash: hashPass(body.password), role: role, shop_id: shop_id, plan: role === "shop" ? "trial" : "client", plan_expires: role === "shop" ? new Date(Date.now() + trialDays * 864e5).toISOString() : null, created_at: now };
     db.users.push(u);
-    const token = uid();
-    db.sessions.push({ token: token, user_id: u.id, created_at: now });
-    save(db); setSession(res, token, req);
+    const remember = body.remember_me == null ? true : truthy(body.remember_me);
+    const sess = sessionRecord(u.id, remember);
+    db.sessions.push(sess);
+    save(db); setSession(res, sess.token, req, remember);
     return json(res, 200, { user: publicUser(u) });
   }
   if (pth === "/api/login" && method === "POST") {
@@ -338,9 +392,10 @@ async function handleApi(req, res, url) {
     const u = db.users.find(function (x) { return x.email === String(body.email || "").toLowerCase(); });
     if (!u || !checkPass(body.password || "", u.password_hash)) return json(res, 401, { error: "Invalid email or password" });
     if (ensureAdminShop(db, u)) save(db);
-    const token = uid();
-    db.sessions.push({ token: token, user_id: u.id, created_at: new Date().toISOString() });
-    save(db); setSession(res, token, req);
+    const remember = truthy(body.remember_me);
+    const sess = sessionRecord(u.id, remember);
+    db.sessions.push(sess);
+    save(db); setSession(res, sess.token, req, remember);
     return json(res, 200, { user: publicUser(u) });
   }
   if (pth === "/api/logout" && method === "POST") {
@@ -416,6 +471,37 @@ async function handleApi(req, res, url) {
     jobs.sort(function (a, b) { return String(b.updated_at).localeCompare(String(a.updated_at)); });
     return json(res, 200, { jobs: jobs.map(function (j) { return presentJob(j, req); }) });
   }
+  if (pth === "/api/imagine" && method === "POST") {
+    if (!canRunFloor(user)) return json(res, 403, { error: "Shop login required" });
+    if (!requireProduce(user, res)) return;
+    if (!imagineConfigured()) return json(res, 501, { error: "Grok Imagine is not configured" });
+    const body = parseJsonBody(await readBody(req));
+    const prompt = String(body.prompt || "").trim();
+    if (!prompt) return json(res, 400, { error: "Prompt required" });
+    const methodName = METHODS.indexOf(body.method) !== -1 ? body.method : "apparel";
+    try {
+      const buf = await generateImage({ prompt: prompt });
+      const shop = db.shops.find(function (s) { return s.id === user.shop_id; });
+      const now = new Date().toISOString();
+      const job = {
+        id: uid(), shop_id: user.shop_id, client_id: null, title: prompt.slice(0, 48) || "Imagine",
+        method: methodName, status: "art_in",
+        notes: "", art_notes: "Grok Imagine · " + prompt,
+        width_in: 10, height_in: 10, qty: 1,
+        due_at: null, file_path: saveImaginePng(buf),
+        proof_token: proofToken(), blank: null, garment_color: "#2c3138",
+        placement: "chest", catalog_code: null,
+        margin_pct: (shop && shop.margin_pct) || 0,
+        line_items: [], comments: [], created_at: now, updated_at: now,
+      };
+      applyQuote(job); applyMockup(job);
+      if (job.file_path) job.status = "mockup";
+      db.jobs.push(job); event(db, job, "Grok Imagine"); save(db);
+      return json(res, 200, { job: presentJob(job, req) });
+    } catch (err) {
+      return json(res, 502, { error: IS_PROD ? "Imagine failed" : err.message });
+    }
+  }
   if (pth === "/api/jobs" && method === "POST") {
     if (!canRunFloor(user)) return json(res, 403, { error: "Shop login required" });
     const raw = await readBody(req);
@@ -434,6 +520,7 @@ async function handleApi(req, res, url) {
       margin_pct: f.margin_pct != null ? Number(f.margin_pct) : (shop && shop.margin_pct) || 0,
       line_items: [], comments: [], created_at: now, updated_at: now,
     };
+    if (parsed.file) job.file_path = applyUploadMatte(job.file_path, f);
     if (job.file_path) job.status = "art_in";
     applyQuote(job); applyMockup(job);
     if (job.file_path) job.status = "mockup";
@@ -473,7 +560,7 @@ async function handleApi(req, res, url) {
     if (!job) return json(res, 404, { error: "Job not found" });
     const parsed = parseMultipart(await readBody(req), req.headers["content-type"]);
     if (!parsed.file) return json(res, 400, { error: "Artwork file required" });
-    job.file_path = parsed.file.path;
+    job.file_path = applyUploadMatte(parsed.file.path, parsed.fields);
     if (STATUSES.indexOf(job.status) < STATUSES.indexOf("art_in")) job.status = "art_in";
     applyMockup(job); event(db, job, "Artwork replaced"); save(db);
     return json(res, 200, { job: presentJob(job, req) });
@@ -494,6 +581,37 @@ async function handleApi(req, res, url) {
       applyMockup(job); event(db, job, "Artwork processed"); save(db);
       return json(res, 200, { job: presentJob(job, req) });
     } catch (err) { return json(res, 400, { error: IS_PROD ? "Could not process artwork" : err.message }); }
+  }
+  const imgJob = pth.match(/^\/api\/jobs\/([^/]+)\/imagine$/);
+  if (imgJob && method === "POST") {
+    if (!canRunFloor(user)) return json(res, 403, { error: "Shop login required" });
+    if (!requireProduce(user, res)) return;
+    if (!imagineConfigured()) return json(res, 501, { error: "Grok Imagine is not configured" });
+    const job = db.jobs.find(function (j) { return j.id === imgJob[1] && j.shop_id === user.shop_id; });
+    if (!job) return json(res, 404, { error: "Job not found" });
+    const body = parseJsonBody(await readBody(req));
+    const prompt = String(body.prompt || "").trim();
+    if (!prompt) return json(res, 400, { error: "Prompt required" });
+    let imageBuf = null;
+    let mime = "image/png";
+    if (job.file_path) {
+      const abs = path.join(UPLOADS, path.basename(job.file_path));
+      if (fs.existsSync(abs)) {
+        imageBuf = fs.readFileSync(abs);
+        const ext = path.extname(abs).toLowerCase();
+        if (ext === ".jpg" || ext === ".jpeg") mime = "image/jpeg";
+        else if (ext === ".webp") mime = "image/webp";
+      }
+    }
+    try {
+      const buf = await generateImage({ prompt: prompt, imageBuf: imageBuf, mime: mime });
+      job.file_path = saveImaginePng(buf);
+      if (STATUSES.indexOf(job.status) < STATUSES.indexOf("art_in")) job.status = "art_in";
+      applyMockup(job); event(db, job, "Grok Imagine"); save(db);
+      return json(res, 200, { job: presentJob(job, req) });
+    } catch (err) {
+      return json(res, 502, { error: IS_PROD ? "Imagine failed" : err.message });
+    }
   }
   const mk = pth.match(/^\/api\/jobs\/([^/]+)\/mockup$/);
   if (mk && method === "POST") {
@@ -544,6 +662,7 @@ async function handleApi(req, res, url) {
     const next = mapLegacyStatus(body.status);
     if (canRunFloor(user)) {
       if (job.shop_id !== user.shop_id) return json(res, 403, { error: "Forbidden" });
+      if (["proof_sent", "approved", "in_production", "done"].indexOf(next) !== -1 && !requireProduce(user, res)) return;
     } else if (job.client_id !== user.id || next !== "approved") {
       return json(res, 403, { error: "Clients can only approve" });
     }
@@ -597,6 +716,7 @@ async function handleApi(req, res, url) {
   const poster = pth.match(/^\/api\/export\/([^/]+)\/intake-poster.svg$/);
   if (poster && method === "GET") {
     if (!canRunFloor(user)) return json(res, 403, { error: "Shop login required" });
+    if (!requireProduce(user, res)) return;
     const job = db.jobs.find(function (j) { return j.id === poster[1] && j.shop_id === user.shop_id; });
     if (!job) return json(res, 404, { error: "Job not found" });
     const shop = db.shops.find(function (s) { return s.id === user.shop_id; });
@@ -605,6 +725,7 @@ async function handleApi(req, res, url) {
   const expFile = pth.match(/^\/api\/export\/([^/]+)\/([^/]+)$/);
   if (expFile && method === "GET") {
     if (!canRunFloor(user)) return json(res, 403, { error: "Shop login required" });
+    if (!requireProduce(user, res)) return;
     const job = db.jobs.find(function (j) { return j.id === expFile[1] && j.shop_id === user.shop_id; });
     if (!job) return json(res, 404, { error: "Job not found" });
     job._shop = db.shops.find(function (s) { return s.id === user.shop_id; });
@@ -618,6 +739,7 @@ async function handleApi(req, res, url) {
   const exp = pth.match(/^\/api\/export\/([^/]+)$/);
   if (exp && method === "GET") {
     if (!canRunFloor(user)) return json(res, 403, { error: "Shop login required" });
+    if (!requireProduce(user, res)) return;
     const job = db.jobs.find(function (j) { return j.id === exp[1] && j.shop_id === user.shop_id; });
     if (!job) return json(res, 404, { error: "Job not found" });
     job._shop = db.shops.find(function (s) { return s.id === user.shop_id; });
@@ -650,7 +772,7 @@ async function handleApi(req, res, url) {
     const now = new Date().toISOString();
     const shop = {
       id: uid(), name: body.name, logo_path: null,
-      brand_color: body.brand_color || "#c9b896", margin_pct: body.margin_pct != null ? Number(body.margin_pct) : 20,
+      brand_color: body.brand_color || "#017ece", margin_pct: body.margin_pct != null ? Number(body.margin_pct) : 20,
       created_at: now,
     };
     db.shops.push(shop); save(db);

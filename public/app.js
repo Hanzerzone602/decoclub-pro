@@ -34,6 +34,7 @@ const BLANKS = ["tee","hoodie","hat","tumbler","plaque","sticker","sign","hoop"]
 const PLACES = ["chest","left_chest","full","back","front","wrap","center"];
 
 async function api(url, opts = {}) {
+  opts = Object.assign({ credentials: "include" }, opts);
   const res = await fetch(url, opts);
   const data = await res.json().catch(() => ({}));
   if (!res.ok) throw new Error(data.error || "Request failed");
@@ -43,6 +44,11 @@ function money(n) { return "$" + Number(n || 0).toFixed(2); }
 function escapeHtml(s) { return String(s || "").replace(/[&<>"']/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c])); }
 function canFloor() {
   return !!(user && (user.role === "shop" || (user.role === "admin" && user.shopId)));
+}
+function entitled() { return !!(user && user.entitled); }
+function paywallNote() {
+  if (entitled()) return "";
+  return '<p class="notice" id="paywall">Proofs and packets need Shop or Studio. Only admin runs the full floor for free.</p>';
 }
 function nav() {
   document.querySelectorAll(".linkish").forEach((b) => {
@@ -73,7 +79,7 @@ async function boot() {
   const s = await api("/api/shop");
   shop = s.shop;
   cfg.billing = s.billing;
-  $("#who").textContent = user.name + " · " + user.role + " · " + user.plan;
+  $("#who").textContent = user.name + " · " + user.role + " · " + user.plan + (entitled() ? "" : " · trial");
   if (shop) {
     $("#sideName").textContent = shop.name;
     if (shop.logo_path) $("#sideLogo").src = shop.logo_path;
@@ -111,8 +117,10 @@ async function startJobFromFile(file, method) {
   fd.append("width_in", "10");
   fd.append("height_in", "10");
   fd.append("qty", "1");
+  const rm = document.getElementById("rmbg");
+  fd.append("remove_bg", !rm || rm.checked ? "1" : "0");
   fd.append("artwork", file);
-  const res = await fetch("/api/jobs", { method: "POST", body: fd });
+  const res = await fetch("/api/jobs", { method: "POST", credentials: "include", body: fd });
   const data = await res.json().catch(() => ({}));
   if (!res.ok) throw new Error(data.error || "Could not start");
   openJob(data.job.id, "art");
@@ -150,6 +158,7 @@ async function renderMake() {
     <div class="make-home">
       <h1 class="make-title">Drop your art here</h1>
       <p class="muted make-sub">One file starts it. That is setup.</p>
+      ${paywallNote()}
       <div class="make-drop" id="makeDrop" tabindex="0" role="button" aria-label="Drop your art here or tap to pick a file">
         <div class="drop-hint">
           <strong>Drop your art here</strong>
@@ -157,7 +166,15 @@ async function renderMake() {
         </div>
         <input id="makeFile" type="file" accept="image/*,.svg,.pdf" hidden />
       </div>
+      <label class="remember"><input id="rmbg" type="checkbox" checked /> Remove background · production</label>
       <div class="process-chips" id="makeChips">${chips}</div>
+      <div class="card" style="margin-top:18px">
+        <div class="kicker">Grok Imagine</div>
+        <p class="muted">Newest image model. Typed art for this process.</p>
+        <textarea id="imaginePrompt" rows="2" placeholder="A varsity mascot, clean print-ready graphic on transparent"></textarea>
+        <button class="btn small" type="button" id="imagineGo">Generate</button>
+        <p class="muted" id="imagineHint"></p>
+      </div>
       <p class="notice" id="makeErr"></p>
     </div>`;
   main.querySelectorAll("[data-chip]").forEach((b) => {
@@ -187,6 +204,17 @@ async function renderMake() {
     if (f) take(f);
   };
   fileEl.onchange = () => { if (fileEl.files && fileEl.files[0]) take(fileEl.files[0]); };
+  const hint = $("#imagineHint");
+  if (!cfg.imagine && hint) hint.textContent = "Imagine is warming up on the server.";
+  const go = $("#imagineGo");
+  if (go) go.onclick = async () => {
+    const prompt = ($("#imaginePrompt") && $("#imaginePrompt").value || "").trim();
+    if (!prompt) { $("#makeErr").textContent = "Describe the graphic first."; return; }
+    try {
+      const data = await api("/api/imagine", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ prompt: prompt, method: makeMethod }) });
+      openJob(data.job.id, "art");
+    } catch (err) { $("#makeErr").textContent = err.message; }
+  };
 }
 
 async function renderBoard() {
@@ -268,13 +296,14 @@ async function renderIntake() {
       <label>Shop margin %</label><input name="margin_pct" type="number" step="0.1" value="${shop && shop.margin_pct != null ? shop.margin_pct : 20}" />
       <label>Notes</label><textarea name="notes" rows="2"></textarea>
       <label>Artwork</label><input name="artwork" type="file" accept="image/*,.svg,.pdf" />
+      <label class="remember"><input name="remove_bg" type="checkbox" checked /> Remove background · production</label>
       <p class="notice" id="err"></p>
       <button class="btn" type="submit">Create job</button>
     </form>`;
   $("#jobForm").onsubmit = async (e) => {
     e.preventDefault();
     try {
-      const res = await fetch("/api/jobs", { method: "POST", body: new FormData(e.target) });
+      const res = await fetch("/api/jobs", { method: "POST", credentials: "include", body: new FormData(e.target) });
       const data = await res.json();
       if (!res.ok) throw new Error(data.error);
       openJob(data.job.id);
@@ -296,6 +325,7 @@ async function renderJob(id) {
       <span class="status">${STAT_LABEL[job.status]||job.status}</span>
     </div>
     <p class="muted">${job.method} · ${job.width_in}×${job.height_in} in · qty ${job.qty} · ${money(job.total)}${job.due_at ? " · due " + escapeHtml(job.due_at) : ""}</p>
+    ${paywallNote()}
     <div class="tabs">${tabs.map(([k,l]) => `<button data-tab="${k}" class="${station===k?"on":""}">${l}</button>`).join("")}</div>
     <div id="station"></div>
     <h3>Timeline</h3>
@@ -358,10 +388,17 @@ function fillArt(el, job, shopControls) {
         ${shopControls ? `
           <form id="up" style="margin:12px 0">
             <input name="artwork" id="artFile" type="file" accept="image/*,.svg,.pdf" />
+            <label class="remember"><input name="remove_bg" id="rmbg" type="checkbox" checked /> Remove background · production</label>
             <button class="btn small" type="submit">Replace artwork</button>
           </form>
           <div class="row">
+            <button class="btn small" id="rmbgBtn">Remove background</button>
             <button class="btn ghost small" id="ko">Knockout white</button>
+          </div>
+          <div class="card" style="margin:12px 0">
+            <div class="kicker">Grok Imagine</div>
+            <textarea id="imaginePrompt" rows="2" placeholder="Edit this art or describe a new graphic"></textarea>
+            <button class="btn small" type="button" id="imagineGo">Imagine</button>
           </div>
           <form id="swap" class="form">
             <label>Color swap from → to</label>
@@ -376,7 +413,9 @@ function fillArt(el, job, shopControls) {
     if (!file) return;
     const fd = new FormData();
     fd.append("artwork", file);
-    const res = await fetch("/api/jobs/" + job.id + "/artwork", { method: "POST", body: fd });
+    const rm = document.getElementById("rmbg");
+    fd.append("remove_bg", !rm || rm.checked ? "1" : "0");
+    const res = await fetch("/api/jobs/" + job.id + "/artwork", { method: "POST", credentials: "include", body: fd });
     const data = await res.json();
     if (!res.ok) { $("#err").textContent = data.error; return; }
     renderJob(job.id);
@@ -398,13 +437,24 @@ function fillArt(el, job, shopControls) {
     e.preventDefault();
     const file = artFile.files && artFile.files[0];
     if (file) return uploadArtwork(file);
-    const res = await fetch("/api/jobs/" + job.id + "/artwork", { method: "POST", body: new FormData(e.target) });
+    const res = await fetch("/api/jobs/" + job.id + "/artwork", { method: "POST", credentials: "include", body: new FormData(e.target) });
     const data = await res.json();
     if (!res.ok) { $("#err").textContent = data.error; return; }
     renderJob(job.id);
   };
+  $("#rmbgBtn").onclick = async () => {
+    try { await api("/api/jobs/" + job.id + "/artops", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ remove_background: true, knockout: "production" }) }); renderJob(job.id); }
+    catch (err) { $("#err").textContent = err.message; }
+  };
   $("#ko").onclick = async () => {
     try { await api("/api/jobs/" + job.id + "/artops", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ knockout: "white" }) }); renderJob(job.id); }
+    catch (err) { $("#err").textContent = err.message; }
+  };
+  const ig = $("#imagineGo");
+  if (ig) ig.onclick = async () => {
+    const prompt = ($("#imaginePrompt") && $("#imaginePrompt").value || "").trim();
+    if (!prompt) { $("#err").textContent = "Describe the graphic first."; return; }
+    try { await api("/api/jobs/" + job.id + "/imagine", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ prompt: prompt }) }); renderJob(job.id); }
     catch (err) { $("#err").textContent = err.message; }
   };
   $("#swap").onsubmit = async (e) => {
@@ -543,8 +593,8 @@ function fillProof(el, job, shopControls) {
     <div class="cta-row">
       <button class="btn small" id="copy">Copy link</button>
       <a class="btn ghost small" href="${job.proof_url}" target="_blank">Open proof</a>
-      ${shopControls ? `<a class="btn ghost small" href="/api/export/${job.id}/intake-poster.svg">Booth poster SVG</a>
-      <button class="btn small" id="send">Mark proof sent</button>` : ""}
+      ${shopControls && entitled() ? `<a class="btn ghost small" href="/api/export/${job.id}/intake-poster.svg">Booth poster SVG</a>
+      <button class="btn small" id="send">Mark proof sent</button>` : (shopControls ? `<span class="muted">Membership required to send proofs.</span>` : "")}
     </div>
     <p class="muted" style="margin-top:12px">Status: ${STAT_LABEL[job.status]||job.status}. Client comments appear below after they write on the proof page.</p>
     <ul>${(job.comments||[]).map((c) => `<li><strong>${escapeHtml(c.author)}</strong> — ${escapeHtml(c.body)}</li>`).join("") || "<li class='muted'>No comments yet</li>"}</ul>`;
@@ -558,6 +608,7 @@ function fillProof(el, job, shopControls) {
 
 function fillProduce(el, job, shopControls) {
   if (!shopControls) { el.innerHTML = "<p class='muted'>Production files are shop-only.</p>"; return; }
+  if (!entitled()) { el.innerHTML = paywallNote() + "<p class='muted'>Packets stay locked until Shop or Studio is active. Admin is complimentary.</p>"; return; }
   el.innerHTML = `
     <p class="muted">Real files written under DATA_DIR/exports. Embroidery DST and rhinestone stone libraries are not invented — notes ship in the packet.</p>
     <div class="export-grid">
@@ -644,7 +695,7 @@ async function renderSettings() {
         <label>Shop name (proofs, tickets, booth poster)</label>
         <input name="name" value="${escapeHtml(shop?.name || "")}" />
         <label>Brand color</label>
-        <input name="brand_color" type="color" value="${shop?.brand_color || "#c9b896"}" />
+        <input name="brand_color" type="color" value="${shop?.brand_color || "#017ece"}" />
         <label>Default margin %</label>
         <input name="margin_pct" type="number" step="0.1" value="${shop?.margin_pct != null ? shop.margin_pct : 20}" />
         <label>Logo</label>
@@ -652,7 +703,8 @@ async function renderSettings() {
         <button class="btn" type="submit">Save brand</button>
       </form>
       <h3>Billing</h3>
-      <p class="muted" id="billnote">${cfg.billing ? "Stripe is configured. Checkout does not mark the shop paid until the webhook." : "Billing not configured — STRIPE_SECRET_KEY is unset. Checkout returns 501. We will not fake a paid plan."}</p>
+      ${paywallNote()}
+      <p class="muted" id="billnote">${cfg.billing ? "Stripe is configured. Checkout does not mark the shop paid until the webhook." : "Billing not configured — STRIPE_SECRET_KEY is unset. Checkout returns 501. We will not fake a paid plan. Admin still runs the floor for free."}</p>
       <div class="cta-row">
         <button class="btn ghost" data-plan="trial">Trial</button>
         <button class="btn ghost" data-plan="shop">Shop $79</button>
@@ -661,7 +713,7 @@ async function renderSettings() {
   const sf = $("#sf");
   if (sf) sf.onsubmit = async (e) => {
     e.preventDefault();
-    const shopRes = await fetch("/api/shop", { method: "POST", body: new FormData(sf) });
+    const shopRes = await fetch("/api/shop", { method: "POST", credentials: "include", body: new FormData(sf) });
     shop = (await shopRes.json()).shop;
     if (shop?.logo_path) $("#sideLogo").src = shop.logo_path;
     $("#sideName").textContent = shop.name;

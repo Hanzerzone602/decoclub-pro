@@ -4,12 +4,12 @@
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1" />
   <title>Log in · DecoClub Pro</title>
-  <link rel="icon" href="/logo.svg" />
+  <link rel="icon" href="/logo.png" />
   <link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Sans:wght@400;600;700&family=IBM+Plex+Serif:wght@600&display=swap" rel="stylesheet" />
   <link rel="stylesheet" href="/styles.css" />
 </head>
 <body class="auth-page">
-  <header class="topbar"><a class="brand" href="/"><img src="/logo.svg" alt="" /> DECOCLUB PRO</a></header>
+  <header class="topbar"><a class="brand" href="/"><img src="/logo.png" alt="" /> DECOCLUB PRO</a></header>
   <form class="auth-box" id="form">
     <div class="kicker">Shop floor</div>
     <h1>Log in</h1>
@@ -18,6 +18,7 @@
     <input name="email" type="email" autocomplete="username" required />
     <label>Password</label>
     <input name="password" type="password" autocomplete="current-password" required />
+    <label class="remember"><input name="remember_me" id="remember" type="checkbox" checked /> Remember me</label>
     <p class="notice" id="err"></p>
     <p class="muted" id="hint"></p>
     <button class="btn" type="submit">Enter floor</button>
@@ -36,13 +37,18 @@
         var mh = document.getElementById("methodHint");
         if (mh) mh.textContent = "We will open a " + (LABELS[method] || method) + " job on Art after you enter the floor.";
       }
-      fetch("/api/config").then(r => r.json()).then(c => {
+      var savedEmail = localStorage.getItem("decoclub_email") || "";
+      if (savedEmail) { var em = document.querySelector("input[name=email]"); if (em) em.value = savedEmail; }
+      fetch("/api/config", { credentials: "include" }).then(r => r.json()).then(c => {
         if (c.demo && c.seed) document.getElementById("hint").textContent = "Seed: " + c.seed.owner + " / " + c.seed.password;
       }).catch(() => {});
       document.getElementById("form").onsubmit = async (e) => {
         e.preventDefault();
         const fd = new FormData(e.target);
-        const res = await fetch("/api/login", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ email: fd.get("email"), password: fd.get("password") }) });
+        const remember = !!document.getElementById("remember").checked;
+        if (remember) localStorage.setItem("decoclub_email", fd.get("email") || "");
+        else localStorage.removeItem("decoclub_email");
+        const res = await fetch("/api/login", { method: "POST", credentials: "include", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ email: fd.get("email"), password: fd.get("password"), remember_me: remember }) });
         const data = await res.json();
         if (!res.ok) { document.getElementById("err").textContent = data.error; return; }
         location.href = method ? "/app.html?method=" + encodeURIComponent(method) : "/app.html";
