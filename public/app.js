@@ -109,8 +109,63 @@ function titleFromFile(file) {
   const cut = n.replace(/\.[^.]+$/, "");
   return cut || n;
 }
+function loadImageEl(url) {
+  return new Promise((resolve, reject) => {
+    const img = new Image();
+    img.crossOrigin = "anonymous";
+    img.onload = () => resolve(img);
+    img.onerror = () => reject(new Error("Could not read that image on this PC"));
+    img.src = url;
+  });
+}
+async function rasterToPngFile(src, name) {
+  const url = typeof src === "string" ? src : URL.createObjectURL(src);
+  const img = await loadImageEl(url);
+  if (typeof src !== "string") URL.revokeObjectURL(url);
+  let w = img.naturalWidth || img.width;
+  let h = img.naturalHeight || img.height;
+  if (!w || !h) throw new Error("Could not read that artwork");
+  const max = 2400;
+  if (w > max || h > max) {
+    const s = max / Math.max(w, h);
+    w = Math.round(w * s);
+    h = Math.round(h * s);
+  }
+  const canvas = document.createElement("canvas");
+  canvas.width = w;
+  canvas.height = h;
+  const ctx = canvas.getContext("2d");
+  ctx.drawImage(img, 0, 0, w, h);
+  const blob = await new Promise((resolve, reject) => {
+    canvas.toBlob((b) => b ? resolve(b) : reject(new Error("Could not convert artwork")), "image/png");
+  });
+  const base = String(name || "art").replace(/\.[^.]+$/, "") + ".png";
+  return new File([blob], base, { type: "image/png" });
+}
+async function fileToPng(file) {
+  if (!file) return file;
+  const n = file.name || "";
+  const typ = file.type || "";
+  if (typ === "image/png" || /\.png$/i.test(n)) return file;
+  if (typ === "application/pdf" || /\.pdf$/i.test(n)) throw new Error("Export the PDF as PNG or JPG first");
+  return rasterToPngFile(file, n);
+}
+async function ensurePngArtwork(job) {
+  const pth = job && job.file_path;
+  if (!pth) throw new Error("Drop artwork first");
+  if (/\.png$/i.test(pth)) return job;
+  const file = await rasterToPngFile(pth, "art.png");
+  const fd = new FormData();
+  fd.append("artwork", file);
+  fd.append("remove_bg", "0");
+  const res = await fetch("/api/jobs/" + job.id + "/artwork", { method: "POST", credentials: "include", body: fd });
+  const data = await res.json().catch(() => ({}));
+  if (!res.ok) throw new Error(data.error || "Could not convert artwork");
+  return data.job || job;
+}
 async function startJobFromFile(file, method) {
   if (!file) throw new Error("Pick a file first.");
+  file = await fileToPng(file);
   const fd = new FormData();
   fd.append("title", titleFromFile(file));
   fd.append("method", METHODS.indexOf(method) !== -1 ? method : "apparel");
@@ -392,7 +447,7 @@ async function fillArt(el, job, shopControls) {
   const layers = (job.vector && job.vector.layers) || [];
   const preview = job.vector_svg
     ? `<img src="${job.vector_svg}" alt="Vector" />`
-    : (job.file_path ? `<img src="${job.file_path}" alt="Art" />` : `<div class="drop-hint"><span class="kicker">Studio drop</span><strong>Drop art here</strong><span>PNG, SVG, or PDF — click to browse</span></div>`);
+    : (job.file_path ? `<img src="${job.file_path}" alt="Art" />` : `<div class="drop-hint"><span class="kicker">Studio drop</span><strong>Drop art here</strong><span>PNG, JPG, WebP, or SVG — click to browse</span></div>`);
   const layerRows = layers.map((L, i) => `
     <div class="layer-row" data-layer="${i}">
       <span class="layer-chip" style="background:${escapeHtml(L.hex)}"></span>
@@ -400,7 +455,7 @@ async function fillArt(el, job, shopControls) {
       ${palSelect("vinyl", pals, L.hex)}
       ${palSelect("thread", pals, L.hex)}
       ${palSelect("stone", pals, L.hex)}
-    </div>`).join("") || `<p class="muted">No vector layers yet. Vectorize a PNG.</p>`;
+    </div>`).join("") || `<p class="muted">No vector layers yet. Vectorize — JPG, PNG, and WebP all work.</p>`;
   el.innerHTML = `
     <div class="split">
       <div class="preview art-drop" id="artDrop" tabindex="0" role="button" aria-label="Drop art or click to upload">
@@ -438,6 +493,7 @@ async function fillArt(el, job, shopControls) {
   if (!shopControls) return;
   async function uploadArtwork(file) {
     if (!file) return;
+    file = await fileToPng(file);
     const fd = new FormData();
     fd.append("artwork", file);
     const rm = document.getElementById("rmbg");
@@ -470,8 +526,11 @@ async function fillArt(el, job, shopControls) {
     renderJob(job.id);
   };
   $("#rmbgBtn").onclick = async () => {
-    try { await api("/api/jobs/" + job.id + "/artops", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ remove_background: true, knockout: "production" }) }); renderJob(job.id); }
-    catch (err) { $("#err").textContent = err.message; }
+    try {
+      await ensurePngArtwork(job);
+      await api("/api/jobs/" + job.id + "/artops", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ remove_background: true, knockout: "production" }) });
+      renderJob(job.id);
+    } catch (err) { $("#err").textContent = err.message; }
   };
   $("#ko").onclick = async () => {
     try { await api("/api/jobs/" + job.id + "/artops", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ knockout: "white" }) }); renderJob(job.id); }
@@ -496,8 +555,11 @@ async function fillArt(el, job, shopControls) {
   };
   const vz = $("#vectorizeBtn");
   if (vz) vz.onclick = async () => {
-    try { await api("/api/jobs/" + job.id + "/vectorize", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({}) }); renderJob(job.id); }
-    catch (err) { $("#err").textContent = err.message; }
+    try {
+      await ensurePngArtwork(job);
+      await api("/api/jobs/" + job.id + "/vectorize", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({}) });
+      renderJob(job.id);
+    } catch (err) { $("#err").textContent = err.message; }
   };
   el.querySelectorAll(".layer-row select").forEach((sel) => {
     sel.onchange = async () => {
