@@ -80,10 +80,13 @@ function stop(child) {
     assert.ok(appPage.text.indexOf("data-view=\"make\"") !== -1);
     assert.ok(appPage.text.indexOf("Office") !== -1);
     const appJs = await req(port, "GET", "/app.js");
-    assert.ok(appJs.text.indexOf("Drop your art here") !== -1);
+    assert.ok(appJs.text.indexOf("Drop art. Vectorize. Recolor. Export.") !== -1);
     assert.ok(appJs.text.indexOf("or tap to pick a file") !== -1);
     assert.ok(appJs.text.indexOf("Remove background") !== -1);
     assert.ok(appJs.text.indexOf("Grok Imagine") !== -1);
+    assert.ok(appJs.text.indexOf("Vectorize") !== -1);
+    assert.ok(appJs.text.indexOf("DST") !== -1);
+    assert.ok(appJs.text.indexOf("No DST") === -1);
     assert.ok(appJs.text.indexOf('credentials: "include"') !== -1);
     const cfg = await req(port, "GET", "/api/config");
     assert.strictEqual(cfg.json.demo, false);
@@ -162,6 +165,18 @@ function stop(child) {
     const adminPack = await req(port, "GET", "/api/export/" + adminJob.json.job.id + "/cut-contour.svg", { headers: { Cookie: adminCookie } });
     assert.strictEqual(adminPack.status, 200);
     assert.ok(adminPack.text.indexOf("<svg") !== -1);
+    const pals = await req(port, "GET", "/api/palettes", { headers: { Cookie: adminCookie } });
+    assert.strictEqual(pals.status, 200);
+    assert.ok(pals.json.vinyl && pals.json.vinyl[0].name && pals.json.vinyl[0].hex);
+    const artSvg = await req(port, "GET", "/api/export/" + adminJob.json.job.id + "/art.svg", { headers: { Cookie: adminCookie } });
+    assert.strictEqual(artSvg.status, 200);
+    assert.ok(artSvg.text.indexOf("<svg") !== -1);
+    const artEps = await req(port, "GET", "/api/export/" + adminJob.json.job.id + "/art.eps", { headers: { Cookie: adminCookie } });
+    assert.strictEqual(artEps.status, 200);
+    assert.ok(artEps.text.indexOf("%!PS-Adobe") !== -1);
+    const dst = await req(port, "GET", "/api/export/" + adminJob.json.job.id + "/design.dst", { headers: { Cookie: adminCookie } });
+    assert.strictEqual(dst.status, 200);
+    assert.ok(dst.buf.length > 512);
     const imagine = await req(port, "POST", "/api/imagine", {
       headers: { "Content-Type": "application/json", Cookie: adminCookie },
       body: JSON.stringify({ prompt: "a badge", method: "dtf" }),

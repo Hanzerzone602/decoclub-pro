@@ -99,4 +99,35 @@ function squarePng() {
   console.log("ok imagine newest model pick");
 }
 
+{
+  const { vectorize, svgFromLayers } = require("../lib/vectorize");
+  const { epsFromLayers } = require("../lib/eps");
+  const { digitizeLayers } = require("../lib/digitize");
+  const { packStonesFromPng } = require("../lib/stones");
+  const { listPalettes, nearestNamed } = require("../lib/palettes");
+  const buf = squarePng();
+  const vec = vectorize(buf, 1, 1);
+  assert.ok(vec.layers && vec.layers.length >= 1, "vectorize yields a layer");
+  const d = vec.layers[0].paths && vec.layers[0].paths[0] && vec.layers[0].paths[0].d;
+  assert.ok(d && /[CL]/.test(d) && /Z/.test(d), "path has C or L and Z");
+  const svg = svgFromLayers(vec.layers, vec.widthIn, vec.heightIn);
+  assert.ok(svg.indexOf("<g") !== -1 && svg.indexOf("<path") !== -1);
+  const eps = epsFromLayers(vec.layers, vec.widthIn, vec.heightIn);
+  assert.ok(eps.indexOf("%!PS-Adobe") === 0 || eps.indexOf("%!PS-Adobe") !== -1);
+  assert.ok(eps.indexOf("setrgbcolor") !== -1);
+  const dig = digitizeLayers(vec, { name: "SQUARE" });
+  assert.ok(dig.dst && dig.dst.length > 512, "DST longer than header");
+  assert.ok(dig.dst[0] === 0x4C && dig.dst[1] === 0x41 && dig.dst[2] === 0x3A, "DST starts with LA:");
+  assert.ok(dig.stitchCount > 50, "1in square has real stitches, not 4 jumps");
+  const stones = packStonesFromPng(buf, 2, 2, { ss: "SS10" });
+  assert.ok(stones.length > 8, "SS10 pack on 2in art is more than a handful");
+  const pals = listPalettes();
+  assert.ok(pals.vinyl.length >= 20 && pals.thread.length >= 24 && pals.stone.length >= 12);
+  pals.vinyl.concat(pals.thread, pals.stone, pals.process).forEach((c) => {
+    assert.ok(c.name && c.hex && /^#[0-9a-fA-F]{6}$/.test(c.hex));
+  });
+  assert.ok(nearestNamed("#017ece", "vinyl").name);
+  console.log("ok studio vectorize eps dst stones palettes", "stitches=" + dig.stitchCount, "stones=" + stones.length);
+}
+
 console.log("all tests passed");

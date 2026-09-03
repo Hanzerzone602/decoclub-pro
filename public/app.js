@@ -1,5 +1,5 @@
 const main = document.getElementById("main");
-let user = null, shop = null, view = "make", currentJob = null, station = "overview", makeMethod = "apparel";
+let user = null, shop = null, view = "make", currentJob = null, station = "art", makeMethod = "apparel";
 let cfg = { statuses: [], methods: [], blanks: [], billing: false, demo: false };
 const $ = (s, r = document) => r.querySelector(s);
 const STAT_LABEL = { new: "New", art_in: "Art in", mockup: "Mockup", priced: "Priced", proof_sent: "Proof sent", approved: "Approved", in_production: "In production", done: "Done" };
@@ -10,10 +10,10 @@ const METHOD_LABELS = {
   embroidery: "Embroidery", sublimation: "Sublimation", rhinestone: "Rhinestone", sign: "Signs",
 };
 const METHOD_OUTCOMES = {
-  dtf: "22in gang sheet", uvdtf: "22in UV gang sheet", uv: "Flatbed print packet",
-  vinyl: "Cut contour + marks", laser: "SVG + PLT", sticker: "Kiss-cut line",
-  hat: "Cap mockup", apparel: "Garment mockup", patch: "Badge + hoop notes",
-  embroidery: "Hoop notes", sublimation: "Wrap layout", rhinestone: "Stone map notes", sign: "Board cutline",
+  dtf: "22in gang + SVG/EPS", uvdtf: "22in UV gang + SVG/EPS", uv: "SVG + EPS print",
+  vinyl: "SVG + EPS cut", laser: "SVG + PLT", sticker: "Kiss-cut SVG + EPS",
+  hat: "Cap mockup + SVG/EPS", apparel: "Garment mockup + SVG/EPS", patch: "Badge + DST/EXP",
+  embroidery: "DST + EXP stitches", sublimation: "Wrap + SVG/EPS", rhinestone: "SS map + CSV", sign: "Board SVG + EPS",
 };
 const METHOD_ICONS = {
   dtf: '<rect x="3" y="5" width="18" height="14" rx="1.5"/><path d="M6 9h5v6H6zM13 9h5M13 13h4"/>',
@@ -56,7 +56,7 @@ function nav() {
     if (b.tagName === "A") return;
     b.onclick = () => { view = b.dataset.view; if (view !== "job") currentJob = null; nav(); render(); };
   });
-  $("#navClients").style.display = canFloor() ? "block" : "none";
+  $("#navClients").style.display = "none";
   $("#navJob").style.display = currentJob ? "block" : "none";
   const office = $("#navOffice");
   if (office) office.style.display = user && user.role === "admin" ? "block" : "none";
@@ -156,12 +156,12 @@ async function renderMake() {
   const chips = METHODS.map((m) => `<button type="button" class="process-chip${m===makeMethod?" on":""}" data-chip="${m}">${METHOD_LABELS[m]}</button>`).join("");
   main.innerHTML = `
     <div class="make-home">
-      <h1 class="make-title">Drop your art here</h1>
-      <p class="muted make-sub">One file starts it. That is setup.</p>
+      <h1 class="make-title">Drop art. Vectorize. Recolor. Export.</h1>
+      <p class="muted make-sub">Studio first — layers, palettes, stitches, stones.</p>
       ${paywallNote()}
-      <div class="make-drop" id="makeDrop" tabindex="0" role="button" aria-label="Drop your art here or tap to pick a file">
+      <div class="make-drop" id="makeDrop" tabindex="0" role="button" aria-label="Drop art. Vectorize. Recolor. Export. or tap to pick a file">
         <div class="drop-hint">
-          <strong>Drop your art here</strong>
+          <strong>Drop art. Vectorize. Recolor. Export.</strong>
           <span>or tap to pick a file</span>
         </div>
         <input id="makeFile" type="file" accept="image/*,.svg,.pdf" hidden />
@@ -263,7 +263,7 @@ async function renderBoard() {
   }
   main.innerHTML = `
     <div class="row">
-      <h1 style="margin:0;font-size:32px">Jobs</h1>
+      <h1 style="margin:0;font-size:32px">Designs</h1>
       ${canFloor() ? `<button class="btn ghost small" id="goNew">More details</button>` : ""}
     </div>
     ${emptyBoard && !canFloor() ? `<p class="muted">No jobs yet.</p>` : ""}
@@ -274,7 +274,7 @@ async function renderBoard() {
   main.querySelectorAll("[data-open]").forEach((b) => { b.onclick = () => openJob(b.dataset.open); });
 }
 
-function openJob(id, st) { currentJob = id; view = "job"; station = st || "overview"; nav(); render(); }
+function openJob(id, st) { currentJob = id; view = "job"; station = st || "art"; nav(); render(); }
 
 async function renderIntake() {
   const { clients } = await api("/api/clients").catch(() => ({ clients: [] }));
@@ -315,8 +315,8 @@ async function renderJob(id) {
   const { job, events } = await api("/api/jobs/" + id);
   const shopControls = canFloor();
   const tabs = [
-    ["overview","Overview"],["art","Art"],["mockup","Mockup"],["price","Price"],
-    ["proof","Proof"],["produce","Produce"],["comments","Comments"]
+    ["art","Art"],["export","Export"],["mockup","Mockup"],["price","Price"],
+    ["proof","Proof"],["overview","Overview"],["comments","Comments"]
   ];
   main.innerHTML = `
     <button class="btn ghost small" id="back">← Board</button>
@@ -337,7 +337,7 @@ async function renderJob(id) {
   if (station === "mockup") return fillMockup(el, job, shopControls);
   if (station === "price") return fillPrice(el, job, shopControls);
   if (station === "proof") return fillProof(el, job, shopControls);
-  if (station === "produce") return fillProduce(el, job, shopControls);
+  if (station === "produce" || station === "export") return fillProduce(el, job, shopControls);
   if (station === "comments") return fillComments(el, job);
   fillOverview(el, job, shopControls);
 }
@@ -375,14 +375,41 @@ function fillOverview(el, job, shopControls) {
   };
 }
 
-function fillArt(el, job, shopControls) {
+let palettesCache = null;
+async function loadPalettes() {
+  if (palettesCache) return palettesCache;
+  try { palettesCache = await api("/api/palettes"); } catch (e) { palettesCache = { vinyl: [], thread: [], stone: [], process: [] }; }
+  return palettesCache;
+}
+function palSelect(kind, palettes, currentHex) {
+  const list = (palettes && palettes[kind]) || [];
+  const opts = list.map((c) => `<option value="${escapeHtml(c.hex)}" ${String(c.hex).toLowerCase()===String(currentHex||"").toLowerCase()?"selected":""}>${escapeHtml(c.name)}</option>`).join("");
+  return `<select data-pal="${kind}"><option value="">${kind}</option>${opts}</select>`;
+}
+
+async function fillArt(el, job, shopControls) {
+  const pals = shopControls ? await loadPalettes() : { vinyl: [], thread: [], stone: [] };
+  const layers = (job.vector && job.vector.layers) || [];
+  const preview = job.vector_svg
+    ? `<img src="${job.vector_svg}" alt="Vector" />`
+    : (job.file_path ? `<img src="${job.file_path}" alt="Art" />` : `<div class="drop-hint"><span class="kicker">Studio drop</span><strong>Drop art here</strong><span>PNG, SVG, or PDF — click to browse</span></div>`);
+  const layerRows = layers.map((L, i) => `
+    <div class="layer-row" data-layer="${i}">
+      <span class="layer-chip" style="background:${escapeHtml(L.hex)}"></span>
+      <span class="layer-name">${escapeHtml(L.nameGuess || ("Layer " + (i+1)))}</span>
+      ${palSelect("vinyl", pals, L.hex)}
+      ${palSelect("thread", pals, L.hex)}
+      ${palSelect("stone", pals, L.hex)}
+    </div>`).join("") || `<p class="muted">No vector layers yet. Vectorize a PNG.</p>`;
   el.innerHTML = `
     <div class="split">
       <div class="preview art-drop" id="artDrop" tabindex="0" role="button" aria-label="Drop art or click to upload">
-        ${job.file_path ? `<img src="${job.file_path}" alt="Art" />` : `<div class="drop-hint"><span class="kicker">Studio drop</span><strong>Drop art here</strong><span>PNG, SVG, or PDF — click to browse</span></div>`}
+        ${preview}
       </div>
       <div>
-        <p class="muted">PNG traces to cut contour. Replace the file, knock near-white to alpha, or swap a hex color.</p>
+        <p class="muted">Vector layers, named palettes, knockout, Imagine. Recolor applies immediately.</p>
+        ${shopControls ? `<button class="btn" id="vectorizeBtn" type="button">Vectorize</button>` : ""}
+        <div class="layer-list">${layerRows}</div>
         <label>Art notes</label>
         <textarea id="artn" rows="3">${escapeHtml(job.art_notes||"")}</textarea>
         ${shopControls ? `
@@ -467,6 +494,25 @@ function fillArt(el, job, shopControls) {
     await api("/api/jobs/" + job.id, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ art_notes: $("#artn").value }) });
     renderJob(job.id);
   };
+  const vz = $("#vectorizeBtn");
+  if (vz) vz.onclick = async () => {
+    try { await api("/api/jobs/" + job.id + "/vectorize", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({}) }); renderJob(job.id); }
+    catch (err) { $("#err").textContent = err.message; }
+  };
+  el.querySelectorAll(".layer-row select").forEach((sel) => {
+    sel.onchange = async () => {
+      const hex = sel.value;
+      if (!hex) return;
+      const layer = Number(sel.closest(".layer-row").dataset.layer);
+      const pal = sel.dataset.pal;
+      const opt = sel.selectedOptions && sel.selectedOptions[0];
+      const name = opt ? opt.textContent : "";
+      try {
+        await api("/api/jobs/" + job.id + "/recolor", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ layer: layer, hex: hex, name: name, palette: pal }) });
+        renderJob(job.id);
+      } catch (err) { $("#err").textContent = err.message; }
+    };
+  });
 }
 
 function fillMockup(el, job, shopControls) {
@@ -607,21 +653,33 @@ function fillProof(el, job, shopControls) {
 }
 
 function fillProduce(el, job, shopControls) {
-  if (!shopControls) { el.innerHTML = "<p class='muted'>Production files are shop-only.</p>"; return; }
+  if (!shopControls) { el.innerHTML = "<p class='muted'>Export files are shop-only.</p>"; return; }
   if (!entitled()) { el.innerHTML = paywallNote() + "<p class='muted'>Packets stay locked until Shop or Studio is active. Admin is complimentary.</p>"; return; }
+  const stitch = job.stitchCount != null ? job.stitchCount : (job.vector ? "run Export" : "—");
+  const stones = job.stones && job.stones.count != null ? job.stones.count : "—";
   el.innerHTML = `
-    <p class="muted">Real files written under DATA_DIR/exports. Embroidery DST and rhinestone stone libraries are not invented — notes ship in the packet.</p>
+    <p class="muted">Process files from this art. SVG + EPS for Corel. DST + EXP stitches. Rhinestone SS map + CSV.</p>
+    <p class="mono">Stitches ${escapeHtml(String(stitch))} · Stones ${escapeHtml(String(stones))}</p>
+    <div class="export-grid export-hero">
+      <a href="/api/export/${job.id}/art.svg">SVG</a>
+      <a href="/api/export/${job.id}/art.eps">EPS</a>
+      <a href="/api/export/${job.id}/design.dst">DST</a>
+      <a href="/api/export/${job.id}/design.exp">EXP</a>
+      <a href="/api/export/${job.id}/stones.svg">Stones SVG</a>
+      <a href="/api/export/${job.id}/stones.csv">Stones CSV</a>
+      <a href="/api/export/${job.id}/stones.plt">Stones PLT</a>
+      <a href="/api/export/${job.id}/stitch-preview.svg">Stitch preview</a>
+    </div>
     <div class="export-grid">
-      <a href="/api/export/${job.id}/packet.json">Packet JSON</a>
-      <a href="/api/export/${job.id}/job-ticket.svg">Job ticket</a>
       <a href="/api/export/${job.id}/cut-contour.svg">Cut contour SVG</a>
-      <a href="/api/export/${job.id}/cutter-marks.svg">Cutter marks</a>
       <a href="/api/export/${job.id}/laser.svg">Laser SVG</a>
       <a href="/api/export/${job.id}/laser.plt">Laser PLT</a>
       <a href="/api/export/${job.id}/gang-sheet.svg">DTF / UV gang 22in</a>
       <a href="/api/export/${job.id}/sticker-cutline.svg">Sticker cutline</a>
+      <a href="/api/export/${job.id}/cutter-marks.svg">Cutter marks</a>
+      <a href="/api/export/${job.id}/job-ticket.svg">Job ticket</a>
+      <a href="/api/export/${job.id}/packet.json">Packet JSON</a>
       <a href="/api/export/${job.id}/method-notes.txt">Method notes</a>
-      <a href="/api/export/${job.id}/intake-poster.svg">Booth / intake poster</a>
     </div>
     <div class="cta-row" style="margin-top:14px">
       <button class="btn" data-st="in_production">Start production</button>

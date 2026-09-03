@@ -11,6 +11,10 @@ const { generateBadgePng } = require("./lib/demoart");
 const { processArtwork } = require("./lib/artops");
 const { removeBackground } = require("./lib/matte");
 const { imagineConfigured, generateImage } = require("./lib/imagine");
+const { vectorize, svgFromLayers } = require("./lib/vectorize");
+const { listPalettes } = require("./lib/palettes");
+const { digitizeJob } = require("./lib/digitize");
+const { stonesForJob } = require("./lib/stones");
 const {
   loadEnvFile, createCheckoutSession, billingConfigured,
   verifyStripeSignature, applyStripeEvent,
@@ -128,6 +132,28 @@ function saveImaginePng(buf) {
   fs.writeFileSync(path.join(UPLOADS, name), buf);
   return "/uploads/" + name;
 }
+function tryVectorizeJob(job) {
+  if (!job || !job.file_path) return;
+  const abs = path.join(UPLOADS, path.basename(job.file_path));
+  if (!fs.existsSync(abs)) return;
+  const buf = fs.readFileSync(abs);
+  if (buf[0] !== 0x89 || buf[1] !== 0x50) return;
+  try {
+    const vec = vectorize(buf, job.width_in, job.height_in);
+    job.vector = vec;
+    const svg = svgFromLayers(vec.layers, vec.widthIn, vec.heightIn);
+    const name = Date.now() + "-" + uid() + "-vector.svg";
+    fs.writeFileSync(path.join(UPLOADS, name), svg);
+    job.vector_svg = "/uploads/" + name;
+  } catch (e) { /* keep raster; never fail the upload */ }
+}
+function rewriteVectorSvg(job) {
+  if (!job || !job.vector || !job.vector.layers) return;
+  const svg = svgFromLayers(job.vector.layers, job.vector.widthIn || job.width_in, job.vector.heightIn || job.height_in);
+  const name = Date.now() + "-" + uid() + "-vector.svg";
+  fs.writeFileSync(path.join(UPLOADS, name), svg);
+  job.vector_svg = "/uploads/" + name;
+}
 function requireAdmin(user, res) {
   if (!user || user.role !== "admin") {
     json(res, 403, { error: "Admin required" });
@@ -206,7 +232,7 @@ function ensureDemoJob(db) {
   }
 }
 
-const MIME = { ".html": "text/html; charset=utf-8", ".css": "text/css; charset=utf-8", ".js": "text/javascript; charset=utf-8", ".svg": "image/svg+xml", ".png": "image/png", ".jpg": "image/jpeg", ".jpeg": "image/jpeg", ".gif": "image/gif", ".webp": "image/webp", ".pdf": "application/pdf", ".json": "application/json", ".plt": "application/vnd.hp-hpgl", ".txt": "text/plain; charset=utf-8" };
+const MIME = { ".html": "text/html; charset=utf-8", ".css": "text/css; charset=utf-8", ".js": "text/javascript; charset=utf-8", ".svg": "image/svg+xml", ".png": "image/png", ".jpg": "image/jpeg", ".jpeg": "image/jpeg", ".gif": "image/gif", ".webp": "image/webp", ".pdf": "application/pdf", ".json": "application/json", ".plt": "application/vnd.hp-hpgl", ".txt": "text/plain; charset=utf-8", ".eps": "application/postscript", ".dst": "application/octet-stream", ".exp": "application/octet-stream", ".csv": "text/csv; charset=utf-8" };
 function send(res, code, body, headers) {
   headers = headers || {};
   const payload = Buffer.isBuffer(body) ? body : Buffer.from(body || "");
@@ -496,6 +522,7 @@ async function handleApi(req, res, url) {
       };
       applyQuote(job); applyMockup(job);
       if (job.file_path) job.status = "mockup";
+      tryVectorizeJob(job);
       db.jobs.push(job); event(db, job, "Grok Imagine"); save(db);
       return json(res, 200, { job: presentJob(job, req) });
     } catch (err) {
@@ -524,6 +551,7 @@ async function handleApi(req, res, url) {
     if (job.file_path) job.status = "art_in";
     applyQuote(job); applyMockup(job);
     if (job.file_path) job.status = "mockup";
+    tryVectorizeJob(job);
     db.jobs.push(job); event(db, job, "Intake created"); save(db);
     return json(res, 200, { job: presentJob(job, req) });
   }
@@ -562,7 +590,9 @@ async function handleApi(req, res, url) {
     if (!parsed.file) return json(res, 400, { error: "Artwork file required" });
     job.file_path = applyUploadMatte(parsed.file.path, parsed.fields);
     if (STATUSES.indexOf(job.status) < STATUSES.indexOf("art_in")) job.status = "art_in";
-    applyMockup(job); event(db, job, "Artwork replaced"); save(db);
+    applyMockup(job);
+    tryVectorizeJob(job);
+    event(db, job, "Artwork replaced"); save(db);
     return json(res, 200, { job: presentJob(job, req) });
   }
   const ops = pth.match(/^\/api\/jobs\/([^/]+)\/artops$/);
@@ -578,7 +608,9 @@ async function handleApi(req, res, url) {
       const name = Date.now() + "-" + uid() + ".png";
       fs.writeFileSync(path.join(UPLOADS, name), out);
       job.file_path = "/uploads/" + name;
-      applyMockup(job); event(db, job, "Artwork processed"); save(db);
+      applyMockup(job);
+      tryVectorizeJob(job);
+      event(db, job, "Artwork processed"); save(db);
       return json(res, 200, { job: presentJob(job, req) });
     } catch (err) { return json(res, 400, { error: IS_PROD ? "Could not process artwork" : err.message }); }
   }
@@ -607,7 +639,9 @@ async function handleApi(req, res, url) {
       const buf = await generateImage({ prompt: prompt, imageBuf: imageBuf, mime: mime });
       job.file_path = saveImaginePng(buf);
       if (STATUSES.indexOf(job.status) < STATUSES.indexOf("art_in")) job.status = "art_in";
-      applyMockup(job); event(db, job, "Grok Imagine"); save(db);
+      applyMockup(job);
+      tryVectorizeJob(job);
+      event(db, job, "Grok Imagine"); save(db);
       return json(res, 200, { job: presentJob(job, req) });
     } catch (err) {
       return json(res, 502, { error: IS_PROD ? "Imagine failed" : err.message });
@@ -711,6 +745,75 @@ async function handleApi(req, res, url) {
     job.comments.push({ id: uid(), author: body.name || "Client", role: "client", body: String(body.body), created_at: new Date().toISOString() });
     event(db, job, "Proof comment"); save(db);
     return json(res, 200, { job: presentJob(job, req) });
+  }
+
+  if (pth === "/api/palettes" && method === "GET") {
+    if (!user) return json(res, 401, { error: "Sign in required" });
+    return json(res, 200, listPalettes());
+  }
+  const vecPath = pth.match(/^\/api\/jobs\/([^/]+)\/vectorize$/);
+  if (vecPath && method === "POST") {
+    if (!canRunFloor(user)) return json(res, 403, { error: "Shop login required" });
+    if (!requireProduce(user, res)) return;
+    const job = db.jobs.find(function (j) { return j.id === vecPath[1] && j.shop_id === user.shop_id; });
+    if (!job) return json(res, 404, { error: "Job not found" });
+    const body = parseJsonBody(await readBody(req));
+    if (!job.file_path) return json(res, 400, { error: "PNG artwork required to vectorize" });
+    const abs = path.join(UPLOADS, path.basename(job.file_path));
+    if (!fs.existsSync(abs)) return json(res, 404, { error: "Artwork missing" });
+    const buf = fs.readFileSync(abs);
+    try {
+      const vec = vectorize(buf, job.width_in, job.height_in, { colors: body.colors });
+      job.vector = vec;
+      rewriteVectorSvg(job);
+      if (body.apply_mockup) applyMockup(job);
+      event(db, job, "Vectorized · " + vec.layers.length + " layers"); save(db);
+      return json(res, 200, { job: presentJob(job, req), vector: vec });
+    } catch (err) {
+      return json(res, 400, { error: IS_PROD ? "Could not vectorize" : err.message });
+    }
+  }
+  const recPath = pth.match(/^\/api\/jobs\/([^/]+)\/recolor$/);
+  if (recPath && method === "POST") {
+    if (!canRunFloor(user)) return json(res, 403, { error: "Shop login required" });
+    if (!requireProduce(user, res)) return;
+    const job = db.jobs.find(function (j) { return j.id === recPath[1] && j.shop_id === user.shop_id; });
+    if (!job || !job.vector || !job.vector.layers) return json(res, 400, { error: "Vectorize first" });
+    const body = parseJsonBody(await readBody(req));
+    const idx = Number(body.layer);
+    if (!job.vector.layers[idx]) return json(res, 400, { error: "Unknown layer" });
+    if (body.hex) job.vector.layers[idx].hex = String(body.hex);
+    if (body.name) job.vector.layers[idx].nameGuess = String(body.name);
+    job.vector.layers[idx].palette = body.palette || job.vector.layers[idx].palette;
+    rewriteVectorSvg(job);
+    event(db, job, "Recolor layer " + idx); save(db);
+    return json(res, 200, { job: presentJob(job, req), vector: job.vector });
+  }
+  const stnPath = pth.match(/^\/api\/jobs\/([^/]+)\/stones$/);
+  if (stnPath && method === "POST") {
+    if (!canRunFloor(user)) return json(res, 403, { error: "Shop login required" });
+    if (!requireProduce(user, res)) return;
+    const job = db.jobs.find(function (j) { return j.id === stnPath[1] && j.shop_id === user.shop_id; });
+    if (!job) return json(res, 404, { error: "Job not found" });
+    const body = parseJsonBody(await readBody(req));
+    const pack = stonesForJob(job, UPLOADS, { ss: body.ss || "SS10" });
+    job.stones = { count: pack.count, ss: pack.ss };
+    job.stone_ss = pack.ss;
+    event(db, job, "Stones · " + pack.count + " " + pack.ss); save(db);
+    return json(res, 200, { job: presentJob(job, req), count: pack.count, ss: pack.ss, stones: pack.stones });
+  }
+  const digPath = pth.match(/^\/api\/jobs\/([^/]+)\/digitize$/);
+  if (digPath && method === "POST") {
+    if (!canRunFloor(user)) return json(res, 403, { error: "Shop login required" });
+    if (!requireProduce(user, res)) return;
+    const job = db.jobs.find(function (j) { return j.id === digPath[1] && j.shop_id === user.shop_id; });
+    if (!job) return json(res, 404, { error: "Job not found" });
+    const body = parseJsonBody(await readBody(req));
+    const dig = digitizeJob(job, UPLOADS, { satinMm: body.satinMm, density: body.density });
+    job.stitchCount = dig.stitchCount;
+    job.colorStops = dig.colorStops;
+    event(db, job, "Digitized · " + dig.stitchCount + " stitches"); save(db);
+    return json(res, 200, { job: presentJob(job, req), stitchCount: dig.stitchCount, colorStops: dig.colorStops });
   }
 
   const poster = pth.match(/^\/api\/export\/([^/]+)\/intake-poster.svg$/);

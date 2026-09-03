@@ -337,3 +337,14 @@ th { color: var(--muted); font-weight: 600; font-size: 11px; letter-spacing: .06
 
 .remember { display:flex; align-items:center; gap:8px; margin:16px 0 0; color:var(--ink); font-size:14px; text-transform:none; letter-spacing:0; }
 .remember input { width:auto; margin:0; }
+
+.layer-list { margin: 12px 0; display: flex; flex-direction: column; gap: 8px; }
+.layer-row { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
+.layer-chip { width: 18px; height: 18px; border: 1px solid var(--line); flex: 0 0 18px; }
+.layer-name { font-size: 13px; min-width: 88px; }
+.layer-row select { font-size: 12px; padding: 4px 6px; max-width: 140px; }
+.export-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(160px, 1fr)); gap: 8px; margin: 12px 0; }
+.export-grid a { display: block; padding: 10px 12px; border: 1px solid var(--line); background: var(--panel); color: var(--ink); font-weight: 600; font-size: 13px; }
+.export-grid a:hover { border-color: var(--gold); color: var(--gold); }
+.export-hero a { padding: 16px 14px; font-size: 16px; background: var(--gold); color: #fff; border-color: var(--gold); }
+.export-hero a:hover { filter: brightness(1.06); color: #fff; }
