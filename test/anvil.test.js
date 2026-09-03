@@ -130,4 +130,31 @@ function squarePng() {
   console.log("ok studio vectorize eps dst stones palettes", "stitches=" + dig.stitchCount, "stones=" + stones.length);
 }
 
+
+{
+  const { vectorize, svgFromLayers } = require("../lib/vectorize");
+  const { encodePng, makeRgba } = require("../lib/png");
+  const w = 80, h = 80;
+  const rgba = makeRgba(w, h, [240, 80, 40, 255]);
+  for (let y = 18; y < 62; y++) {
+    for (let x = 18; x < 62; x++) {
+      const i = (y * w + x) * 4;
+      rgba[i] = 20; rgba[i + 1] = 40; rgba[i + 2] = 160; rgba[i + 3] = 255;
+    }
+  }
+  for (let y = 32; y < 48; y++) {
+    for (let x = 32; x < 48; x++) {
+      const i = (y * w + x) * 4;
+      rgba[i] = 240; rgba[i + 1] = 80; rgba[i + 2] = 40; rgba[i + 3] = 255;
+    }
+  }
+  const vec = vectorize(encodePng(w, h, rgba), 4, 4, { colors: 4 });
+  assert.ok(vec.layers.length >= 2, "two-color donut yields 2+ layers");
+  const svg = svgFromLayers(vec.layers, vec.widthIn, vec.heightIn);
+  assert.ok(svg.indexOf('fill-rule="evenodd"') !== -1);
+  const hasHole = vec.layers.some((L) => (L.paths || []).some((p) => p.hole));
+  assert.ok(hasHole || /Z M /.test(svg) || (svg.match(/Z/g) || []).length >= 2, "hole or stacked paths present");
+  console.log("ok layered color vectorize", "layers=" + vec.layers.length);
+}
+
 console.log("all tests passed");

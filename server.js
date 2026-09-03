@@ -500,7 +500,7 @@ async function handleApi(req, res, url) {
   if (pth === "/api/imagine" && method === "POST") {
     if (!canRunFloor(user)) return json(res, 403, { error: "Shop login required" });
     if (!requireProduce(user, res)) return;
-    if (!imagineConfigured()) return json(res, 501, { error: "Grok Imagine is not configured" });
+    if (!imagineConfigured()) return json(res, 501, { error: "AI Generate is not configured" });
     const body = parseJsonBody(await readBody(req));
     const prompt = String(body.prompt || "").trim();
     if (!prompt) return json(res, 400, { error: "Prompt required" });
@@ -510,9 +510,9 @@ async function handleApi(req, res, url) {
       const shop = db.shops.find(function (s) { return s.id === user.shop_id; });
       const now = new Date().toISOString();
       const job = {
-        id: uid(), shop_id: user.shop_id, client_id: null, title: prompt.slice(0, 48) || "Imagine",
+        id: uid(), shop_id: user.shop_id, client_id: null, title: prompt.slice(0, 48) || "AI Generate",
         method: methodName, status: "art_in",
-        notes: "", art_notes: "Grok Imagine · " + prompt,
+        notes: "", art_notes: "AI Generate · " + prompt,
         width_in: 10, height_in: 10, qty: 1,
         due_at: null, file_path: saveImaginePng(buf),
         proof_token: proofToken(), blank: null, garment_color: "#2c3138",
@@ -523,10 +523,10 @@ async function handleApi(req, res, url) {
       applyQuote(job); applyMockup(job);
       if (job.file_path) job.status = "mockup";
       tryVectorizeJob(job);
-      db.jobs.push(job); event(db, job, "Grok Imagine"); save(db);
+      db.jobs.push(job); event(db, job, "AI Generate"); save(db);
       return json(res, 200, { job: presentJob(job, req) });
     } catch (err) {
-      return json(res, 502, { error: IS_PROD ? "Imagine failed" : err.message });
+      return json(res, 502, { error: IS_PROD ? "AI Generate failed" : err.message });
     }
   }
   if (pth === "/api/jobs" && method === "POST") {
@@ -618,7 +618,7 @@ async function handleApi(req, res, url) {
   if (imgJob && method === "POST") {
     if (!canRunFloor(user)) return json(res, 403, { error: "Shop login required" });
     if (!requireProduce(user, res)) return;
-    if (!imagineConfigured()) return json(res, 501, { error: "Grok Imagine is not configured" });
+    if (!imagineConfigured()) return json(res, 501, { error: "AI Generate is not configured" });
     const job = db.jobs.find(function (j) { return j.id === imgJob[1] && j.shop_id === user.shop_id; });
     if (!job) return json(res, 404, { error: "Job not found" });
     const body = parseJsonBody(await readBody(req));
@@ -641,10 +641,10 @@ async function handleApi(req, res, url) {
       if (STATUSES.indexOf(job.status) < STATUSES.indexOf("art_in")) job.status = "art_in";
       applyMockup(job);
       tryVectorizeJob(job);
-      event(db, job, "Grok Imagine"); save(db);
+      event(db, job, "AI Generate"); save(db);
       return json(res, 200, { job: presentJob(job, req) });
     } catch (err) {
-      return json(res, 502, { error: IS_PROD ? "Imagine failed" : err.message });
+      return json(res, 502, { error: IS_PROD ? "AI Generate failed" : err.message });
     }
   }
   const mk = pth.match(/^\/api\/jobs\/([^/]+)\/mockup$/);
@@ -758,10 +758,12 @@ async function handleApi(req, res, url) {
     const job = db.jobs.find(function (j) { return j.id === vecPath[1] && j.shop_id === user.shop_id; });
     if (!job) return json(res, 404, { error: "Job not found" });
     const body = parseJsonBody(await readBody(req));
-    if (!job.file_path) return json(res, 400, { error: "PNG artwork required to vectorize" });
+    if (!job.file_path) return json(res, 400, { error: "Artwork required to vectorize" });
     const abs = path.join(UPLOADS, path.basename(job.file_path));
     if (!fs.existsSync(abs)) return json(res, 404, { error: "Artwork missing" });
     const buf = fs.readFileSync(abs);
+    if (buf[0] === 0xff && buf[1] === 0xd8) return json(res, 400, { error: "Still a JPEG — click Vectorize again so Studio can convert it" });
+    if (buf[0] !== 0x89 || buf[1] !== 0x50) return json(res, 400, { error: "Need PNG, JPG, or WebP artwork" });
     try {
       const vec = vectorize(buf, job.width_in, job.height_in, { colors: body.colors });
       job.vector = vec;

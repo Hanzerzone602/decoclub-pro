@@ -112,35 +112,56 @@ function titleFromFile(file) {
 function loadImageEl(url) {
   return new Promise((resolve, reject) => {
     const img = new Image();
-    img.crossOrigin = "anonymous";
     img.onload = () => resolve(img);
     img.onerror = () => reject(new Error("Could not read that image on this PC"));
     img.src = url;
   });
 }
 async function rasterToPngFile(src, name) {
-  const url = typeof src === "string" ? src : URL.createObjectURL(src);
-  const img = await loadImageEl(url);
-  if (typeof src !== "string") URL.revokeObjectURL(url);
-  let w = img.naturalWidth || img.width;
-  let h = img.naturalHeight || img.height;
-  if (!w || !h) throw new Error("Could not read that artwork");
+  let w = 0, h = 0, drawer = null, bmp = null, url = null;
+  if (typeof src !== "string" && typeof createImageBitmap === "function") {
+    try {
+      bmp = await createImageBitmap(src);
+      w = bmp.width;
+      h = bmp.height;
+      drawer = (ctx, dw, dh) => ctx.drawImage(bmp, 0, 0, dw, dh);
+    } catch (e) { bmp = null; }
+  }
+  if (!drawer) {
+    url = typeof src === "string" ? src : URL.createObjectURL(src);
+    try {
+      const img = await loadImageEl(url);
+      w = img.naturalWidth || img.width;
+      h = img.naturalHeight || img.height;
+      drawer = (ctx, dw, dh) => ctx.drawImage(img, 0, 0, dw, dh);
+    } finally {
+      if (typeof src !== "string" && url) URL.revokeObjectURL(url);
+    }
+  }
+  if (!w || !h || !drawer) throw new Error("Could not read that artwork");
   const max = 2400;
+  let dw = w, dh = h;
   if (w > max || h > max) {
     const s = max / Math.max(w, h);
-    w = Math.round(w * s);
-    h = Math.round(h * s);
+    dw = Math.round(w * s);
+    dh = Math.round(h * s);
   }
   const canvas = document.createElement("canvas");
-  canvas.width = w;
-  canvas.height = h;
-  const ctx = canvas.getContext("2d");
-  ctx.drawImage(img, 0, 0, w, h);
+  canvas.width = dw;
+  canvas.height = dh;
+  drawer(canvas.getContext("2d"), dw, dh);
+  if (bmp && bmp.close) try { bmp.close(); } catch (e) {}
   const blob = await new Promise((resolve, reject) => {
     canvas.toBlob((b) => b ? resolve(b) : reject(new Error("Could not convert artwork")), "image/png");
   });
   const base = String(name || "art").replace(/\.[^.]+$/, "") + ".png";
   return new File([blob], base, { type: "image/png" });
+}
+function mustConvertToPng(file) {
+  const n = (file && file.name) || "";
+  const typ = (file && file.type) || "";
+  return typ === "image/jpeg" || typ === "image/jpg" || typ === "image/webp" || typ === "image/bmp" ||
+    /\.(jpe?g|webp|bmp)$/i.test(n);
 }
 async function fileToPng(file) {
   if (!file) return file;
@@ -148,7 +169,14 @@ async function fileToPng(file) {
   const typ = file.type || "";
   if (typ === "image/png" || /\.png$/i.test(n)) return file;
   if (typ === "application/pdf" || /\.pdf$/i.test(n)) throw new Error("Export the PDF as PNG or JPG first");
-  return rasterToPngFile(file, n);
+  try {
+    return await rasterToPngFile(file, n);
+  } catch (err) {
+    if (mustConvertToPng(file)) {
+      throw new Error("Could not convert that JPEG/WebP/BMP to PNG. Export a PNG from your design app and drop that.");
+    }
+    return file;
+  }
 }
 async function ensurePngArtwork(job) {
   const pth = job && job.file_path;
@@ -223,13 +251,12 @@ async function renderMake() {
       </div>
       <label class="remember"><input id="rmbg" type="checkbox" checked /> Remove background · production</label>
       <div class="process-chips" id="makeChips">${chips}</div>
-      <div class="card" style="margin-top:18px">
-        <div class="kicker">Grok Imagine</div>
-        <p class="muted">Newest image model. Typed art for this process.</p>
+      ${cfg.imagine ? `<div class="card" style="margin-top:18px">
+        <div class="kicker">AI Generate</div>
+        <p class="muted">Typed art for this process.</p>
         <textarea id="imaginePrompt" rows="2" placeholder="A varsity mascot, clean print-ready graphic on transparent"></textarea>
-        <button class="btn small" type="button" id="imagineGo">Generate</button>
-        <p class="muted" id="imagineHint"></p>
-      </div>
+        <button class="btn small" type="button" id="imagineGo">AI Generate</button>
+      </div>` : ""}
       <p class="notice" id="makeErr"></p>
     </div>`;
   main.querySelectorAll("[data-chip]").forEach((b) => {
@@ -245,7 +272,8 @@ async function renderMake() {
     try {
       await startJobFromFile(file, makeMethod);
     } catch (err) {
-      $("#makeErr").textContent = err.message;
+      const box = $("#makeErr") || $("#err");
+      if (box) box.textContent = err.message;
     }
   }
   drop.onclick = () => fileEl.click();
@@ -259,8 +287,6 @@ async function renderMake() {
     if (f) take(f);
   };
   fileEl.onchange = () => { if (fileEl.files && fileEl.files[0]) take(fileEl.files[0]); };
-  const hint = $("#imagineHint");
-  if (!cfg.imagine && hint) hint.textContent = "Imagine is warming up on the server.";
   const go = $("#imagineGo");
   if (go) go.onclick = async () => {
     const prompt = ($("#imaginePrompt") && $("#imaginePrompt").value || "").trim();
@@ -462,7 +488,7 @@ async function fillArt(el, job, shopControls) {
         ${preview}
       </div>
       <div>
-        <p class="muted">Vector layers, named palettes, knockout, Imagine. Recolor applies immediately.</p>
+        <p class="muted">Vector layers, named palettes, knockout, AI Generate. Recolor applies immediately.</p>
         ${shopControls ? `<button class="btn" id="vectorizeBtn" type="button">Vectorize</button>` : ""}
         <div class="layer-list">${layerRows}</div>
         <label>Art notes</label>
@@ -477,11 +503,11 @@ async function fillArt(el, job, shopControls) {
             <button class="btn small" id="rmbgBtn">Remove background</button>
             <button class="btn ghost small" id="ko">Knockout white</button>
           </div>
-          <div class="card" style="margin:12px 0">
-            <div class="kicker">Grok Imagine</div>
+          ${cfg.imagine ? `<div class="card" style="margin:12px 0">
+            <div class="kicker">AI Generate</div>
             <textarea id="imaginePrompt" rows="2" placeholder="Edit this art or describe a new graphic"></textarea>
-            <button class="btn small" type="button" id="imagineGo">Imagine</button>
-          </div>
+            <button class="btn small" type="button" id="imagineGo">AI Generate</button>
+          </div>` : ""}
           <form id="swap" class="form">
             <label>Color swap from → to</label>
             <div class="row"><input name="from" placeholder="#000000" /><input name="to" type="color" value="#c9b896" /><button class="btn small" type="submit">Swap</button></div>
@@ -493,15 +519,19 @@ async function fillArt(el, job, shopControls) {
   if (!shopControls) return;
   async function uploadArtwork(file) {
     if (!file) return;
-    file = await fileToPng(file);
-    const fd = new FormData();
-    fd.append("artwork", file);
-    const rm = document.getElementById("rmbg");
-    fd.append("remove_bg", !rm || rm.checked ? "1" : "0");
-    const res = await fetch("/api/jobs/" + job.id + "/artwork", { method: "POST", credentials: "include", body: fd });
-    const data = await res.json();
-    if (!res.ok) { $("#err").textContent = data.error; return; }
-    renderJob(job.id);
+    try {
+      file = await fileToPng(file);
+      const fd = new FormData();
+      fd.append("artwork", file);
+      const rm = document.getElementById("rmbg");
+      fd.append("remove_bg", !rm || rm.checked ? "1" : "0");
+      const res = await fetch("/api/jobs/" + job.id + "/artwork", { method: "POST", credentials: "include", body: fd });
+      const data = await res.json().catch(() => ({}));
+      if (!res.ok) { $("#err").textContent = data.error || "Could not upload artwork"; return; }
+      renderJob(job.id);
+    } catch (err) {
+      $("#err").textContent = err.message;
+    }
   }
   const artFile = $("#artFile");
   const drop = $("#artDrop");
