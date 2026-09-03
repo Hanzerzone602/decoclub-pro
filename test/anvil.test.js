@@ -157,4 +157,18 @@ function squarePng() {
   console.log("ok layered color vectorize", "layers=" + vec.layers.length);
 }
 
+{
+  const { processArtwork } = require("../lib/artops");
+  const { encodePng, makeRgba, decodePng } = require("../lib/png");
+  const w = 20, h = 20;
+  const rgba = makeRgba(w, h, [200, 40, 40, 255]);
+  const out = processArtwork(encodePng(w, h, rgba), { greyscale: true, scale: 2 });
+  const img = decodePng(out);
+  assert.strictEqual(img.width, 40);
+  assert.strictEqual(img.height, 40);
+  assert.strictEqual(img.rgba[0], img.rgba[1]);
+  assert.strictEqual(img.rgba[1], img.rgba[2]);
+  console.log("ok hi-res greyscale");
+}
+
 console.log("all tests passed");

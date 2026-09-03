@@ -470,53 +470,89 @@ function palSelect(kind, palettes, currentHex) {
 
 async function fillArt(el, job, shopControls) {
   const pals = shopControls ? await loadPalettes() : { vinyl: [], thread: [], stone: [] };
+  const allPals = []
+    .concat((pals.vinyl || []).map((c) => Object.assign({ kind: "vinyl" }, c)))
+    .concat((pals.thread || []).map((c) => Object.assign({ kind: "thread" }, c)));
   const layers = (job.vector && job.vector.layers) || [];
+  const hasArt = !!(job.vector_svg || job.file_path);
   const preview = job.vector_svg
-    ? `<img src="${job.vector_svg}" alt="Vector" />`
-    : (job.file_path ? `<img src="${job.file_path}" alt="Art" />` : `<div class="drop-hint"><span class="kicker">Studio drop</span><strong>Drop art here</strong><span>PNG, JPG, WebP, or SVG — click to browse</span></div>`);
+    ? `<img id="artZoomImg" src="${job.vector_svg}" alt="Vector" draggable="false" />`
+    : (job.file_path ? `<img id="artZoomImg" src="${job.file_path}" alt="Art" draggable="false" />` : `<div class="drop-hint"><strong>Drop art here</strong><span>PNG, JPG, or WebP</span></div>`);
   const layerRows = layers.map((L, i) => `
     <div class="layer-row" data-layer="${i}">
-      <span class="layer-chip" style="background:${escapeHtml(L.hex)}"></span>
-      <span class="layer-name">${escapeHtml(L.nameGuess || ("Layer " + (i+1)))}</span>
-      ${palSelect("vinyl", pals, L.hex)}
-      ${palSelect("thread", pals, L.hex)}
-      ${palSelect("stone", pals, L.hex)}
-    </div>`).join("") || `<p class="muted">No vector layers yet. Vectorize — JPG, PNG, and WebP all work.</p>`;
+      <svg class="layer-ico" viewBox="0 0 20 20" aria-hidden="true"><circle cx="10" cy="10" r="7" fill="${escapeHtml(L.hex)}" stroke="#1a2330" stroke-width="1"/></svg>
+      <span class="layer-name">${escapeHtml(L.nameGuess || ("Layer " + (i + 1)))}</span>
+      <input type="color" class="layer-pick" value="${escapeHtml((L.hex || "#111111").slice(0, 7))}" title="Recolor" />
+      <select class="layer-pal" data-layer="${i}">
+        <option value="">Named color</option>
+        ${allPals.map((c) => `<option value="${escapeHtml(c.hex)}" data-name="${escapeHtml(c.name)}" ${String(c.hex).toLowerCase()===String(L.hex||"").toLowerCase()?"selected":""}>${escapeHtml(c.name)}</option>`).join("")}
+      </select>
+    </div>`).join("") || `<p class="muted">Click Vectorize after you drop art.</p>`;
   el.innerHTML = `
-    <div class="split">
-      <div class="preview art-drop" id="artDrop" tabindex="0" role="button" aria-label="Drop art or click to upload">
-        ${preview}
+    <div class="split art-simple">
+      <div class="art-stage">
+        <div class="preview art-drop${hasArt ? " has-art" : ""}" id="artDrop" tabindex="0">
+          <div class="art-zoom-inner" id="artZoomInner">${preview}</div>
+        </div>
+        ${hasArt ? `<div class="zoom-bar">
+          <button type="button" class="zoom-btn" id="zoomOut" title="Zoom out">−</button>
+          <button type="button" class="zoom-btn" id="zoomFit" title="Fit">Fit</button>
+          <button type="button" class="zoom-btn" id="zoomIn" title="Zoom in">+</button>
+          <span class="zoom-readout" id="zoomRead">100%</span>
+          <span class="muted">Scroll to zoom · drag to pan</span>
+        </div>` : ""}
+        <input id="artFile" type="file" accept="image/*,.svg,.pdf" hidden />
       </div>
-      <div>
-        <p class="muted">Vector layers, named palettes, knockout, AI Generate. Recolor applies immediately.</p>
-        ${shopControls ? `<button class="btn" id="vectorizeBtn" type="button">Vectorize</button>` : ""}
-        <div class="layer-list">${layerRows}</div>
-        <label>Art notes</label>
-        <textarea id="artn" rows="3">${escapeHtml(job.art_notes||"")}</textarea>
+      <div class="art-tools">
         ${shopControls ? `
-          <form id="up" style="margin:12px 0">
-            <input name="artwork" id="artFile" type="file" accept="image/*,.svg,.pdf" />
-            <label class="remember"><input name="remove_bg" id="rmbg" type="checkbox" checked /> Remove background · production</label>
-            <button class="btn small" type="submit">Replace artwork</button>
-          </form>
+        <div class="art-actions">
+          <button class="btn" id="vectorizeBtn" type="button">Vectorize</button>
+          <button class="btn ghost" id="greyBtn" type="button">Hi-res greyscale</button>
+        </div>
+        <div class="detail-row" id="detailRow">
+          <button type="button" class="detail-btn" data-colors="4" title="Few colors">
+            <svg viewBox="0 0 24 24" aria-hidden="true"><rect x="4" y="6" width="16" height="12" rx="2"/></svg>
+            Simple
+          </button>
+          <button type="button" class="detail-btn on" data-colors="8" title="Balanced">
+            <svg viewBox="0 0 24 24" aria-hidden="true"><rect x="3" y="5" width="8" height="14" rx="1"/><rect x="13" y="5" width="8" height="14" rx="1"/></svg>
+            Balanced
+          </button>
+          <button type="button" class="detail-btn" data-colors="12" title="Fine detail">
+            <svg viewBox="0 0 24 24" aria-hidden="true"><rect x="3" y="4" width="5" height="16"/><rect x="10" y="4" width="5" height="16"/><rect x="17" y="4" width="4" height="16"/></svg>
+            Fine
+          </button>
+        </div>` : ""}
+        <div class="layer-list">${layerRows}</div>
+        ${shopControls ? `
+        <details class="art-more">
+          <summary>More tools</summary>
+          <label class="remember"><input id="rmbg" type="checkbox" checked /> Remove background on replace</label>
           <div class="row">
-            <button class="btn small" id="rmbgBtn">Remove background</button>
-            <button class="btn ghost small" id="ko">Knockout white</button>
+            <button class="btn small" type="button" id="replaceBtn">Replace art</button>
+            <button class="btn small" type="button" id="rmbgBtn">Remove background</button>
+            <button class="btn ghost small" type="button" id="ko">Knockout white</button>
           </div>
-          ${cfg.imagine ? `<div class="card" style="margin:12px 0">
-            <div class="kicker">AI Generate</div>
-            <textarea id="imaginePrompt" rows="2" placeholder="Edit this art or describe a new graphic"></textarea>
+          ${cfg.imagine ? `<div class="more-block">
+            <label>AI Generate</label>
+            <textarea id="imaginePrompt" rows="2" placeholder="Describe a new graphic"></textarea>
             <button class="btn small" type="button" id="imagineGo">AI Generate</button>
           </div>` : ""}
-          <form id="swap" class="form">
-            <label>Color swap from → to</label>
-            <div class="row"><input name="from" placeholder="#000000" /><input name="to" type="color" value="#c9b896" /><button class="btn small" type="submit">Swap</button></div>
-          </form>
-          <button class="btn small" id="saveArtN">Save notes</button>
-          <p class="notice" id="err"></p>` : ""}
+          <label>Notes</label>
+          <textarea id="artn" rows="2">${escapeHtml(job.art_notes||"")}</textarea>
+          <button class="btn small" id="saveArtN" type="button">Save notes</button>
+        </details>
+        <p class="notice" id="err"></p>` : ""}
       </div>
     </div>`;
   if (!shopControls) return;
+  let vzColors = 8;
+  el.querySelectorAll(".detail-btn").forEach((b) => {
+    b.onclick = () => {
+      vzColors = Number(b.dataset.colors) || 8;
+      el.querySelectorAll(".detail-btn").forEach((x) => x.classList.toggle("on", x === b));
+    };
+  });
   async function uploadArtwork(file) {
     if (!file) return;
     try {
@@ -536,8 +572,12 @@ async function fillArt(el, job, shopControls) {
   const artFile = $("#artFile");
   const drop = $("#artDrop");
   artFile.onchange = () => { if (artFile.files && artFile.files[0]) uploadArtwork(artFile.files[0]); };
-  drop.onclick = () => artFile.click();
-  drop.onkeydown = (e) => { if (e.key === "Enter" || e.key === " ") { e.preventDefault(); artFile.click(); } };
+  const replaceBtn = $("#replaceBtn");
+  if (replaceBtn) replaceBtn.onclick = () => artFile.click();
+  if (!hasArt) {
+    drop.onclick = () => artFile.click();
+    drop.onkeydown = (e) => { if (e.key === "Enter" || e.key === " ") { e.preventDefault(); artFile.click(); } };
+  }
   drop.ondragover = (e) => { e.preventDefault(); drop.classList.add("dragover"); };
   drop.ondragleave = () => drop.classList.remove("dragover");
   drop.ondrop = (e) => {
@@ -546,15 +586,7 @@ async function fillArt(el, job, shopControls) {
     const f = e.dataTransfer && e.dataTransfer.files && e.dataTransfer.files[0];
     if (f) uploadArtwork(f);
   };
-  $("#up").onsubmit = async (e) => {
-    e.preventDefault();
-    const file = artFile.files && artFile.files[0];
-    if (file) return uploadArtwork(file);
-    const res = await fetch("/api/jobs/" + job.id + "/artwork", { method: "POST", credentials: "include", body: new FormData(e.target) });
-    const data = await res.json();
-    if (!res.ok) { $("#err").textContent = data.error; return; }
-    renderJob(job.id);
-  };
+  if (hasArt) bindArtZoom(drop);
   $("#rmbgBtn").onclick = async () => {
     try {
       await ensurePngArtwork(job);
@@ -566,6 +598,14 @@ async function fillArt(el, job, shopControls) {
     try { await api("/api/jobs/" + job.id + "/artops", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ knockout: "white" }) }); renderJob(job.id); }
     catch (err) { $("#err").textContent = err.message; }
   };
+  const grey = $("#greyBtn");
+  if (grey) grey.onclick = async () => {
+    try {
+      await ensurePngArtwork(job);
+      await api("/api/jobs/" + job.id + "/artops", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ greyscale: true, scale: 2 }) });
+      renderJob(job.id);
+    } catch (err) { $("#err").textContent = err.message; }
+  };
   const ig = $("#imagineGo");
   if (ig) ig.onclick = async () => {
     const prompt = ($("#imaginePrompt") && $("#imaginePrompt").value || "").trim();
@@ -573,13 +613,8 @@ async function fillArt(el, job, shopControls) {
     try { await api("/api/jobs/" + job.id + "/imagine", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ prompt: prompt }) }); renderJob(job.id); }
     catch (err) { $("#err").textContent = err.message; }
   };
-  $("#swap").onsubmit = async (e) => {
-    e.preventDefault();
-    const fd = new FormData(e.target);
-    try { await api("/api/jobs/" + job.id + "/artops", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ color_swap: { from: fd.get("from"), to: fd.get("to") } }) }); renderJob(job.id); }
-    catch (err) { $("#err").textContent = err.message; }
-  };
-  $("#saveArtN").onclick = async () => {
+  const saveN = $("#saveArtN");
+  if (saveN) saveN.onclick = async () => {
     await api("/api/jobs/" + job.id, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ art_notes: $("#artn").value }) });
     renderJob(job.id);
   };
@@ -587,24 +622,74 @@ async function fillArt(el, job, shopControls) {
   if (vz) vz.onclick = async () => {
     try {
       await ensurePngArtwork(job);
-      await api("/api/jobs/" + job.id + "/vectorize", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({}) });
+      await api("/api/jobs/" + job.id + "/vectorize", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ colors: vzColors }) });
       renderJob(job.id);
     } catch (err) { $("#err").textContent = err.message; }
   };
-  el.querySelectorAll(".layer-row select").forEach((sel) => {
-    sel.onchange = async () => {
-      const hex = sel.value;
-      if (!hex) return;
-      const layer = Number(sel.closest(".layer-row").dataset.layer);
-      const pal = sel.dataset.pal;
-      const opt = sel.selectedOptions && sel.selectedOptions[0];
-      const name = opt ? opt.textContent : "";
+  el.querySelectorAll(".layer-pick").forEach((inp) => {
+    inp.onchange = async () => {
+      const layer = Number(inp.closest(".layer-row").dataset.layer);
       try {
-        await api("/api/jobs/" + job.id + "/recolor", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ layer: layer, hex: hex, name: name, palette: pal }) });
+        await api("/api/jobs/" + job.id + "/recolor", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ layer: layer, hex: inp.value }) });
         renderJob(job.id);
       } catch (err) { $("#err").textContent = err.message; }
     };
   });
+  el.querySelectorAll(".layer-pal").forEach((sel) => {
+    sel.onchange = async () => {
+      const hex = sel.value;
+      if (!hex) return;
+      const layer = Number(sel.dataset.layer);
+      const opt = sel.selectedOptions && sel.selectedOptions[0];
+      const name = opt ? opt.getAttribute("data-name") || opt.textContent : "";
+      try {
+        await api("/api/jobs/" + job.id + "/recolor", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ layer: layer, hex: hex, name: name }) });
+        renderJob(job.id);
+      } catch (err) { $("#err").textContent = err.message; }
+    };
+  });
+}
+function bindArtZoom(stage) {
+  const inner = $("#artZoomInner", stage) || $("#artZoomInner");
+  if (!inner) return;
+  let scale = 1, x = 0, y = 0, drag = null;
+  function apply() {
+    inner.style.transform = "translate(" + x + "px, " + y + "px) scale(" + scale + ")";
+    const r = $("#zoomRead");
+    if (r) r.textContent = Math.round(scale * 100) + "%";
+  }
+  function zoomTo(next, cx, cy) {
+    const old = scale;
+    scale = Math.max(0.25, Math.min(8, next));
+    if (cx != null) {
+      x = cx - ((cx - x) * (scale / old));
+      y = cy - ((cy - y) * (scale / old));
+    }
+    apply();
+  }
+  const zin = $("#zoomIn"), zout = $("#zoomOut"), zfit = $("#zoomFit");
+  if (zin) zin.onclick = (e) => { e.stopPropagation(); zoomTo(scale * 1.25); };
+  if (zout) zout.onclick = (e) => { e.stopPropagation(); zoomTo(scale / 1.25); };
+  if (zfit) zfit.onclick = (e) => { e.stopPropagation(); scale = 1; x = 0; y = 0; apply(); };
+  stage.addEventListener("wheel", (e) => {
+    e.preventDefault();
+    const rect = stage.getBoundingClientRect();
+    zoomTo(scale * (e.deltaY < 0 ? 1.12 : 1 / 1.12), e.clientX - rect.left, e.clientY - rect.top);
+  }, { passive: false });
+  stage.addEventListener("pointerdown", (e) => {
+    if (e.button !== 0) return;
+    drag = { x: e.clientX - x, y: e.clientY - y };
+    stage.classList.add("panning");
+    stage.setPointerCapture(e.pointerId);
+  });
+  stage.addEventListener("pointermove", (e) => {
+    if (!drag) return;
+    x = e.clientX - drag.x;
+    y = e.clientY - drag.y;
+    apply();
+  });
+  stage.addEventListener("pointerup", () => { drag = null; stage.classList.remove("panning"); });
+  apply();
 }
 
 function fillMockup(el, job, shopControls) {

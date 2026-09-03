@@ -348,3 +348,24 @@ th { color: var(--muted); font-weight: 600; font-size: 11px; letter-spacing: .06
 .export-grid a:hover { border-color: var(--gold); color: var(--gold); }
 .export-hero a { padding: 16px 14px; font-size: 16px; background: var(--gold); color: #fff; border-color: var(--gold); }
 .export-hero a:hover { filter: brightness(1.06); color: #fff; }
+
+.art-stage { display:flex; flex-direction:column; gap:8px; }
+.art-drop.has-art { cursor:grab; overflow:hidden; position:relative; }
+.art-drop.has-art.panning { cursor:grabbing; }
+.art-zoom-inner { transform-origin: 0 0; will-change: transform; display:flex; align-items:center; justify-content:center; width:100%; height:100%; }
+.art-drop.has-art img { max-height:none; max-width:100%; pointer-events:none; user-select:none; }
+.zoom-bar { display:flex; align-items:center; gap:8px; flex-wrap:wrap; }
+.zoom-btn { min-width:36px; padding:6px 10px; border:1px solid var(--line); background:var(--panel); font-weight:700; cursor:pointer; }
+.zoom-btn:hover { border-color:var(--gold); color:var(--gold); }
+.zoom-readout { font-weight:700; min-width:48px; }
+.art-actions { display:flex; gap:8px; flex-wrap:wrap; }
+.detail-row { display:flex; gap:8px; margin:12px 0; }
+.detail-btn { flex:1; display:flex; flex-direction:column; align-items:center; gap:4px; padding:8px 6px; border:1px solid var(--line); background:var(--panel); cursor:pointer; font-size:12px; font-weight:600; }
+.detail-btn svg { width:22px; height:22px; fill:currentColor; }
+.detail-btn.on, .detail-btn:hover { border-color:var(--gold); color:var(--gold); }
+.layer-ico { width:22px; height:22px; flex:0 0 22px; }
+.layer-pick { width:42px; height:28px; padding:0; border:1px solid var(--line); background:transparent; }
+.art-more { margin-top:16px; border-top:1px solid var(--line); padding-top:10px; }
+.art-more summary { cursor:pointer; font-weight:700; color:var(--muted); }
+.more-block { margin:12px 0; }
+.preview.art-drop.has-art { min-height:420px; }
