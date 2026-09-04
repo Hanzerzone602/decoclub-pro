@@ -519,7 +519,7 @@ async function fillArt(el, job, shopControls) {
             <svg viewBox="0 0 24 24" aria-hidden="true"><rect x="3" y="5" width="8" height="14" rx="1"/><rect x="13" y="5" width="8" height="14" rx="1"/></svg>
             Balanced
           </button>
-          <button type="button" class="detail-btn" data-colors="12" title="Fine detail">
+          <button type="button" class="detail-btn" data-colors="10" title="Fine detail">
             <svg viewBox="0 0 24 24" aria-hidden="true"><rect x="3" y="4" width="5" height="16"/><rect x="10" y="4" width="5" height="16"/><rect x="17" y="4" width="4" height="16"/></svg>
             Fine
           </button>
@@ -628,13 +628,11 @@ async function fillArt(el, job, shopControls) {
     const errEl = $("#err");
     if (errEl) errEl.textContent = "Vectorizing…";
     await ensurePngArtwork(job);
-    const maxEdge = vzColors >= 12 ? 1400 : (vzColors <= 4 ? 900 : 1100);
-    const epsilon = vzColors >= 12 ? 0.35 : (vzColors <= 4 ? 0.85 : 0.55);
-    const fitError = vzColors >= 12 ? 0.4 : (vzColors <= 4 ? 0.9 : 0.65);
+    const maxEdge = 720;
     await api("/api/jobs/" + job.id + "/vectorize", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ colors: vzColors, maxEdge: maxEdge, epsilon: epsilon, fitError: fitError, engine: "local" }),
+      body: JSON.stringify({ colors: vzColors, maxEdge: maxEdge, engine: "local" }),
     });
     renderJob(job.id);
   }
