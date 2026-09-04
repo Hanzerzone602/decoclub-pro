@@ -1,4 +1,5 @@
 const http = require("http");
+const { Worker } = require("worker_threads");
 const fs = require("fs");
 const path = require("path");
 const crypto = require("crypto");
@@ -132,34 +133,62 @@ function saveImaginePng(buf) {
   fs.writeFileSync(path.join(UPLOADS, name), buf);
   return "/uploads/" + name;
 }
+function applyVectorResult(job, vec, svg) {
+  if (!job || !vec) return;
+  job.vector = vec;
+  const name = Date.now() + "-" + uid() + "-vector.svg";
+  fs.writeFileSync(path.join(UPLOADS, name), svg);
+  job.vector_svg = "/uploads/" + name;
+}
+function vectorizeInWorker(buf, widthIn, heightIn, opts, timeoutMs) {
+  return new Promise(function (resolve, reject) {
+    const worker = new Worker(path.join(__dirname, "lib", "vectorize-worker.js"), {
+      workerData: {
+        bufB64: Buffer.from(buf).toString("base64"),
+        widthIn: widthIn,
+        heightIn: heightIn,
+        opts: opts || {},
+      },
+    });
+    let done = false;
+    const timer = setTimeout(function () {
+      if (done) return;
+      done = true;
+      try { worker.terminate(); } catch (e) {}
+      reject(new Error("Vectorize timed out"));
+    }, timeoutMs || 90000);
+    worker.on("message", function (msg) {
+      if (done) return;
+      done = true;
+      clearTimeout(timer);
+      try { worker.terminate(); } catch (e) {}
+      if (msg && msg.ok) resolve(msg);
+      else reject(new Error((msg && msg.error) || "Vectorize failed"));
+    });
+    worker.on("error", function (err) {
+      if (done) return;
+      done = true;
+      clearTimeout(timer);
+      reject(err);
+    });
+  });
+}
 function tryVectorizeJob(job) {
+  /* sync path kept only for tests — production upload never calls this for big art */
   if (!job || !job.file_path) return;
   const abs = path.join(UPLOADS, path.basename(job.file_path));
   if (!fs.existsSync(abs)) return;
   const buf = fs.readFileSync(abs);
   if (buf[0] !== 0x89 || buf[1] !== 0x50) return;
   try {
-    const vec = vectorize(buf, job.width_in, job.height_in, { maxEdge: 640, colors: 8 });
-    job.vector = vec;
+    const vec = vectorize(buf, job.width_in, job.height_in, { maxEdge: 320, colors: 6, fast: true });
     const svg = svgFromLayers(vec.layers, vec.widthIn, vec.heightIn);
-    const name = Date.now() + "-" + uid() + "-vector.svg";
-    fs.writeFileSync(path.join(UPLOADS, name), svg);
-    job.vector_svg = "/uploads/" + name;
-  } catch (e) { /* keep raster; never fail the upload */ }
+    applyVectorResult(job, vec, svg);
+  } catch (e) { /* keep raster */ }
 }
 function scheduleVectorize(jobId) {
-  setImmediate(function () {
-    try {
-      const db = load();
-      const job = db.jobs.find(function (j) { return j.id === jobId; });
-      if (!job || job.vector) return;
-      tryVectorizeJob(job);
-      if (job.vector) {
-        event(db, job, "Vectorized · " + ((job.vector.layers && job.vector.layers.length) || 0) + " layers");
-        save(db);
-      }
-    } catch (e) { /* never take down the shop */ }
-  });
+  /* Upload stays snappy: do NOT auto-vectorize. User clicks Vectorize. */
+  return;
 }
 function rewriteVectorSvg(job) {
   if (!job || !job.vector || !job.vector.layers) return;
@@ -544,7 +573,6 @@ async function handleApi(req, res, url) {
       };
       applyQuote(job); applyMockup(job);
       if (job.file_path) job.status = "mockup";
-      tryVectorizeJob(job);
       db.jobs.push(job); event(db, job, "AI Generate"); save(db);
       return json(res, 200, { job: presentJob(job, req) });
     } catch (err) {
@@ -662,7 +690,6 @@ async function handleApi(req, res, url) {
       job.file_path = saveImaginePng(buf);
       if (STATUSES.indexOf(job.status) < STATUSES.indexOf("art_in")) job.status = "art_in";
       applyMockup(job);
-      tryVectorizeJob(job);
       event(db, job, "AI Generate"); save(db);
       return json(res, 200, { job: presentJob(job, req) });
     } catch (err) {
@@ -787,12 +814,16 @@ async function handleApi(req, res, url) {
     if (buf[0] === 0xff && buf[1] === 0xd8) return json(res, 400, { error: "Still a JPEG — click Vectorize again so Studio can convert it" });
     if (buf[0] !== 0x89 || buf[1] !== 0x50) return json(res, 400, { error: "Need PNG, JPG, or WebP artwork" });
     try {
-      const vec = vectorize(buf, job.width_in, job.height_in, { colors: body.colors, maxEdge: body.maxEdge || 1400, epsilon: body.epsilon == null ? 0.55 : body.epsilon });
-      job.vector = vec;
-      rewriteVectorSvg(job);
+      const opts = {
+        colors: body.colors,
+        maxEdge: Math.min(Number(body.maxEdge) || 1000, 1200),
+        epsilon: body.epsilon == null ? 0.55 : body.epsilon,
+      };
+      const msg = await vectorizeInWorker(buf, job.width_in, job.height_in, opts, 90000);
+      applyVectorResult(job, msg.vec, msg.svg);
       if (body.apply_mockup) applyMockup(job);
-      event(db, job, "Vectorized · " + vec.layers.length + " layers"); save(db);
-      return json(res, 200, { job: presentJob(job, req), vector: vec });
+      event(db, job, "Vectorized · " + msg.vec.layers.length + " layers"); save(db);
+      return json(res, 200, { job: presentJob(job, req), vector: msg.vec });
     } catch (err) {
       return json(res, 400, { error: IS_PROD ? "Could not vectorize" : err.message });
     }
