@@ -48,7 +48,7 @@ function canFloor() {
 function entitled() { return !!(user && user.entitled); }
 function paywallNote() {
   if (entitled()) return "";
-  return '<p class="notice" id="paywall">Proofs and packets need Shop or Studio. Only admin runs the full floor for free.</p>';
+  return '<p class="notice" id="paywall">Some exports need a member account. Trial and member logins unlock the full art studio.</p>';
 }
 function nav() {
   document.querySelectorAll(".linkish").forEach((b) => {
@@ -851,7 +851,7 @@ function fillProof(el, job, shopControls) {
 
 function fillProduce(el, job, shopControls) {
   if (!shopControls) { el.innerHTML = "<p class='muted'>Export files are shop-only.</p>"; return; }
-  if (!entitled()) { el.innerHTML = paywallNote() + "<p class='muted'>Packets stay locked until Shop or Studio is active. Admin is complimentary.</p>"; return; }
+  if (!entitled()) { el.innerHTML = paywallNote() + "<p class='muted'>Some art exports stay locked until a member account is active. Admin stays open.</p>"; return; }
   const stitch = job.stitchCount != null ? job.stitchCount : (job.vector ? "run Export" : "—");
   const stones = job.stones && job.stones.count != null ? job.stones.count : "—";
   el.innerHTML = `

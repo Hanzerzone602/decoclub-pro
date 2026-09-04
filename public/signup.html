@@ -11,17 +11,17 @@
 <body class="auth-page">
   <header class="topbar"><a class="brand" href="/"><img src="/logo.png" alt="" /> DECOCLUB PRO</a></header>
   <form class="auth-box" id="form">
-    <div class="kicker">Seven-day trial for shops</div>
-    <h1>Open the shop</h1>
-    <p class="muted" id="methodHint">Trial can mock and price. Packets unlock on Shop or Studio.</p>
+    <div class="kicker">Seven-day art studio trial</div>
+    <h1>Create your account</h1>
+    <p class="muted" id="methodHint">Try vectorize, digitize, laser, screen, and UV art prep. Sign in later to revisit past outputs.</p>
     <label>Your name</label><input name="name" required />
-    <label>Shop name</label><input name="shopName" placeholder="Westside Press" />
+    <label>Studio name</label><input name="shopName" placeholder="Your studio" />
     <label>Email</label><input name="email" type="email" required />
     <label>Password</label><input name="password" type="password" minlength="6" required />
     <label>Account type</label>
     <select name="role">
-      <option value="shop">Shop (full floor)</option>
-      <option value="client">Client (proofs and assigned jobs)</option>
+      <option value="shop">Studio member</option>
+      <option value="client">Guest (view shared art)</option>
     </select>
     <p class="notice" id="err"></p>
     <button class="btn" type="submit">Create account</button>
@@ -30,7 +30,7 @@
   <script>
     (function () {
       var METHODS = ["dtf","uvdtf","uv","vinyl","laser","sticker","hat","apparel","patch","embroidery","sublimation","rhinestone","sign"];
-      var LABELS = { dtf: "DTF", uvdtf: "UV DTF", uv: "UV print", vinyl: "Vinyl", laser: "Laser", sticker: "Stickers", hat: "Hats", apparel: "Apparel", patch: "Patches", embroidery: "Embroidery", sublimation: "Sublimation", rhinestone: "Rhinestone", sign: "Signs" };
+      var LABELS = { dtf: "Vectorize", uvdtf: "UV / UV-DTF", uv: "UV print-ready", vinyl: "Vinyl art", laser: "Laser-ready", sticker: "Screenprint-ready", hat: "Hat art", apparel: "Apparel art", patch: "Patch art", embroidery: "Digitize", sublimation: "Sublimation art", rhinestone: "Rhinestone art", sign: "Sign art" };
       var q = new URLSearchParams(location.search).get("method") || "";
       var stored = sessionStorage.getItem("decoclub_start_method") || "";
       var method = METHODS.indexOf(q) !== -1 ? q : (METHODS.indexOf(stored) !== -1 ? stored : "");
@@ -38,7 +38,7 @@
         sessionStorage.setItem("decoclub_start_method", method);
         document.getElementById("altAuth").href = "/login.html?method=" + encodeURIComponent(method);
         var hint = document.getElementById("methodHint");
-        if (hint) hint.textContent = "After you open the shop, we will start a " + (LABELS[method] || method) + " job on Art.";
+        if (hint) hint.textContent = "After you create an account, we will open " + (LABELS[method] || method) + " in the art studio.";
       }
       document.getElementById("form").onsubmit = async (e) => {
         e.preventDefault();

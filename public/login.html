@@ -11,9 +11,9 @@
 <body class="auth-page">
   <header class="topbar"><a class="brand" href="/"><img src="/logo.png" alt="" /> DECOCLUB PRO</a></header>
   <form class="auth-box" id="form">
-    <div class="kicker">Shop floor</div>
+    <div class="kicker">Art studio</div>
     <h1>Log in</h1>
-    <p class="muted" id="methodHint">Enter the floor. Jobs, proofs, packets.</p>
+    <p class="muted" id="methodHint">Sign in to your art tools and past outputs.</p>
     <label>Email</label>
     <input name="email" type="email" autocomplete="username" required />
     <label>Password</label>
@@ -21,13 +21,13 @@
     <label class="remember"><input name="remember_me" id="remember" type="checkbox" checked /> Remember me</label>
     <p class="notice" id="err"></p>
     <p class="muted" id="hint"></p>
-    <button class="btn" type="submit">Enter floor</button>
-    <p class="muted" style="margin-top:18px">No account? <a href="/signup.html" id="altAuth">Create a shop or client login</a></p>
+    <button class="btn" type="submit">Log in</button>
+    <p class="muted" style="margin-top:18px">No account? <a href="/signup.html" id="altAuth">Create an account</a></p>
   </form>
   <script>
     (function () {
       var METHODS = ["dtf","uvdtf","uv","vinyl","laser","sticker","hat","apparel","patch","embroidery","sublimation","rhinestone","sign"];
-      var LABELS = { dtf: "DTF", uvdtf: "UV DTF", uv: "UV print", vinyl: "Vinyl", laser: "Laser", sticker: "Stickers", hat: "Hats", apparel: "Apparel", patch: "Patches", embroidery: "Embroidery", sublimation: "Sublimation", rhinestone: "Rhinestone", sign: "Signs" };
+      var LABELS = { dtf: "Vectorize", uvdtf: "UV / UV-DTF", uv: "UV print-ready", vinyl: "Vinyl art", laser: "Laser-ready", sticker: "Screenprint-ready", hat: "Hat art", apparel: "Apparel art", patch: "Patch art", embroidery: "Digitize", sublimation: "Sublimation art", rhinestone: "Rhinestone art", sign: "Sign art" };
       var q = new URLSearchParams(location.search).get("method") || "";
       var stored = sessionStorage.getItem("decoclub_start_method") || "";
       var method = METHODS.indexOf(q) !== -1 ? q : (METHODS.indexOf(stored) !== -1 ? stored : "");
@@ -35,7 +35,7 @@
         sessionStorage.setItem("decoclub_start_method", method);
         document.getElementById("altAuth").href = "/signup.html?method=" + encodeURIComponent(method);
         var mh = document.getElementById("methodHint");
-        if (mh) mh.textContent = "We will open a " + (LABELS[method] || method) + " job on Art after you enter the floor.";
+        if (mh) mh.textContent = "We will open " + (LABELS[method] || method) + " in the art studio after you log in.";
       }
       var savedEmail = localStorage.getItem("decoclub_email") || "";
       if (savedEmail) { var em = document.querySelector("input[name=email]"); if (em) em.value = savedEmail; }
