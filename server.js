@@ -15,6 +15,7 @@ const { imagineConfigured, generateImage } = require("./lib/imagine");
 const { vectorize, svgFromLayers } = require("./lib/vectorize");
 const vectorizerAi = require("./lib/vectorizerAi");
 const vtracer = require("./lib/vtracer");
+const colorspec = require("./lib/colorspec");
 const { listPalettes } = require("./lib/palettes");
 const { digitizeJob } = require("./lib/digitize");
 const { stonesForJob } = require("./lib/stones");
@@ -159,8 +160,8 @@ function layersFromSvgFills(svgText, widthIn, heightIn) {
     fills.push(hex);
     if (fills.length >= 48) break;
   }
-  return fills.map(function (hex, i) {
-    return { hex: hex, nameGuess: "Layer " + (i + 1), paths: [] };
+  return fills.map(function (hex) {
+    return colorspec.annotateLayer({ hex: hex, paths: [] });
   });
 }
 function applyProVectorFiles(job, svgBuf, epsBuf, meta) {
@@ -181,7 +182,7 @@ function applyProVectorFiles(job, svgBuf, epsBuf, meta) {
     source: "vectorizer.ai",
     widthIn: Number(job.width_in) || 10,
     heightIn: Number(job.height_in) || 10,
-    layers: layers.length ? layers : [{ hex: "#111111", nameGuess: "Art", paths: [] }],
+    layers: colorspec.annotateLayers(layers.length ? layers : [{ hex: "#111111", paths: [] }]),
     imageToken: meta.imageToken || null,
     credits: meta.credits || null,
   };
@@ -981,6 +982,10 @@ async function handleApi(req, res, url) {
     if (!job.vector.layers[idx]) return json(res, 400, { error: "Unknown layer" });
     const prevHex = job.vector.layers[idx].hex;
     if (body.hex) job.vector.layers[idx].hex = String(body.hex);
+    if (body.hex) {
+      const ann = colorspec.annotateLayer({ hex: job.vector.layers[idx].hex, paths: job.vector.layers[idx].paths || [] });
+      job.vector.layers[idx] = Object.assign(job.vector.layers[idx], ann);
+    }
     if (body.name) job.vector.layers[idx].nameGuess = String(body.name);
     job.vector.layers[idx].palette = body.palette || job.vector.layers[idx].palette;
     if ((job.vector.source === "vectorizer.ai" || job.vector.source === "vtracer") && job.vector_svg && body.hex && prevHex) {

@@ -459,7 +459,7 @@ function fillOverview(el, job, shopControls) {
 let palettesCache = null;
 async function loadPalettes() {
   if (palettesCache) return palettesCache;
-  try { palettesCache = await api("/api/palettes"); } catch (e) { palettesCache = { vinyl: [], thread: [], stone: [], process: [] }; }
+  try { palettesCache = await api("/api/palettes"); } catch (e) { palettesCache = { pantone: [], vinyl: [], thread: [], stone: [], process: [] }; }
   return palettesCache;
 }
 function palSelect(kind, palettes, currentHex) {
@@ -469,23 +469,32 @@ function palSelect(kind, palettes, currentHex) {
 }
 
 async function fillArt(el, job, shopControls) {
-  const pals = shopControls ? await loadPalettes() : { vinyl: [], thread: [], stone: [] };
-  const allPals = []
-    .concat((pals.vinyl || []).map((c) => Object.assign({ kind: "vinyl" }, c)))
-    .concat((pals.thread || []).map((c) => Object.assign({ kind: "thread" }, c)));
+  const pals = shopControls ? await loadPalettes() : { pantone: [], vinyl: [], thread: [], stone: [] };
+  const pantones = pals.pantone || [];
   const layers = (job.vector && job.vector.layers) || [];
   const hasArt = !!(job.vector_svg || job.file_path);
   const preview = job.vector_svg
-    ? `<img id="artZoomImg" src="${job.vector_svg}" alt="Vector" draggable="false" />`
+    ? `<div id="artZoomSvg" class="art-svg-host" data-src="${escapeHtml(job.vector_svg)}"></div>`
     : (job.file_path ? `<img id="artZoomImg" src="${job.file_path}" alt="Art" draggable="false" />` : `<div class="drop-hint"><strong>Drop art here</strong><span>PNG, JPG, or WebP</span></div>`);
+  function layerLabel(L) {
+    if (L.rgb && L.cmyk) {
+      const rgb = "R" + L.rgb.r + " G" + L.rgb.g + " B" + L.rgb.b;
+      const cmyk = "C" + L.cmyk.c + " M" + L.cmyk.m + " Y" + L.cmyk.y + " K" + L.cmyk.k;
+      return rgb + " · " + cmyk + (L.pantone ? " · " + L.pantone : "");
+    }
+    return L.nameGuess || (L.hex || "").toUpperCase();
+  }
   const layerRows = layers.map((L, i) => `
     <div class="layer-row" data-layer="${i}">
       <svg class="layer-ico" viewBox="0 0 20 20" aria-hidden="true"><circle cx="10" cy="10" r="7" fill="${escapeHtml(L.hex)}" stroke="#1a2330" stroke-width="1"/></svg>
-      <span class="layer-name">${escapeHtml(L.nameGuess || ("Layer " + (i + 1)))}</span>
+      <div class="layer-meta">
+        <span class="layer-name">${escapeHtml(layerLabel(L))}</span>
+        <span class="layer-sub muted">${escapeHtml((L.hex || "").toUpperCase())}</span>
+      </div>
       <input type="color" class="layer-pick" value="${escapeHtml((L.hex || "#111111").slice(0, 7))}" title="Recolor" />
-      <select class="layer-pal" data-layer="${i}">
-        <option value="">Named color</option>
-        ${allPals.map((c) => `<option value="${escapeHtml(c.hex)}" data-name="${escapeHtml(c.name)}" ${String(c.hex).toLowerCase()===String(L.hex||"").toLowerCase()?"selected":""}>${escapeHtml(c.name)}</option>`).join("")}
+      <select class="layer-pal" data-layer="${i}" title="Pantone">
+        <option value="">Pantone…</option>
+        ${pantones.map((c) => `<option value="${escapeHtml(c.hex)}" data-name="${escapeHtml(c.name)}" ${String(L.pantone||"")===String(c.name)?"selected":""}>${escapeHtml(c.name)}</option>`).join("")}
       </select>
     </div>`).join("") || `<p class="muted">Click Vectorize after you drop art.</p>`;
   el.innerHTML = `
@@ -592,7 +601,28 @@ async function fillArt(el, job, shopControls) {
     const f = e.dataTransfer && e.dataTransfer.files && e.dataTransfer.files[0];
     if (f) uploadArtwork(f);
   };
-  if (hasArt) bindArtZoom(drop);
+  if (hasArt) {
+    const host = $("#artZoomSvg");
+    if (host && host.dataset.src) {
+      fetch(host.dataset.src, { credentials: "include" }).then((r) => r.text()).then((svg) => {
+        host.innerHTML = svg;
+        const elSvg = host.querySelector("svg");
+        if (elSvg) {
+          elSvg.removeAttribute("width");
+          elSvg.removeAttribute("height");
+          elSvg.setAttribute("preserveAspectRatio", "xMidYMid meet");
+          elSvg.style.width = "100%";
+          elSvg.style.height = "auto";
+        }
+        bindArtZoom(drop);
+      }).catch(() => {
+        host.outerHTML = '<img id="artZoomImg" src="' + host.dataset.src + '" alt="Vector" draggable="false" />';
+        bindArtZoom(drop);
+      });
+    } else {
+      bindArtZoom(drop);
+    }
+  }
   $("#rmbgBtn").onclick = async () => {
     try {
       await ensurePngArtwork(job);

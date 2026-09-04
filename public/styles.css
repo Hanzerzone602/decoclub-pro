@@ -373,3 +373,10 @@ th { color: var(--muted); font-weight: 600; font-size: 11px; letter-spacing: .06
 
 .art-dl { margin-top: 14px; }
 .art-dl a { text-align: center; letter-spacing: 0.02em; box-shadow: 0 2px 0 rgba(0,0,0,0.12); }
+
+.layer-meta { display:flex; flex-direction:column; gap:2px; min-width:0; flex:1; }
+.layer-name { font-size:12px; line-height:1.25; word-break:break-word; }
+.layer-sub { font-size:11px; }
+.art-svg-host { width:100%; display:flex; align-items:center; justify-content:center; }
+.art-svg-host svg { width:100%; height:auto; max-width:100%; overflow:visible; }
+.art-drop.has-art .art-svg-host { pointer-events:none; user-select:none; }
