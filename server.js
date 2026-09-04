@@ -15,6 +15,7 @@ const { imagineConfigured, generateImage } = require("./lib/imagine");
 const { vectorize, svgFromLayers } = require("./lib/vectorize");
 const vectorizerAi = require("./lib/vectorizerAi");
 const vtracer = require("./lib/vtracer");
+const bezierVectorize = require("./lib/bezierVectorize");
 const colorspec = require("./lib/colorspec");
 const { listPalettes } = require("./lib/palettes");
 const { digitizeJob } = require("./lib/digitize");
@@ -288,9 +289,8 @@ function tryVectorizeJob(job) {
   const buf = fs.readFileSync(abs);
   if (buf[0] !== 0x89 || buf[1] !== 0x50) return;
   try {
-    const vec = vectorize(buf, job.width_in, job.height_in, { maxEdge: 320, colors: 6, fast: true });
-    const svg = svgFromLayers(vec.layers, vec.widthIn, vec.heightIn);
-    applyVectorResult(job, vec, svg);
+    const packed = bezierVectorize.vectorizeToSvg(buf, job.width_in, job.height_in, { maxEdge: 320, colors: 6 });
+    applyVectorResult(job, packed.vec, packed.svg);
   } catch (e) { /* keep raster */ }
 }
 function scheduleVectorize(jobId) {
@@ -939,6 +939,7 @@ async function handleApi(req, res, url) {
     if (buf[0] === 0xff && buf[1] === 0xd8) return json(res, 400, { error: "Still a JPEG — click Vectorize again so Studio can convert it" });
     if (buf[0] !== 0x89 || buf[1] !== 0x50) return json(res, 400, { error: "Need PNG, JPG, or WebP artwork" });
     const wantApi = body.engine === "vectorizer.ai";
+    const wantVtracer = body.engine === "vtracer";
     const wantLegacy = body.engine === "legacy" || body.engine === "local-js";
     try {
       if (wantApi) {
@@ -950,23 +951,48 @@ async function handleApi(req, res, url) {
         event(db, job, "Pro Vectorize · Vectorizer.AI · " + (job.vector.layers || []).length + " colors"); save(db);
         return json(res, 200, { job: presentJob(job, req), vector: job.vector });
       }
-      if (!wantLegacy && vtracer.available()) {
+      if (wantVtracer) {
+        if (!vtracer.available()) return json(res, 501, { error: "VTracer binary missing" });
         runVtracerVectorize(job, buf, body);
         if (body.apply_mockup) applyMockup(job);
         event(db, job, "Vectorized · VTracer · " + (job.vector.layers || []).length + " colors"); save(db);
         return json(res, 200, { job: presentJob(job, req), vector: job.vector });
       }
+      if (wantLegacy) {
+        const opts = {
+          colors: body.colors,
+          maxEdge: Math.min(Number(body.maxEdge) || 720, 800),
+          epsilon: body.epsilon,
+          fitError: body.fitError,
+        };
+        const msg = await vectorizeInWorker(buf, job.width_in, job.height_in, opts, 90000);
+        applyVectorResult(job, msg.vec, msg.svg);
+        if (body.apply_mockup) applyMockup(job);
+        event(db, job, "Vectorized · legacy · " + msg.vec.layers.length + " layers"); save(db);
+        return json(res, 200, { job: presentJob(job, req), vector: msg.vec });
+      }
+      /* Default free path: pure-JS cubic Bézier engine; VTracer only as fallback */
       const opts = {
-        colors: body.colors,
-        maxEdge: Math.min(Number(body.maxEdge) || 720, 800),
-        epsilon: body.epsilon,
+        colors: body.colors == null ? 12 : body.colors,
+        maxEdge: Math.min(Number(body.maxEdge) || 1100, 1400),
         fitError: body.fitError,
+        overlapPx: body.overlapPx,
       };
-      const msg = await vectorizeInWorker(buf, job.width_in, job.height_in, opts, 90000);
-      applyVectorResult(job, msg.vec, msg.svg);
-      if (body.apply_mockup) applyMockup(job);
-      event(db, job, "Vectorized · " + msg.vec.layers.length + " layers"); save(db);
-      return json(res, 200, { job: presentJob(job, req), vector: msg.vec });
+      try {
+        const packed = bezierVectorize.vectorizeToSvg(buf, job.width_in, job.height_in, opts);
+        applyVectorResult(job, packed.vec, packed.svg);
+        if (body.apply_mockup) applyMockup(job);
+        event(db, job, "Vectorized · Bézier · " + packed.vec.layers.length + " layers"); save(db);
+        return json(res, 200, { job: presentJob(job, req), vector: job.vector });
+      } catch (bezErr) {
+        if (vtracer.available()) {
+          runVtracerVectorize(job, buf, body);
+          if (body.apply_mockup) applyMockup(job);
+          event(db, job, "Vectorized · VTracer fallback · " + (job.vector.layers || []).length + " colors"); save(db);
+          return json(res, 200, { job: presentJob(job, req), vector: job.vector });
+        }
+        throw bezErr;
+      }
     } catch (err) {
       return json(res, 400, { error: IS_PROD ? "Could not vectorize" : err.message });
     }
