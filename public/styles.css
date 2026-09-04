@@ -369,3 +369,6 @@ th { color: var(--muted); font-weight: 600; font-size: 11px; letter-spacing: .06
 .art-more summary { cursor:pointer; font-weight:700; color:var(--muted); }
 .more-block { margin:12px 0; }
 .preview.art-drop.has-art { min-height:420px; }
+
+.art-dl { margin-top: 14px; }
+.art-dl a { text-align: center; letter-spacing: 0.02em; box-shadow: 0 2px 0 rgba(0,0,0,0.12); }

@@ -524,6 +524,11 @@ async function fillArt(el, job, shopControls) {
           </button>
         </div>` : ""}
         <div class="layer-list">${layerRows}</div>
+        ${shopControls && layers.length ? `<div class="export-grid export-hero art-dl">
+          <a href="/api/export/${job.id}/art.svg">Download SVG</a>
+          <a href="/api/export/${job.id}/art.eps">Download EPS</a>
+        </div>
+        <p class="muted">Corel / Illustrator ready · real curves</p>` : ""}
         ${shopControls ? `
         <details class="art-more">
           <summary>More tools</summary>
@@ -622,7 +627,7 @@ async function fillArt(el, job, shopControls) {
   if (vz) vz.onclick = async () => {
     try {
       await ensurePngArtwork(job);
-      await api("/api/jobs/" + job.id + "/vectorize", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ colors: vzColors }) });
+      await api("/api/jobs/" + job.id + "/vectorize", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ colors: vzColors, maxEdge: 1400, epsilon: 0.5 }) });
       renderJob(job.id);
     } catch (err) { $("#err").textContent = err.message; }
   };

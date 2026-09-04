@@ -110,6 +110,7 @@ function squarePng() {
   assert.ok(vec.layers && vec.layers.length >= 1, "vectorize yields a layer");
   const d = vec.layers[0].paths && vec.layers[0].paths[0] && vec.layers[0].paths[0].d;
   assert.ok(d && /[CL]/.test(d) && /Z/.test(d), "path has C or L and Z");
+  assert.ok(/ C /.test(d) || / L /.test(d), "path has segments");
   const svg = svgFromLayers(vec.layers, vec.widthIn, vec.heightIn);
   assert.ok(svg.indexOf("<g") !== -1 && svg.indexOf("<path") !== -1);
   const eps = epsFromLayers(vec.layers, vec.widthIn, vec.heightIn);
@@ -155,6 +156,35 @@ function squarePng() {
   const hasHole = vec.layers.some((L) => (L.paths || []).some((p) => p.hole));
   assert.ok(hasHole || /Z M /.test(svg) || (svg.match(/Z/g) || []).length >= 2, "hole or stacked paths present");
   console.log("ok layered color vectorize", "layers=" + vec.layers.length);
+}
+
+{
+  const { vectorize, svgFromLayers } = require("../lib/vectorize");
+  const { epsFromLayers } = require("../lib/eps");
+  const { encodePng, makeRgba } = require("../lib/png");
+  const w = 96, h = 96;
+  const rgba = makeRgba(w, h, [255, 255, 255, 0]);
+  const cx = 48, cy = 48, r = 34;
+  for (let y = 0; y < h; y++) {
+    for (let x = 0; x < w; x++) {
+      const dx = x + 0.5 - cx, dy = y + 0.5 - cy;
+      if (dx * dx + dy * dy <= r * r) {
+        const i = (y * w + x) * 4;
+        rgba[i] = 20; rgba[i + 1] = 90; rgba[i + 2] = 200; rgba[i + 3] = 255;
+      }
+    }
+  }
+  const vec = vectorize(encodePng(w, h, rgba), 3, 3, { colors: 3, maxEdge: 200, epsilon: 0.55, fitError: 0.65 });
+  assert.ok(vec.layers && vec.layers.length >= 1, "disk yields layer");
+  const allD = vec.layers.map((L) => (L.paths || []).map((p) => p.d).join(" ")).join(" ");
+  assert.ok(/ C /.test(allD), "curved shape paths contain cubic C commands");
+  const cCount = (allD.match(/ C /g) || []).length;
+  assert.ok(cCount >= 2, "at least 2 cubics on disk, got " + cCount);
+  const svg = svgFromLayers(vec.layers, vec.widthIn, vec.heightIn);
+  assert.ok(svg.indexOf('fill-rule="evenodd"') !== -1);
+  const eps = epsFromLayers(vec.layers, vec.widthIn, vec.heightIn);
+  assert.ok(eps.indexOf("curveto") !== -1, "EPS contains curveto for cubic paths");
+  console.log("ok curved cubic vectorize", "C=" + cCount, "curveto");
 }
 
 {

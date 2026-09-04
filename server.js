@@ -787,7 +787,7 @@ async function handleApi(req, res, url) {
     if (buf[0] === 0xff && buf[1] === 0xd8) return json(res, 400, { error: "Still a JPEG — click Vectorize again so Studio can convert it" });
     if (buf[0] !== 0x89 || buf[1] !== 0x50) return json(res, 400, { error: "Need PNG, JPG, or WebP artwork" });
     try {
-      const vec = vectorize(buf, job.width_in, job.height_in, { colors: body.colors });
+      const vec = vectorize(buf, job.width_in, job.height_in, { colors: body.colors, maxEdge: body.maxEdge || 1400, epsilon: body.epsilon == null ? 0.55 : body.epsilon });
       job.vector = vec;
       rewriteVectorSvg(job);
       if (body.apply_mockup) applyMockup(job);
