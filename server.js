@@ -142,7 +142,7 @@ function applyVectorResult(job, vec, svg) {
 }
 function vectorizeInWorker(buf, widthIn, heightIn, opts, timeoutMs) {
   return new Promise(function (resolve, reject) {
-    const worker = new Worker(path.join(__dirname, "lib", "vectorize-worker.js"), {
+    const worker = new Worker(path.resolve(__dirname, "lib", "vectorize-worker.js"), {
       workerData: {
         bufB64: Buffer.from(buf).toString("base64"),
         widthIn: widthIn,
