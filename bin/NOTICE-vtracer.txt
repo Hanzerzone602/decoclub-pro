@@ -1,0 +1,4 @@
+VTracer 0.6.4 (visioncortex)
+License: MIT
+https://github.com/visioncortex/vtracer
+Binary: vtracer-x86_64-unknown-linux-musl (Railway/Linux)

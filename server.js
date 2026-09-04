@@ -14,6 +14,7 @@ const { removeBackground } = require("./lib/matte");
 const { imagineConfigured, generateImage } = require("./lib/imagine");
 const { vectorize, svgFromLayers } = require("./lib/vectorize");
 const vectorizerAi = require("./lib/vectorizerAi");
+const vtracer = require("./lib/vtracer");
 const { listPalettes } = require("./lib/palettes");
 const { digitizeJob } = require("./lib/digitize");
 const { stonesForJob } = require("./lib/stones");
@@ -185,7 +186,49 @@ function applyProVectorFiles(job, svgBuf, epsBuf, meta) {
     credits: meta.credits || null,
   };
 }
+function applyVtracerResult(job, result) {
+  const svgName = Date.now() + "-" + uid() + "-vtracer.svg";
+  fs.writeFileSync(path.join(UPLOADS, svgName), result.svg);
+  job.vector_svg = "/uploads/" + svgName;
+  if (result.eps && result.eps.length) {
+    const epsName = Date.now() + "-" + uid() + "-vtracer.eps";
+    fs.writeFileSync(path.join(UPLOADS, epsName), result.eps);
+    job.vector_eps = "/uploads/" + epsName;
+  } else {
+    delete job.vector_eps;
+  }
+  job.vector = result.vec;
+}
+
+function runVtracerVectorize(job, buf, body) {
+  if (!vtracer.available()) {
+    const err = new Error("VTracer binary missing on host");
+    err.code = "NO_VTRACER";
+    throw err;
+  }
+  const result = vtracer.vectorizeBuffer(buf, {
+    widthIn: job.width_in,
+    heightIn: job.height_in,
+    colors: body && body.colors,
+    timeoutMs: 120000,
+  });
+  applyVtracerResult(job, result);
+  return result;
+}
+
 async function runProVectorize(job, buf, body) {
+  const forceApi = body && (body.engine === "vectorizer.ai" || body.api === true);
+  if (!forceApi && vtracer.available()) {
+    runVtracerVectorize(job, buf, body);
+    return;
+  }
+  if (!vectorizerAi.configured()) {
+    if (vtracer.available()) {
+      runVtracerVectorize(job, buf, body);
+      return;
+    }
+    throw new Error("Pro Vectorize needs VTracer binary or VECTORIZER_API keys");
+  }
   const svgRes = await vectorizerAi.vectorizeImage(buf, {
     format: "svg",
     maxColors: body.colors,
@@ -255,7 +298,7 @@ function scheduleVectorize(jobId) {
 }
 function rewriteVectorSvg(job) {
   if (!job || !job.vector || !job.vector.layers) return;
-  if (job.vector.source === "vectorizer.ai" && job.vector_svg) {
+  if ((job.vector.source === "vectorizer.ai" || job.vector.source === "vtracer") && job.vector_svg) {
     const abs = path.join(UPLOADS, path.basename(job.vector_svg));
     if (fs.existsSync(abs)) {
       let svg = fs.readFileSync(abs, "utf8");
@@ -499,7 +542,7 @@ async function handleApi(req, res, url) {
   const pth = url.pathname;
 
   if (pth === "/api/config" && method === "GET") {
-    return json(res, 200, { demo: allowDemo(), billing: billingConfigured(), imagine: imagineConfigured(), imagineModel: "latest", vectorizerAi: vectorizerAi.configured(), name: "DecoClub Pro", statuses: STATUSES, methods: METHODS, blanks: BLANKS, seed: allowDemo() ? { owner: "owner@anvil.local", client: "client@anvil.local", password: "anvil123" } : null });
+    return json(res, 200, { demo: allowDemo(), billing: billingConfigured(), imagine: imagineConfigured(), imagineModel: "latest", vectorizerAi: vectorizerAi.configured(), vtracer: vtracer.available(), name: "DecoClub Pro", statuses: STATUSES, methods: METHODS, blanks: BLANKS, seed: allowDemo() ? { owner: "owner@anvil.local", client: "client@anvil.local", password: "anvil123" } : null });
   }
   if (pth === "/api/quote" && (method === "POST" || method === "GET")) {
     const body = method === "GET" ? { method: url.searchParams.get("method"), width_in: url.searchParams.get("width_in"), height_in: url.searchParams.get("height_in"), qty: url.searchParams.get("qty"), margin_pct: url.searchParams.get("margin_pct") } : parseJsonBody(await readBody(req));
@@ -894,15 +937,22 @@ async function handleApi(req, res, url) {
     const buf = fs.readFileSync(abs);
     if (buf[0] === 0xff && buf[1] === 0xd8) return json(res, 400, { error: "Still a JPEG — click Vectorize again so Studio can convert it" });
     if (buf[0] !== 0x89 || buf[1] !== 0x50) return json(res, 400, { error: "Need PNG, JPG, or WebP artwork" });
-    const wantPro = body.engine === "pro" || body.engine === "vectorizer.ai" || body.pro === true;
+    const wantApi = body.engine === "vectorizer.ai";
+    const wantLegacy = body.engine === "legacy" || body.engine === "local-js";
     try {
-      if (wantPro) {
+      if (wantApi) {
         if (!vectorizerAi.configured()) {
-          return json(res, 501, { error: "Pro Vectorize needs VECTORIZER_API_ID and VECTORIZER_API_SECRET on the host" });
+          return json(res, 501, { error: "Vectorizer.AI keys not configured" });
         }
-        await runProVectorize(job, buf, body);
+        await runProVectorize(job, buf, Object.assign({}, body, { engine: "vectorizer.ai", api: true }));
         if (body.apply_mockup) applyMockup(job);
         event(db, job, "Pro Vectorize · Vectorizer.AI · " + (job.vector.layers || []).length + " colors"); save(db);
+        return json(res, 200, { job: presentJob(job, req), vector: job.vector });
+      }
+      if (!wantLegacy && vtracer.available()) {
+        runVtracerVectorize(job, buf, body);
+        if (body.apply_mockup) applyMockup(job);
+        event(db, job, "Vectorized · VTracer · " + (job.vector.layers || []).length + " colors"); save(db);
         return json(res, 200, { job: presentJob(job, req), vector: job.vector });
       }
       const opts = {
@@ -933,7 +983,7 @@ async function handleApi(req, res, url) {
     if (body.hex) job.vector.layers[idx].hex = String(body.hex);
     if (body.name) job.vector.layers[idx].nameGuess = String(body.name);
     job.vector.layers[idx].palette = body.palette || job.vector.layers[idx].palette;
-    if (job.vector.source === "vectorizer.ai" && job.vector_svg && body.hex && prevHex) {
+    if ((job.vector.source === "vectorizer.ai" || job.vector.source === "vtracer") && job.vector_svg && body.hex && prevHex) {
       const abs = path.join(UPLOADS, path.basename(job.vector_svg));
       if (fs.existsSync(abs)) {
         let svg = fs.readFileSync(abs, "utf8");

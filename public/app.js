@@ -509,7 +509,7 @@ async function fillArt(el, job, shopControls) {
           <button class="btn primary" id="vectorizeBtn" type="button">Vectorize</button>
           <button class="btn ghost" id="greyBtn" type="button">Hi-res greyscale</button>
         </div>
-        <p class="muted">Local vector engine · Corel / Illustrator ready SVG &amp; EPS</p>
+        <p class="muted">Pro vector (VTracer) · Corel / Illustrator ready SVG &amp; EPS</p>
         <div class="detail-row" id="detailRow">
           <button type="button" class="detail-btn" data-colors="4" title="Few colors">
             <svg viewBox="0 0 24 24" aria-hidden="true"><rect x="4" y="6" width="16" height="12" rx="2"/></svg>
@@ -632,7 +632,7 @@ async function fillArt(el, job, shopControls) {
     await api("/api/jobs/" + job.id + "/vectorize", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ colors: vzColors, maxEdge: maxEdge, engine: "local" }),
+      body: JSON.stringify({ colors: vzColors, maxEdge: maxEdge, engine: engine || "vtracer" }),
     });
     renderJob(job.id);
   }
