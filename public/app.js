@@ -507,8 +507,10 @@ async function fillArt(el, job, shopControls) {
         ${shopControls ? `
         <div class="art-actions">
           <button class="btn" id="vectorizeBtn" type="button">Vectorize</button>
+          ${cfg.vectorizerAi ? `<button class="btn primary" id="proVectorizeBtn" type="button">Pro Vectorize</button>` : ""}
           <button class="btn ghost" id="greyBtn" type="button">Hi-res greyscale</button>
         </div>
+        ${cfg.vectorizerAi ? `<p class="muted">Pro Vectorize uses Vectorizer.AI quality (paid credits). Vectorize uses DecoClub’s engine.</p>` : `<p class="muted">Pro Vectorize unlocks when Vectorizer.AI API keys are on the host.</p>`}
         <div class="detail-row" id="detailRow">
           <button type="button" class="detail-btn" data-colors="4" title="Few colors">
             <svg viewBox="0 0 24 24" aria-hidden="true"><rect x="4" y="6" width="16" height="12" rx="2"/></svg>
@@ -623,13 +625,27 @@ async function fillArt(el, job, shopControls) {
     await api("/api/jobs/" + job.id, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ art_notes: $("#artn").value }) });
     renderJob(job.id);
   };
+  async function runVectorize(engine) {
+    const errEl = $("#err");
+    if (errEl) errEl.textContent = engine === "pro" ? "Pro Vectorize running…" : "Vectorizing…";
+    await ensurePngArtwork(job);
+    const maxEdge = vzColors >= 12 ? 1200 : (vzColors <= 4 ? 900 : 1100);
+    await api("/api/jobs/" + job.id + "/vectorize", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ colors: vzColors, maxEdge: maxEdge, epsilon: vzColors >= 12 ? 0.4 : 0.55, engine: engine || "local" }),
+    });
+    renderJob(job.id);
+  }
   const vz = $("#vectorizeBtn");
   if (vz) vz.onclick = async () => {
-    try {
-      await ensurePngArtwork(job);
-      await api("/api/jobs/" + job.id + "/vectorize", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ colors: vzColors, maxEdge: 1400, epsilon: 0.5 }) });
-      renderJob(job.id);
-    } catch (err) { $("#err").textContent = err.message; }
+    try { await runVectorize("local"); }
+    catch (err) { $("#err").textContent = err.message; }
+  };
+  const pvz = $("#proVectorizeBtn");
+  if (pvz) pvz.onclick = async () => {
+    try { await runVectorize("pro"); }
+    catch (err) { $("#err").textContent = err.message; }
   };
   el.querySelectorAll(".layer-pick").forEach((inp) => {
     inp.onchange = async () => {

@@ -13,6 +13,7 @@ const { processArtwork } = require("./lib/artops");
 const { removeBackground } = require("./lib/matte");
 const { imagineConfigured, generateImage } = require("./lib/imagine");
 const { vectorize, svgFromLayers } = require("./lib/vectorize");
+const vectorizerAi = require("./lib/vectorizerAi");
 const { listPalettes } = require("./lib/palettes");
 const { digitizeJob } = require("./lib/digitize");
 const { stonesForJob } = require("./lib/stones");
@@ -139,6 +140,68 @@ function applyVectorResult(job, vec, svg) {
   const name = Date.now() + "-" + uid() + "-vector.svg";
   fs.writeFileSync(path.join(UPLOADS, name), svg);
   job.vector_svg = "/uploads/" + name;
+  delete job.vector_eps;
+}
+function layersFromSvgFills(svgText, widthIn, heightIn) {
+  const fills = [];
+  const seen = new Set();
+  const re = /fill\s*=\s*["'](#?[0-9a-fA-F]{3,8})["']/g;
+  let m;
+  while ((m = re.exec(svgText))) {
+    let hex = m[1];
+    if (hex[0] !== "#") hex = "#" + hex;
+    if (hex.length === 4) hex = "#" + hex[1] + hex[1] + hex[2] + hex[2] + hex[3] + hex[3];
+    hex = hex.slice(0, 7).toLowerCase();
+    if (hex === "#ffffff" || hex === "#00000000") continue;
+    if (seen.has(hex)) continue;
+    seen.add(hex);
+    fills.push(hex);
+    if (fills.length >= 48) break;
+  }
+  return fills.map(function (hex, i) {
+    return { hex: hex, nameGuess: "Layer " + (i + 1), paths: [] };
+  });
+}
+function applyProVectorFiles(job, svgBuf, epsBuf, meta) {
+  meta = meta || {};
+  const svgName = Date.now() + "-" + uid() + "-pro.svg";
+  fs.writeFileSync(path.join(UPLOADS, svgName), svgBuf);
+  job.vector_svg = "/uploads/" + svgName;
+  if (epsBuf && epsBuf.length) {
+    const epsName = Date.now() + "-" + uid() + "-pro.eps";
+    fs.writeFileSync(path.join(UPLOADS, epsName), epsBuf);
+    job.vector_eps = "/uploads/" + epsName;
+  } else {
+    delete job.vector_eps;
+  }
+  const svgText = Buffer.from(svgBuf).toString("utf8");
+  const layers = layersFromSvgFills(svgText, job.width_in, job.height_in);
+  job.vector = {
+    source: "vectorizer.ai",
+    widthIn: Number(job.width_in) || 10,
+    heightIn: Number(job.height_in) || 10,
+    layers: layers.length ? layers : [{ hex: "#111111", nameGuess: "Art", paths: [] }],
+    imageToken: meta.imageToken || null,
+    credits: meta.credits || null,
+  };
+}
+async function runProVectorize(job, buf, body) {
+  const svgRes = await vectorizerAi.vectorizeImage(buf, {
+    format: "svg",
+    maxColors: body.colors,
+    retentionDays: 1,
+    mode: process.env.VECTORIZER_MODE || "production",
+    fileName: "art.png",
+  });
+  let epsBuf = null;
+  if (svgRes.imageToken) {
+    try {
+      epsBuf = await vectorizerAi.downloadFormat(svgRes.imageToken, "eps");
+    } catch (e) {
+      epsBuf = null;
+    }
+  }
+  applyProVectorFiles(job, svgRes.buf, epsBuf, { imageToken: svgRes.imageToken, credits: svgRes.credits });
 }
 function vectorizeInWorker(buf, widthIn, heightIn, opts, timeoutMs) {
   return new Promise(function (resolve, reject) {
@@ -192,10 +255,28 @@ function scheduleVectorize(jobId) {
 }
 function rewriteVectorSvg(job) {
   if (!job || !job.vector || !job.vector.layers) return;
+  if (job.vector.source === "vectorizer.ai" && job.vector_svg) {
+    const abs = path.join(UPLOADS, path.basename(job.vector_svg));
+    if (fs.existsSync(abs)) {
+      let svg = fs.readFileSync(abs, "utf8");
+      const layers = job.vector.layers;
+      // best-effort: replace each prior fill hex once with current layer hex
+      layers.forEach(function (L) {
+        if (!L || !L.hex) return;
+        const hex = String(L.hex).toLowerCase();
+        // no prior map — recolor UI already mutated L.hex; skip opaque rewrite without old hex
+      });
+      const name = Date.now() + "-" + uid() + "-vector.svg";
+      fs.writeFileSync(path.join(UPLOADS, name), svg);
+      job.vector_svg = "/uploads/" + name;
+      return;
+    }
+  }
   const svg = svgFromLayers(job.vector.layers, job.vector.widthIn || job.width_in, job.vector.heightIn || job.height_in);
   const name = Date.now() + "-" + uid() + "-vector.svg";
   fs.writeFileSync(path.join(UPLOADS, name), svg);
   job.vector_svg = "/uploads/" + name;
+  delete job.vector_eps;
 }
 function requireAdmin(user, res) {
   if (!user || user.role !== "admin") {
@@ -418,7 +499,7 @@ async function handleApi(req, res, url) {
   const pth = url.pathname;
 
   if (pth === "/api/config" && method === "GET") {
-    return json(res, 200, { demo: allowDemo(), billing: billingConfigured(), imagine: imagineConfigured(), imagineModel: "latest", name: "DecoClub Pro", statuses: STATUSES, methods: METHODS, blanks: BLANKS, seed: allowDemo() ? { owner: "owner@anvil.local", client: "client@anvil.local", password: "anvil123" } : null });
+    return json(res, 200, { demo: allowDemo(), billing: billingConfigured(), imagine: imagineConfigured(), imagineModel: "latest", vectorizerAi: vectorizerAi.configured(), name: "DecoClub Pro", statuses: STATUSES, methods: METHODS, blanks: BLANKS, seed: allowDemo() ? { owner: "owner@anvil.local", client: "client@anvil.local", password: "anvil123" } : null });
   }
   if (pth === "/api/quote" && (method === "POST" || method === "GET")) {
     const body = method === "GET" ? { method: url.searchParams.get("method"), width_in: url.searchParams.get("width_in"), height_in: url.searchParams.get("height_in"), qty: url.searchParams.get("qty"), margin_pct: url.searchParams.get("margin_pct") } : parseJsonBody(await readBody(req));
@@ -813,7 +894,17 @@ async function handleApi(req, res, url) {
     const buf = fs.readFileSync(abs);
     if (buf[0] === 0xff && buf[1] === 0xd8) return json(res, 400, { error: "Still a JPEG — click Vectorize again so Studio can convert it" });
     if (buf[0] !== 0x89 || buf[1] !== 0x50) return json(res, 400, { error: "Need PNG, JPG, or WebP artwork" });
+    const wantPro = body.engine === "pro" || body.engine === "vectorizer.ai" || body.pro === true;
     try {
+      if (wantPro) {
+        if (!vectorizerAi.configured()) {
+          return json(res, 501, { error: "Pro Vectorize needs VECTORIZER_API_ID and VECTORIZER_API_SECRET on the host" });
+        }
+        await runProVectorize(job, buf, body);
+        if (body.apply_mockup) applyMockup(job);
+        event(db, job, "Pro Vectorize · Vectorizer.AI · " + (job.vector.layers || []).length + " colors"); save(db);
+        return json(res, 200, { job: presentJob(job, req), vector: job.vector });
+      }
       const opts = {
         colors: body.colors,
         maxEdge: Math.min(Number(body.maxEdge) || 1000, 1200),
@@ -837,10 +928,27 @@ async function handleApi(req, res, url) {
     const body = parseJsonBody(await readBody(req));
     const idx = Number(body.layer);
     if (!job.vector.layers[idx]) return json(res, 400, { error: "Unknown layer" });
+    const prevHex = job.vector.layers[idx].hex;
     if (body.hex) job.vector.layers[idx].hex = String(body.hex);
     if (body.name) job.vector.layers[idx].nameGuess = String(body.name);
     job.vector.layers[idx].palette = body.palette || job.vector.layers[idx].palette;
-    rewriteVectorSvg(job);
+    if (job.vector.source === "vectorizer.ai" && job.vector_svg && body.hex && prevHex) {
+      const abs = path.join(UPLOADS, path.basename(job.vector_svg));
+      if (fs.existsSync(abs)) {
+        let svg = fs.readFileSync(abs, "utf8");
+        const from = String(prevHex);
+        const to = String(body.hex);
+        const esc = from.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+        svg = svg.replace(new RegExp(esc, "gi"), to);
+        const name = Date.now() + "-" + uid() + "-vector.svg";
+        fs.writeFileSync(path.join(UPLOADS, name), svg);
+        job.vector_svg = "/uploads/" + name;
+      } else {
+        rewriteVectorSvg(job);
+      }
+    } else {
+      rewriteVectorSvg(job);
+    }
     event(db, job, "Recolor layer " + idx); save(db);
     return json(res, 200, { job: presentJob(job, req), vector: job.vector });
   }
@@ -887,6 +995,18 @@ async function handleApi(req, res, url) {
     const job = db.jobs.find(function (j) { return j.id === expFile[1] && j.shop_id === user.shop_id; });
     if (!job) return json(res, 404, { error: "Job not found" });
     job._shop = db.shops.find(function (s) { return s.id === user.shop_id; });
+    if (expFile[2] === "art.svg" && job.vector_svg) {
+      const abs = path.join(UPLOADS, path.basename(job.vector_svg));
+      if (fs.existsSync(abs)) {
+        return download(res, "decoclub-" + job.id.slice(0, 8) + "-art.svg", fs.readFileSync(abs), "image/svg+xml");
+      }
+    }
+    if (expFile[2] === "art.eps" && job.vector_eps) {
+      const abs = path.join(UPLOADS, path.basename(job.vector_eps));
+      if (fs.existsSync(abs)) {
+        return download(res, "decoclub-" + job.id.slice(0, 8) + "-art.eps", fs.readFileSync(abs), "application/postscript");
+      }
+    }
     const pack = writeExports(job, UPLOADS, path.join(EXPORTS, job.id));
     const name = expFile[2];
     const short = job.id.slice(0, 8);
