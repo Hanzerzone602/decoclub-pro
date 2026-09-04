@@ -907,8 +907,9 @@ async function handleApi(req, res, url) {
       }
       const opts = {
         colors: body.colors,
-        maxEdge: Math.min(Number(body.maxEdge) || 1000, 1200),
+        maxEdge: Math.min(Number(body.maxEdge) || 1100, 1400),
         epsilon: body.epsilon == null ? 0.55 : body.epsilon,
+        fitError: body.fitError,
       };
       const msg = await vectorizeInWorker(buf, job.width_in, job.height_in, opts, 90000);
       applyVectorResult(job, msg.vec, msg.svg);

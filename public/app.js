@@ -506,11 +506,10 @@ async function fillArt(el, job, shopControls) {
       <div class="art-tools">
         ${shopControls ? `
         <div class="art-actions">
-          <button class="btn" id="vectorizeBtn" type="button">Vectorize</button>
-          ${cfg.vectorizerAi ? `<button class="btn primary" id="proVectorizeBtn" type="button">Pro Vectorize</button>` : ""}
+          <button class="btn primary" id="vectorizeBtn" type="button">Vectorize</button>
           <button class="btn ghost" id="greyBtn" type="button">Hi-res greyscale</button>
         </div>
-        ${cfg.vectorizerAi ? `<p class="muted">Pro Vectorize uses Vectorizer.AI quality (paid credits). Vectorize uses DecoClub’s engine.</p>` : `<p class="muted">Pro Vectorize unlocks when Vectorizer.AI API keys are on the host.</p>`}
+        <p class="muted">Local vector engine · Corel / Illustrator ready SVG &amp; EPS</p>
         <div class="detail-row" id="detailRow">
           <button type="button" class="detail-btn" data-colors="4" title="Few colors">
             <svg viewBox="0 0 24 24" aria-hidden="true"><rect x="4" y="6" width="16" height="12" rx="2"/></svg>
@@ -627,13 +626,15 @@ async function fillArt(el, job, shopControls) {
   };
   async function runVectorize(engine) {
     const errEl = $("#err");
-    if (errEl) errEl.textContent = engine === "pro" ? "Pro Vectorize running…" : "Vectorizing…";
+    if (errEl) errEl.textContent = "Vectorizing…";
     await ensurePngArtwork(job);
-    const maxEdge = vzColors >= 12 ? 1200 : (vzColors <= 4 ? 900 : 1100);
+    const maxEdge = vzColors >= 12 ? 1400 : (vzColors <= 4 ? 900 : 1100);
+    const epsilon = vzColors >= 12 ? 0.35 : (vzColors <= 4 ? 0.85 : 0.55);
+    const fitError = vzColors >= 12 ? 0.4 : (vzColors <= 4 ? 0.9 : 0.65);
     await api("/api/jobs/" + job.id + "/vectorize", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ colors: vzColors, maxEdge: maxEdge, epsilon: vzColors >= 12 ? 0.4 : 0.55, engine: engine || "local" }),
+      body: JSON.stringify({ colors: vzColors, maxEdge: maxEdge, epsilon: epsilon, fitError: fitError, engine: "local" }),
     });
     renderJob(job.id);
   }
