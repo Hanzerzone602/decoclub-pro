@@ -1106,20 +1106,24 @@ async function handleApi(req, res, url) {
         event(db, job, "Vectorized · legacy · " + msg.vec.layers.length + " layers"); save(db);
         return json(res, 200, { job: presentJob(job, req), vector: msg.vec });
       }
-      /* Default PNG Vectorize: SRC-faithful bezier (invent-warp / raster-corel are OPT-IN only — tiger prior would trash other art) */
+      /* Default PNG Vectorize: invent-warp when STRICT prior-match (soft tiger twin); else SRC bezier */
       const opts = {
         colors: body.colors == null ? 8 : body.colors,
         maxEdge: Math.min(Number(body.maxEdge) || 1100, 1400),
         fitError: body.fitError,
         overlapPx: body.overlapPx,
-        look: "corel",
-        discretePaths: true,
+        fuse: body.fuse || "auto",
+        priorSvg: body.priorSvg,
+        priorPng: body.priorPng,
+        structuralPrior: body.structuralPrior,
       };
       try {
-        const packed = bezierVectorize.vectorizeToSvg(buf, job.width_in, job.height_in, opts);
+        const packed = rasterCorel.vectorizeToSvg(buf, job.width_in, job.height_in, opts);
         applyVectorResult(job, packed.vec, packed.svg);
         if (body.apply_mockup) applyMockup(job);
-        event(db, job, "Vectorized · bezier · " + (job.vector.layers || []).length + " layers");
+        const recipe = (packed.meta && packed.meta.recipe) || (packed.vec && packed.vec.meta && packed.vec.meta.recipe) || "raster-corel";
+        const eng = (packed.vec && packed.vec.source) || "raster-corel";
+        event(db, job, "Vectorized · " + eng + "/" + recipe + " · " + (job.vector.layers || []).length + " layers");
         save(db);
         return json(res, 200, { job: presentJob(job, req), vector: job.vector, meta: packed.meta || (packed.vec && packed.vec.meta) });
       } catch (bezErr) {
