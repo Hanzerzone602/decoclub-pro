@@ -5,9 +5,11 @@ nixPkgs = ["nodejs_20", "python311", "python311Packages.pip", "gcc", "zlib", "li
 cmds = [
   "npm install --omit=dev",
   "python3 -m pip install --upgrade pip",
-  "python3 -m venv .venv",
-  ".venv/bin/pip install -r requirements.txt"
+  "python3 -m pip install --target=/app/pydeps -r requirements.txt"
 ]
 
 [start]
-cmd = "export PATH=$(pwd)/.venv/bin:$PATH && export INVENT_WARP_PYTHON=$(pwd)/.venv/bin/python3 && node server.js"
+cmd = "export PYTHONPATH=/app/pydeps:$PYTHONPATH && export PATH=/app/pydeps/bin:$PATH && node server.js"
+
+[variables]
+PYTHONPATH = "/app/pydeps"
