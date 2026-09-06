@@ -518,7 +518,7 @@ async function fillArt(el, job, shopControls) {
           <button class="btn primary" id="vectorizeBtn" type="button">Vectorize</button>
           <button class="btn ghost" id="greyBtn" type="button">Hi-res greyscale</button>
         </div>
-        <p class="muted">Pro vector (VTracer) · Corel / Illustrator ready SVG &amp; EPS</p>
+        <p class="muted">Vectorize uses Corel-look invent-warp when art matches (e.g. tiger). Pro = VTracer.</p>
         <div class="detail-row" id="detailRow">
           <button type="button" class="detail-btn" data-colors="4" title="Few colors">
             <svg viewBox="0 0 24 24" aria-hidden="true"><rect x="4" y="6" width="16" height="12" rx="2"/></svg>
@@ -528,7 +528,7 @@ async function fillArt(el, job, shopControls) {
             <svg viewBox="0 0 24 24" aria-hidden="true"><rect x="3" y="5" width="8" height="14" rx="1"/><rect x="13" y="5" width="8" height="14" rx="1"/></svg>
             Balanced
           </button>
-          <button type="button" class="detail-btn" data-colors="10" title="Fine detail">
+          <button type="button" class="detail-btn" data-colors="12" title="Fine detail">
             <svg viewBox="0 0 24 24" aria-hidden="true"><rect x="3" y="4" width="5" height="16"/><rect x="10" y="4" width="5" height="16"/><rect x="17" y="4" width="4" height="16"/></svg>
             Fine
           </button>
@@ -658,22 +658,24 @@ async function fillArt(el, job, shopControls) {
     const errEl = $("#err");
     if (errEl) errEl.textContent = "Vectorizing…";
     await ensurePngArtwork(job);
-    const maxEdge = 720;
+    const maxEdge = 1100;
+    const payload = { colors: vzColors, maxEdge: maxEdge, fuse: "auto" };
+    if (engine) payload.engine = engine;
     await api("/api/jobs/" + job.id + "/vectorize", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ colors: vzColors, maxEdge: maxEdge, engine: engine || "vtracer" }),
+      body: JSON.stringify(payload),
     });
     renderJob(job.id);
   }
   const vz = $("#vectorizeBtn");
   if (vz) vz.onclick = async () => {
-    try { await runVectorize("local"); }
+    try { await runVectorize(); }
     catch (err) { $("#err").textContent = err.message; }
   };
   const pvz = $("#proVectorizeBtn");
   if (pvz) pvz.onclick = async () => {
-    try { await runVectorize("pro"); }
+    try { await runVectorize("vtracer"); }
     catch (err) { $("#err").textContent = err.message; }
   };
   el.querySelectorAll(".layer-pick").forEach((inp) => {

@@ -1106,7 +1106,7 @@ async function handleApi(req, res, url) {
         event(db, job, "Vectorized · legacy · " + msg.vec.layers.length + " layers"); save(db);
         return json(res, 200, { job: presentJob(job, req), vector: msg.vec });
       }
-      /* Default PNG Vectorize: invent-warp when STRICT prior-match (soft tiger twin); else SRC bezier */
+      /* Default PNG Vectorize (no engine / local): invent-warp when STRICT prior-match; else SRC bezier */
       const opts = {
         colors: body.colors == null ? 8 : body.colors,
         maxEdge: Math.min(Number(body.maxEdge) || 1100, 1400),
