@@ -16,7 +16,9 @@ const { vectorize, svgFromLayers } = require("./lib/vectorize");
 const vectorizerAi = require("./lib/vectorizerAi");
 const vtracer = require("./lib/vtracer");
 const bezierVectorize = require("./lib/bezierVectorize");
+const inventVectorize = require("./lib/inventVectorize");
 const colorspec = require("./lib/colorspec");
+const corelImport = require("./lib/corelImport");
 const { listPalettes } = require("./lib/palettes");
 const { digitizeJob } = require("./lib/digitize");
 const { stonesForJob } = require("./lib/stones");
@@ -137,6 +139,45 @@ function saveImaginePng(buf) {
   fs.writeFileSync(path.join(UPLOADS, name), buf);
   return "/uploads/" + name;
 }
+
+function applyCorelImportResult(job, result) {
+  const svgName = Date.now() + "-" + uid() + "-corel.svg";
+  fs.writeFileSync(path.join(UPLOADS, svgName), result.svg);
+  job.vector_svg = "/uploads/" + svgName;
+  delete job.vector_eps;
+  job.vector = result.vec;
+  return result;
+}
+function runCorelImportOnJob(job, buf, body) {
+  body = body || {};
+  const sizeIn = Number(body.sizeIn) || Number(job.width_in) || 10;
+  const opts = {
+    sizeIn: sizeIn,
+    pad: body.pad != null ? Number(body.pad) : 40,
+    paperUnderlay: body.paperUnderlay !== false,
+  };
+  if (body.bbox && body.bbox.minx != null) opts.bbox = body.bbox;
+  const result = corelImport.transfer(buf, opts);
+  // Keep job plate size square when Corel-import remaps to square studio art
+  job.width_in = sizeIn;
+  job.height_in = sizeIn;
+  applyCorelImportResult(job, result);
+  return result;
+}
+function tryAutoCorelImport(job, filePath, originalName) {
+  if (!job || !filePath) return false;
+  const abs = path.join(UPLOADS, path.basename(filePath));
+  if (!fs.existsSync(abs)) return false;
+  const buf = fs.readFileSync(abs);
+  if (!corelImport.looksLikeSvg(buf)) return false;
+  const text = buf.toString("utf8");
+  const nameHint = String(originalName || filePath || "").toLowerCase();
+  if (!corelImport.isCorelSvg(text) && !/\.svg$/i.test(nameHint)) return false;
+  if (!corelImport.isCorelSvg(text)) return false;
+  runCorelImportOnJob(job, buf, {});
+  return true;
+}
+
 function applyVectorResult(job, vec, svg) {
   if (!job || !vec) return;
   job.vector = vec;
@@ -299,7 +340,7 @@ function scheduleVectorize(jobId) {
 }
 function rewriteVectorSvg(job) {
   if (!job || !job.vector || !job.vector.layers) return;
-  if ((job.vector.source === "vectorizer.ai" || job.vector.source === "vtracer") && job.vector_svg) {
+  if ((job.vector.source === "vectorizer.ai" || job.vector.source === "vtracer" || job.vector.source === "corel-import") && job.vector_svg) {
     const abs = path.join(UPLOADS, path.basename(job.vector_svg));
     if (fs.existsSync(abs)) {
       let svg = fs.readFileSync(abs, "utf8");
@@ -543,7 +584,7 @@ async function handleApi(req, res, url) {
   const pth = url.pathname;
 
   if (pth === "/api/config" && method === "GET") {
-    return json(res, 200, { demo: allowDemo(), billing: billingConfigured(), imagine: imagineConfigured(), imagineModel: "latest", vectorizerAi: vectorizerAi.configured(), vtracer: vtracer.available(), name: "DecoClub Pro", statuses: STATUSES, methods: METHODS, blanks: BLANKS, seed: allowDemo() ? { owner: "owner@anvil.local", client: "client@anvil.local", password: "anvil123" } : null });
+    return json(res, 200, { demo: allowDemo(), billing: billingConfigured(), imagine: imagineConfigured(), imagineModel: "latest", vectorizerAi: vectorizerAi.configured(), vtracer: vtracer.available(), inventVectorize: true, inventWinner: "path-transfer", corelImport: true, name: "DecoClub Pro", statuses: STATUSES, methods: METHODS, blanks: BLANKS, seed: allowDemo() ? { owner: "owner@anvil.local", client: "client@anvil.local", password: "anvil123" } : null });
   }
   if (pth === "/api/quote" && (method === "POST" || method === "GET")) {
     const body = method === "GET" ? { method: url.searchParams.get("method"), width_in: url.searchParams.get("width_in"), height_in: url.searchParams.get("height_in"), qty: url.searchParams.get("qty"), margin_pct: url.searchParams.get("margin_pct") } : parseJsonBody(await readBody(req));
@@ -727,7 +768,15 @@ async function handleApi(req, res, url) {
     applyQuote(job); applyMockup(job);
     if (job.file_path) job.status = "mockup";
     db.jobs.push(job); event(db, job, "Intake created"); save(db);
-    if (job.file_path) scheduleVectorize(job.id);
+    if (job.file_path) {
+      const orig = parsed.file && parsed.file.original;
+      if (tryAutoCorelImport(job, job.file_path, orig)) {
+        event(db, job, "Corel import · auto path-transfer");
+        save(db);
+      } else {
+        scheduleVectorize(job.id);
+      }
+    }
     return json(res, 200, { job: presentJob(job, req) });
   }
 
@@ -767,7 +816,13 @@ async function handleApi(req, res, url) {
     if (STATUSES.indexOf(job.status) < STATUSES.indexOf("art_in")) job.status = "art_in";
     applyMockup(job);
     event(db, job, "Artwork replaced"); save(db);
-    scheduleVectorize(job.id);
+    const origArt = parsed.file && parsed.file.original;
+    if (tryAutoCorelImport(job, job.file_path, origArt)) {
+      event(db, job, "Corel import · auto path-transfer");
+      save(db);
+    } else {
+      scheduleVectorize(job.id);
+    }
     return json(res, 200, { job: presentJob(job, req) });
   }
   const ops = pth.match(/^\/api\/jobs\/([^/]+)\/artops$/);
@@ -925,6 +980,32 @@ async function handleApi(req, res, url) {
     if (!user) return json(res, 401, { error: "Sign in required" });
     return json(res, 200, listPalettes());
   }
+
+  /* Explicit CorelDRAW path-transfer import (not default PNG Vectorize).
+     POST /api/jobs/:id/corel-import  OR  POST .../vectorize { engine: "corel-import" } */
+  const corelImp = pth.match(/^\/api\/jobs\/([^/]+)\/corel-import$/);
+  if (corelImp && method === "POST") {
+    if (!canRunFloor(user)) return json(res, 403, { error: "Shop login required" });
+    if (!requireProduce(user, res)) return;
+    const job = db.jobs.find(function (j) { return j.id === corelImp[1] && j.shop_id === user.shop_id; });
+    if (!job) return json(res, 404, { error: "Job not found" });
+    const body = parseJsonBody(await readBody(req));
+    if (!job.file_path) return json(res, 400, { error: "Upload a CorelDRAW SVG first" });
+    const abs = path.join(UPLOADS, path.basename(job.file_path));
+    if (!fs.existsSync(abs)) return json(res, 404, { error: "Artwork missing" });
+    const buf = fs.readFileSync(abs);
+    if (!corelImport.looksLikeSvg(buf)) return json(res, 400, { error: "Artwork is not SVG — export SVG from CorelDRAW" });
+    try {
+      const result = runCorelImportOnJob(job, buf, body);
+      if (body.apply_mockup !== false) applyMockup(job);
+      event(db, job, "Corel import · path-transfer · " + result.meta.paths + " paths");
+      save(db);
+      return json(res, 200, { job: presentJob(job, req), vector: job.vector, meta: result.meta });
+    } catch (err) {
+      return json(res, 400, { error: IS_PROD ? "Could not import Corel SVG" : err.message });
+    }
+  }
+
   const vecPath = pth.match(/^\/api\/jobs\/([^/]+)\/vectorize$/);
   if (vecPath && method === "POST") {
     if (!canRunFloor(user)) return json(res, 403, { error: "Shop login required" });
@@ -936,12 +1017,50 @@ async function handleApi(req, res, url) {
     const abs = path.join(UPLOADS, path.basename(job.file_path));
     if (!fs.existsSync(abs)) return json(res, 404, { error: "Artwork missing" });
     const buf = fs.readFileSync(abs);
+    const wantCorel = body.engine === "corel-import" || body.engine === "corel";
+    const isSvg = corelImport.looksLikeSvg(buf);
+    const svgText = isSvg ? buf.toString("utf8") : "";
+    const isCorelSvg = isSvg && corelImport.isCorelSvg(svgText);
+    /* Explicit Corel path-transfer — NOT the default PNG Vectorize button */
+    if (wantCorel || isCorelSvg) {
+      if (!isSvg) return json(res, 400, { error: "corel-import needs a CorelDRAW SVG upload" });
+      try {
+        const result = runCorelImportOnJob(job, buf, body);
+        if (body.apply_mockup) applyMockup(job);
+        event(db, job, "Corel import · path-transfer · " + result.meta.paths + " paths · " + (job.vector.layers || []).length + " colors");
+        save(db);
+        return json(res, 200, { job: presentJob(job, req), vector: job.vector, meta: result.meta });
+      } catch (err) {
+        return json(res, 400, { error: IS_PROD ? "Could not import Corel SVG" : err.message });
+      }
+    }
+    if (isSvg) return json(res, 400, { error: "SVG is not CorelDRAW — use engine corel-import only for Corel exports, or upload PNG to Vectorize" });
     if (buf[0] === 0xff && buf[1] === 0xd8) return json(res, 400, { error: "Still a JPEG — click Vectorize again so Studio can convert it" });
     if (buf[0] !== 0x89 || buf[1] !== 0x50) return json(res, 400, { error: "Need PNG, JPG, or WebP artwork" });
     const wantApi = body.engine === "vectorizer.ai";
     const wantVtracer = body.engine === "vtracer";
     const wantLegacy = body.engine === "legacy" || body.engine === "local-js";
+    const wantInvent = body.engine === "invent" || body.engine === "invent-transfer" || body.engine === "invent-trace" || body.engine === "invent-hybrid";
     try {
+      if (wantInvent) {
+        const inventMode =
+          body.engine === "invent-transfer" ? "transfer" :
+          body.engine === "invent-trace" ? "trace" :
+          body.engine === "invent-hybrid" ? "hybrid" :
+          (body.inventMode || body.mode || "auto");
+        const packed = inventVectorize.vectorizeToSvg(buf, job.width_in, job.height_in, Object.assign({}, body, {
+          mode: inventMode,
+          sizeIn: job.width_in,
+          corelSvg: body.corelSvg,
+        }));
+        const svg = typeof packed === "string" ? packed : packed.svg;
+        const vec = packed.vec || { widthIn: job.width_in, heightIn: job.height_in, layers: [], source: "invent" };
+        applyVectorResult(job, vec, svg);
+        if (body.apply_mockup) applyMockup(job);
+        event(db, job, "Vectorized · invent/" + inventMode + " · " + (job.vector.layers || []).length + " layers");
+        save(db);
+        return json(res, 200, { job: presentJob(job, req), vector: job.vector, meta: packed.meta || (vec && vec.meta) });
+      }
       if (wantApi) {
         if (!vectorizerAi.configured()) {
           return json(res, 501, { error: "Vectorizer.AI keys not configured" });
@@ -1014,7 +1133,7 @@ async function handleApi(req, res, url) {
     }
     if (body.name) job.vector.layers[idx].nameGuess = String(body.name);
     job.vector.layers[idx].palette = body.palette || job.vector.layers[idx].palette;
-    if ((job.vector.source === "vectorizer.ai" || job.vector.source === "vtracer") && job.vector_svg && body.hex && prevHex) {
+    if ((job.vector.source === "vectorizer.ai" || job.vector.source === "vtracer" || job.vector.source === "corel-import") && job.vector_svg && body.hex && prevHex) {
       const abs = path.join(UPLOADS, path.basename(job.vector_svg));
       if (fs.existsSync(abs)) {
         let svg = fs.readFileSync(abs, "utf8");
