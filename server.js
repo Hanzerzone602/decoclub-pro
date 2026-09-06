@@ -17,6 +17,8 @@ const vectorizerAi = require("./lib/vectorizerAi");
 const vtracer = require("./lib/vtracer");
 const bezierVectorize = require("./lib/bezierVectorize");
 const inventVectorize = require("./lib/inventVectorize");
+const rasterCorel = require("./lib/rasterCorel");
+const inventWarp = require("./lib/inventWarp");
 const colorspec = require("./lib/colorspec");
 const corelImport = require("./lib/corelImport");
 const { listPalettes } = require("./lib/palettes");
@@ -584,7 +586,7 @@ async function handleApi(req, res, url) {
   const pth = url.pathname;
 
   if (pth === "/api/config" && method === "GET") {
-    return json(res, 200, { demo: allowDemo(), billing: billingConfigured(), imagine: imagineConfigured(), imagineModel: "latest", vectorizerAi: vectorizerAi.configured(), vtracer: vtracer.available(), inventVectorize: true, inventWinner: "path-transfer", corelImport: true, name: "DecoClub Pro", statuses: STATUSES, methods: METHODS, blanks: BLANKS, seed: allowDemo() ? { owner: "owner@anvil.local", client: "client@anvil.local", password: "anvil123" } : null });
+    return json(res, 200, { demo: allowDemo(), billing: billingConfigured(), imagine: imagineConfigured(), imagineModel: "latest", vectorizerAi: vectorizerAi.configured(), vtracer: vtracer.available(), inventVectorize: true, inventWinner: "ecc-multiROI-TPS", rasterCorel: true, inventWarp: inventWarp.available(), corelImport: true, name: "DecoClub Pro", statuses: STATUSES, methods: METHODS, blanks: BLANKS, seed: allowDemo() ? { owner: "owner@anvil.local", client: "client@anvil.local", password: "anvil123" } : null });
   }
   if (pth === "/api/quote" && (method === "POST" || method === "GET")) {
     const body = method === "GET" ? { method: url.searchParams.get("method"), width_in: url.searchParams.get("width_in"), height_in: url.searchParams.get("height_in"), qty: url.searchParams.get("qty"), margin_pct: url.searchParams.get("margin_pct") } : parseJsonBody(await readBody(req));
@@ -1040,8 +1042,22 @@ async function handleApi(req, res, url) {
     const wantApi = body.engine === "vectorizer.ai";
     const wantVtracer = body.engine === "vtracer";
     const wantLegacy = body.engine === "legacy" || body.engine === "local-js";
+    const wantHallucinate = body.engine === "raster-corel" || body.engine === "hallucinate" || body.engine === "invent-hallucinate" || body.engine === "invent-warp";
     const wantInvent = body.engine === "invent" || body.engine === "invent-transfer" || body.engine === "invent-trace" || body.engine === "invent-hybrid";
     try {
+      if (wantHallucinate) {
+        const packed = rasterCorel.vectorizeToSvg(buf, job.width_in, job.height_in, Object.assign({}, body, {
+          fuse: body.fuse || "hallucinate",
+          sizeIn: job.width_in,
+        }));
+        const svg = typeof packed === "string" ? packed : packed.svg;
+        const vec = packed.vec || { widthIn: job.width_in, heightIn: job.height_in, layers: [], source: "raster-corel" };
+        applyVectorResult(job, vec, svg);
+        if (body.apply_mockup) applyMockup(job);
+        event(db, job, "Vectorized · raster-corel/hallucinate · " + (job.vector.layers || []).length + " layers");
+        save(db);
+        return json(res, 200, { job: presentJob(job, req), vector: job.vector, meta: packed.meta || (vec && vec.meta) });
+      }
       if (wantInvent) {
         const inventMode =
           body.engine === "invent-transfer" ? "transfer" :
@@ -1090,19 +1106,22 @@ async function handleApi(req, res, url) {
         event(db, job, "Vectorized · legacy · " + msg.vec.layers.length + " layers"); save(db);
         return json(res, 200, { job: presentJob(job, req), vector: msg.vec });
       }
-      /* Default free path: pure-JS cubic Bézier engine; VTracer only as fallback */
+      /* Default PNG Vectorize: SRC-faithful bezier (invent-warp / raster-corel are OPT-IN only — tiger prior would trash other art) */
       const opts = {
-        colors: body.colors == null ? 12 : body.colors,
+        colors: body.colors == null ? 8 : body.colors,
         maxEdge: Math.min(Number(body.maxEdge) || 1100, 1400),
         fitError: body.fitError,
         overlapPx: body.overlapPx,
+        look: "corel",
+        discretePaths: true,
       };
       try {
         const packed = bezierVectorize.vectorizeToSvg(buf, job.width_in, job.height_in, opts);
         applyVectorResult(job, packed.vec, packed.svg);
         if (body.apply_mockup) applyMockup(job);
-        event(db, job, "Vectorized · Bézier · " + packed.vec.layers.length + " layers"); save(db);
-        return json(res, 200, { job: presentJob(job, req), vector: job.vector });
+        event(db, job, "Vectorized · bezier · " + (job.vector.layers || []).length + " layers");
+        save(db);
+        return json(res, 200, { job: presentJob(job, req), vector: job.vector, meta: packed.meta || (packed.vec && packed.vec.meta) });
       } catch (bezErr) {
         if (vtracer.available()) {
           runVtracerVectorize(job, buf, body);
