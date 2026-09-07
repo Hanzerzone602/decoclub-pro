@@ -53,16 +53,16 @@ function runRiskForJob(job) {
   const mae = meta.mae_svg_vs_src != null ? Number(meta.mae_svg_vs_src) : (meta.mae_src != null ? Number(meta.mae_src) : null);
   let level = "review";
   let title = "Review";
-  let line = "Vector looks usable — spot-check thin lines and knockouts before you burn a screen.";
+  let line = "Vector ready — check colors against the blank before you press.";
   if (!job || !job.vector) {
     return { level: "hold", title: "Hold", line: "No vector yet. Drop art and Vectorize before you queue a press run." };
   }
   if (/bezier|hallucinate-after|src-bezier|vtracer/i.test(recipe) && !/invent-warp|bundled|ecc/i.test(recipe)) {
     level = "hold"; title = "Hold";
-    line = "Autotrace mush risk — edges may stair-step. Re-run Vectorize or clean in Corel before production.";
+    line = "Vectorize did not hit invent-warp on this mark. Re-run Vectorize; do not press this art.";
   } else if (/invent-warp|bundled|ecc-multiROI|corel-import/i.test(recipe)) {
     level = "go"; title = "Green";
-    line = "Corel-class topology on this mark — good to run after a quick color check.";
+    line = "Invent-warp topology on this mark — good to run after a quick color check.";
   } else if (n > 0 && n <= 8) {
     level = "go"; title = "Green";
     line = n + " clean layers — standard apparel/DTF run. Confirm underbase if needed.";
@@ -572,7 +572,7 @@ async function fillArt(el, job, shopControls) {
           <button class="btn primary" id="vectorizeBtn" type="button">Vectorize</button>
           <button class="btn ghost" id="greyBtn" type="button">Hi-res greyscale</button>
         </div>
-        <p class="muted">Same art, switch recipe anytime — no re-upload. Vectorize unlocks invent-warp when the mark matches.</p>
+        <p class="muted">Same art, switch recipe anytime — no re-upload. Vectorize builds production paths when the mark matches.</p>
         ${vzRecipeHtml}
         <div class="detail-row" id="detailRow">
           <button type="button" class="detail-btn" data-colors="4" title="Few colors">
@@ -593,7 +593,7 @@ async function fillArt(el, job, shopControls) {
           <a href="/api/export/${job.id}/art.svg">Download SVG</a>
           <a href="/api/export/${job.id}/art.eps">Download EPS</a>
         </div>
-        <p class="muted">Corel / Illustrator ready · real curves</p>` : ""}
+        <p class="muted">Production SVG / EPS · real curves</p>` : ""}
         ${shopControls ? `
         <details class="art-more">
           <summary>More tools</summary>
