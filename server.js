@@ -1123,10 +1123,10 @@ async function handleApi(req, res, url) {
         event(db, job, "Vectorized · legacy · " + msg.vec.layers.length + " layers"); save(db);
         return json(res, 200, { job: presentJob(job, req), vector: msg.vec });
       }
-      /* Default PNG Vectorize (no engine / local): invent-warp when STRICT prior-match; else SRC bezier */
+      /* Default PNG Vectorize: invent-warp ONLY for soft frontal tiger twin; else SRC bezier (capped) */
       const opts = {
         colors: body.colors == null ? 8 : body.colors,
-        maxEdge: Math.min(Number(body.maxEdge) || 1100, 1400),
+        maxEdge: Math.min(Number(body.maxEdge) || 720, 900),
         fitError: body.fitError,
         overlapPx: body.overlapPx,
         fuse: body.fuse || "auto",
@@ -1136,6 +1136,37 @@ async function handleApi(req, res, url) {
       };
       try {
         const packed = rasterCorel.vectorizeToSvg(buf, job.width_in, job.height_in, opts);
+        const recipe0 = (packed.meta && packed.meta.recipe) || (packed.vec && packed.vec.meta && packed.vec.meta.recipe) || "";
+        // Heavy bezier on large art: finish in worker so Railway proxy does not 502
+        if (/src-bezier-fallback/i.test(recipe0)) {
+          const wopts = {
+            colors: opts.colors,
+            maxEdge: Math.min(opts.maxEdge, 640),
+            fitError: body.fitError,
+            overlapPx: body.overlapPx,
+          };
+          try {
+            const msg = await vectorizeInWorker(buf, job.width_in, job.height_in, wopts, 120000);
+            applyVectorResult(job, msg.vec, msg.svg);
+            if (job.vector && job.vector.meta) {
+              job.vector.meta.recipe = "src-bezier-fallback";
+              job.vector.meta.engine = "raster-corel";
+              job.vector.source = "raster-corel";
+            }
+            if (body.apply_mockup) applyMockup(job);
+            event(db, job, "Vectorized · raster-corel/src-bezier-fallback · " + (job.vector.layers || []).length + " layers");
+            save(db);
+            return json(res, 200, { job: presentJob(job, req), vector: job.vector, meta: job.vector && job.vector.meta });
+          } catch (wErr) {
+            if (vtracer.available()) {
+              runVtracerVectorize(job, buf, body);
+              if (body.apply_mockup) applyMockup(job);
+              event(db, job, "Vectorized · VTracer fallback · " + (job.vector.layers || []).length + " colors"); save(db);
+              return json(res, 200, { job: presentJob(job, req), vector: job.vector });
+            }
+            throw wErr;
+          }
+        }
         applyVectorResult(job, packed.vec, packed.svg);
         if (body.apply_mockup) applyMockup(job);
         const recipe = (packed.meta && packed.meta.recipe) || (packed.vec && packed.vec.meta && packed.vec.meta.recipe) || "raster-corel";
