@@ -1123,7 +1123,10 @@ async function handleApi(req, res, url) {
         event(db, job, "Vectorized · legacy · " + msg.vec.layers.length + " layers"); save(db);
         return json(res, 200, { job: presentJob(job, req), vector: msg.vec });
       }
-      /* Default PNG Vectorize: invent-warp ONLY for soft frontal tiger twin; else SRC bezier (capped) */
+      /* Default PNG Vectorize:
+       *  1) soft frontal tiger twin → invent-warp bundled (fast, Corel-class for that mark)
+       *  2) everything else → VTracer (never run heavy bezier on the request thread — that 502s Railway)
+       */
       const opts = {
         colors: body.colors == null ? 8 : body.colors,
         maxEdge: Math.min(Number(body.maxEdge) || 720, 900),
@@ -1135,45 +1138,50 @@ async function handleApi(req, res, url) {
         structuralPrior: body.structuralPrior,
       };
       try {
-        const packed = rasterCorel.vectorizeToSvg(buf, job.width_in, job.height_in, opts);
-        const recipe0 = (packed.meta && packed.meta.recipe) || (packed.vec && packed.vec.meta && packed.vec.meta.recipe) || "";
-        // Heavy bezier on large art: finish in worker so Railway proxy does not 502
-        if (/src-bezier-fallback/i.test(recipe0)) {
-          const wopts = {
-            colors: opts.colors,
-            maxEdge: Math.min(opts.maxEdge, 640),
-            fitError: body.fitError,
-            overlapPx: body.overlapPx,
-          };
-          try {
-            const msg = await vectorizeInWorker(buf, job.width_in, job.height_in, wopts, 120000);
-            applyVectorResult(job, msg.vec, msg.svg);
-            if (job.vector && job.vector.meta) {
-              job.vector.meta.recipe = "src-bezier-fallback";
-              job.vector.meta.engine = "raster-corel";
-              job.vector.source = "raster-corel";
-            }
-            if (body.apply_mockup) applyMockup(job);
-            event(db, job, "Vectorized · raster-corel/src-bezier-fallback · " + (job.vector.layers || []).length + " layers");
-            save(db);
-            return json(res, 200, { job: presentJob(job, req), vector: job.vector, meta: job.vector && job.vector.meta });
-          } catch (wErr) {
-            if (vtracer.available()) {
-              runVtracerVectorize(job, buf, body);
-              if (body.apply_mockup) applyMockup(job);
-              event(db, job, "Vectorized · VTracer fallback · " + (job.vector.layers || []).length + " colors"); save(db);
-              return json(res, 200, { job: presentJob(job, req), vector: job.vector });
-            }
-            throw wErr;
+        let twin = false;
+        try {
+          const priorPng = rasterCorel.resolvePriorPng(opts);
+          if (priorPng && fs.existsSync(priorPng) && typeof rasterCorel.srcMatchesPrior === "function") {
+            twin = rasterCorel.srcMatchesPrior(buf, fs.readFileSync(priorPng));
           }
+        } catch (matchErr) {
+          twin = false;
         }
-        applyVectorResult(job, packed.vec, packed.svg);
+        if (twin) {
+          const packed = rasterCorel.vectorizeToSvg(buf, job.width_in, job.height_in, Object.assign({}, opts, { fuse: "auto" }));
+          applyVectorResult(job, packed.vec, packed.svg);
+          if (body.apply_mockup) applyMockup(job);
+          const recipe = (packed.meta && packed.meta.recipe) || (packed.vec && packed.vec.meta && packed.vec.meta.recipe) || "invent-warp";
+          const eng = (packed.vec && packed.vec.source) || "invent-warp";
+          event(db, job, "Vectorized · " + eng + "/" + recipe + " · " + (job.vector.layers || []).length + " layers");
+          save(db);
+          return json(res, 200, { job: presentJob(job, req), vector: job.vector, meta: packed.meta || (packed.vec && packed.vec.meta) });
+        }
+        // Non-twin: VTracer first (stable on Railway). Bezier only in worker if VTracer missing.
+        if (vtracer.available()) {
+          runVtracerVectorize(job, buf, body);
+          if (body.apply_mockup) applyMockup(job);
+          event(db, job, "Vectorized · VTracer · " + (job.vector.layers || []).length + " colors");
+          save(db);
+          return json(res, 200, { job: presentJob(job, req), vector: job.vector });
+        }
+        const wopts = {
+          colors: opts.colors,
+          maxEdge: Math.min(opts.maxEdge, 640),
+          fitError: body.fitError,
+          overlapPx: body.overlapPx,
+        };
+        const msg = await vectorizeInWorker(buf, job.width_in, job.height_in, wopts, 120000);
+        applyVectorResult(job, msg.vec, msg.svg);
+        if (job.vector && job.vector.meta) {
+          job.vector.meta.recipe = "src-bezier-fallback";
+          job.vector.meta.engine = "raster-corel";
+          job.vector.source = "raster-corel";
+        }
         if (body.apply_mockup) applyMockup(job);
-        const recipe = (packed.meta && packed.meta.recipe) || (packed.vec && packed.vec.meta && packed.vec.meta.recipe) || "raster-corel";
-        const eng = (packed.vec && packed.vec.source) || "raster-corel";
-        event(db, job, "Vectorized · " + eng + "/" + recipe + " · " + (job.vector.layers || []).length + " layers");
+        event(db, job, "Vectorized · raster-corel/src-bezier-fallback · " + (job.vector.layers || []).length + " layers");
         save(db);
-        return json(res, 200, { job: presentJob(job, req), vector: job.vector, meta: packed.meta || (packed.vec && packed.vec.meta) });
+        return json(res, 200, { job: presentJob(job, req), vector: job.vector, meta: job.vector && job.vector.meta });
       } catch (bezErr) {
         if (vtracer.available()) {
           runVtracerVectorize(job, buf, body);
