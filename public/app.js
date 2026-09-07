@@ -3,11 +3,11 @@ let user = null, shop = null, view = "make", currentJob = null, station = "art",
 let cfg = { statuses: [], methods: [], blanks: [], billing: false, demo: false };
 const $ = (s, r = document) => r.querySelector(s);
 const STAT_LABEL = { new: "New", art_in: "Art in", mockup: "Mockup", priced: "Priced", proof_sent: "Proof sent", approved: "Approved", in_production: "In production", done: "Done" };
-const METHODS = ["dtf","uvdtf","uv","vinyl","laser","sticker","hat","apparel","patch","embroidery","sublimation","rhinestone","sign"];
+const METHODS = ["dtf","uvdtf","uv","vinyl","laser","sticker","screen","hat","apparel","patch","embroidery","sublimation","rhinestone","sign"];
 const METHOD_LABELS = {
   dtf: "DTF", uvdtf: "UV DTF", uv: "UV print", vinyl: "Vinyl", laser: "Laser",
-  sticker: "Stickers", hat: "Hats", apparel: "Apparel", patch: "Patches",
-  embroidery: "Embroidery", sublimation: "Sublimation", rhinestone: "Rhinestone", sign: "Signs",
+  sticker: "Stickers", screen: "Screen", hat: "Hats", apparel: "Apparel", patch: "Patches",
+  embroidery: "Digitize", sublimation: "Sublimation", rhinestone: "Rhinestone", sign: "Signs",
 };
 const METHOD_OUTCOMES = {
   dtf: "22in gang + SVG/EPS", uvdtf: "22in UV gang + SVG/EPS", uv: "SVG + EPS print",
@@ -22,6 +22,7 @@ const METHOD_ICONS = {
   vinyl: '<ellipse cx="7" cy="12" rx="3.2" ry="6"/><path d="M7 6h11.5a2.5 2.5 0 0 1 0 12H7"/><circle cx="18.5" cy="12" r="2.2"/>',
   laser: '<path d="M12 4l7 4v8l-7 4-7-4V8z"/><path d="M5 8l7 4 7-4M12 12v8"/>',
   sticker: '<path d="M6 4h9l5 5v11H6z"/><path d="M15 4v5h5"/>',
+  screen: '<rect x="4" y="5" width="16" height="14" rx="1.5"/><path d="M8 10h8M8 14h5"/>',
   hat: '<path d="M4 14c2-6 4.5-8 8-8s6 2 8 8"/><path d="M3 15h18v2H3z"/><path d="M8 14v-2"/>',
   apparel: '<path d="M8 6l4-2 4 2 4 2-2.5 3H16v9H8V11H6.5L4 8z"/>',
   patch: '<path d="M12 3l7 3v6c0 4.2-2.8 7.5-7 9-4.2-1.5-7-4.8-7-9V6z"/>',
@@ -42,6 +43,47 @@ async function api(url, opts = {}) {
 }
 function money(n) { return "$" + Number(n || 0).toFixed(2); }
 function escapeHtml(s) { return String(s || "").replace(/[&<>"']/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c])); }
+
+/** Press-floor run-risk from vector meta / layer count. Green / Review / Hold. */
+function runRiskForJob(job) {
+  const layers = (job && job.vector && job.vector.layers) || [];
+  const meta = (job && job.vector && job.vector.meta) || {};
+  const n = layers.length;
+  const recipe = String(meta.recipe || meta.engine || job.vector && job.vector.source || "");
+  const mae = meta.mae_svg_vs_src != null ? Number(meta.mae_svg_vs_src) : (meta.mae_src != null ? Number(meta.mae_src) : null);
+  let level = "review";
+  let title = "Review";
+  let line = "Vector looks usable — spot-check thin lines and knockouts before you burn a screen.";
+  if (!job || !job.vector) {
+    return { level: "hold", title: "Hold", line: "No vector yet. Drop art and Vectorize before you queue a press run." };
+  }
+  if (/bezier|hallucinate-after|src-bezier|vtracer/i.test(recipe) && !/invent-warp|bundled|ecc/i.test(recipe)) {
+    level = "hold"; title = "Hold";
+    line = "Autotrace mush risk — edges may stair-step. Re-run Vectorize or clean in Corel before production.";
+  } else if (/invent-warp|bundled|ecc-multiROI|corel-import/i.test(recipe)) {
+    level = "go"; title = "Green";
+    line = "Corel-class topology on this mark — good to run after a quick color check.";
+  } else if (n > 0 && n <= 8) {
+    level = "go"; title = "Green";
+    line = n + " clean layers — standard apparel/DTF run. Confirm underbase if needed.";
+  } else if (n > 12) {
+    level = "hold"; title = "Hold";
+    line = n + " layers is a lot for one hit — merge colors or split screens before you go.";
+  } else if (n > 8) {
+    level = "review"; title = "Review";
+    line = n + " layers — check registration and whether fine detail will hold on press.";
+  }
+  if (mae != null && mae > 40 && level === "go") {
+    level = "review"; title = "Review";
+    line = "Alignment drift vs source (MAE " + mae.toFixed(0) + ") — zoom eyes/edges before you print.";
+  }
+  return { level: level, title: title, line: line, recipe: recipe, layers: n };
+}
+function runRiskHtml(job) {
+  const r = runRiskForJob(job);
+  const cls = r.level === "go" ? "risk-go" : (r.level === "hold" ? "risk-hold" : "risk-review");
+  return `<div class="run-risk ${cls}" id="runRisk"><strong>${escapeHtml(r.title)}</strong> · ${escapeHtml(r.line)}</div>`;
+}
 function canFloor() {
   return !!(user && (user.role === "shop" || (user.role === "admin" && user.shopId)));
 }
@@ -472,6 +514,11 @@ async function fillArt(el, job, shopControls) {
   const pals = shopControls ? await loadPalettes() : { pantone: [], vinyl: [], thread: [], stone: [] };
   const pantones = pals.pantone || [];
   const layers = (job.vector && job.vector.layers) || [];
+  const vzMeta = (job.vector && job.vector.meta) || {};
+  const vzRecipe = vzMeta.recipe || vzMeta.engine || (job.vector && job.vector.source) || "";
+  const vzRecipeHtml = vzRecipe
+    ? `<p class="muted" id="vzRecipe"><strong>Vectorize recipe:</strong> ${escapeHtml(String(vzRecipe))}${vzMeta.bundled ? " (bundled)" : ""}</p>`
+    : `<p class="muted" id="vzRecipe">Vectorize recipe: <em>not run yet</em></p>`;
   const hasArt = !!(job.vector_svg || job.file_path);
   const preview = job.vector_svg
     ? `<div id="artZoomSvg" class="art-svg-host" data-src="${escapeHtml(job.vector_svg)}"></div>`
@@ -514,11 +561,19 @@ async function fillArt(el, job, shopControls) {
       </div>
       <div class="art-tools">
         ${shopControls ? `
+        ${runRiskHtml(job)}
+        <div class="recipe-row" id="recipeRow">
+          <span class="muted" style="margin-right:8px">Recipe</span>
+          ${["apparel","dtf","screen","embroidery","laser","uv","vinyl"].map((m) =>
+            `<button type="button" class="process-chip${job.method===m?" on":""}" data-recipe="${m}">${METHOD_LABELS[m]||m}</button>`
+          ).join("")}
+        </div>
         <div class="art-actions">
           <button class="btn primary" id="vectorizeBtn" type="button">Vectorize</button>
           <button class="btn ghost" id="greyBtn" type="button">Hi-res greyscale</button>
         </div>
-        <p class="muted">Vectorize uses Corel-look invent-warp when art matches (e.g. tiger). Pro = VTracer.</p>
+        <p class="muted">Same art, switch recipe anytime — no re-upload. Vectorize unlocks invent-warp when the mark matches.</p>
+        ${vzRecipeHtml}
         <div class="detail-row" id="detailRow">
           <button type="button" class="detail-btn" data-colors="4" title="Few colors">
             <svg viewBox="0 0 24 24" aria-hidden="true"><rect x="4" y="6" width="16" height="12" rx="2"/></svg>
@@ -661,13 +716,27 @@ async function fillArt(el, job, shopControls) {
     const maxEdge = 1100;
     const payload = { colors: vzColors, maxEdge: maxEdge, fuse: "auto" };
     if (engine) payload.engine = engine;
-    await api("/api/jobs/" + job.id + "/vectorize", {
+    const res = await api("/api/jobs/" + job.id + "/vectorize", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify(payload),
     });
+    const meta = (res && res.meta) || (res && res.vector && res.vector.meta) || {};
+    const recipe = meta.recipe || (res && res.vector && res.vector.source) || "unknown";
+    if (errEl) {
+      errEl.textContent = "Vectorize recipe: " + recipe + (meta.bundled ? " (bundled)" : "");
+    }
     renderJob(job.id);
   }
+  document.querySelectorAll("[data-recipe]").forEach((btn) => {
+    btn.onclick = async () => {
+      const method = btn.getAttribute("data-recipe");
+      try {
+        await api("/api/jobs/" + job.id, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ method: method }) });
+        renderJob(job.id);
+      } catch (err) { $("#err").textContent = err.message; }
+    };
+  });
   const vz = $("#vectorizeBtn");
   if (vz) vz.onclick = async () => {
     try { await runVectorize(); }

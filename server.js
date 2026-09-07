@@ -39,7 +39,7 @@ const EXPORTS = path.join(DATA, "exports");
 const DB_PATH = path.join(DATA, "store.json");
 const IS_PROD = process.env.NODE_ENV === "production";
 const STATUSES = ["new","art_in","mockup","priced","proof_sent","approved","in_production","done"];
-const METHODS = ["dtf","uvdtf","uv","vinyl","laser","sticker","hat","apparel","patch","embroidery","sublimation","rhinestone","sign"];
+const METHODS = ["dtf","uvdtf","uv","vinyl","laser","sticker","screen","hat","apparel","patch","embroidery","sublimation","rhinestone","sign"];
 
 function allowDemo() {
   if (IS_PROD) return false;
@@ -116,9 +116,26 @@ function isPaidMember(user) {
   if (!user.plan_expires) return true;
   return Date.parse(user.plan_expires) > Date.now();
 }
-function canProduce(user) { return isComped(user) || isPaidMember(user); }
+/** Active shop trial — entitled until plan_expires (Grok/DecoClub: trials must finish files). */
+function isActiveTrial(user) {
+  if (!user || user.plan !== "trial") return false;
+  if (!user.plan_expires) return true;
+  return Date.parse(user.plan_expires) > Date.now();
+}
+function canProduce(user) { return isComped(user) || isPaidMember(user) || isActiveTrial(user); }
+/** Paid/admin only — fence DST/EXP/digitize/stones packets; trials keep Vectorize + SVG/EPS. */
+function canProducePackets(user) { return isComped(user) || isPaidMember(user); }
 function requireProduce(user, res) {
   if (canProduce(user)) return true;
+  json(res, 402, { error: "Membership or active trial required. Start free for 7 days, or use Shop / Studio." });
+  return false;
+}
+function requirePaidProduce(user, res) {
+  if (canProducePackets(user)) return true;
+  if (isActiveTrial(user)) {
+    json(res, 402, { error: "Stitch packets (DST/EXP) and stone maps need a Shop or Studio plan. Vectorize and SVG/EPS stay free on trial." });
+    return false;
+  }
   json(res, 402, { error: "Membership required to finish production. Admin is complimentary. Shop and Studio plans unlock proofs and packets." });
   return false;
 }
@@ -1179,7 +1196,7 @@ async function handleApi(req, res, url) {
   const stnPath = pth.match(/^\/api\/jobs\/([^/]+)\/stones$/);
   if (stnPath && method === "POST") {
     if (!canRunFloor(user)) return json(res, 403, { error: "Shop login required" });
-    if (!requireProduce(user, res)) return;
+    if (!requirePaidProduce(user, res)) return;
     const job = db.jobs.find(function (j) { return j.id === stnPath[1] && j.shop_id === user.shop_id; });
     if (!job) return json(res, 404, { error: "Job not found" });
     const body = parseJsonBody(await readBody(req));
@@ -1192,7 +1209,7 @@ async function handleApi(req, res, url) {
   const digPath = pth.match(/^\/api\/jobs\/([^/]+)\/digitize$/);
   if (digPath && method === "POST") {
     if (!canRunFloor(user)) return json(res, 403, { error: "Shop login required" });
-    if (!requireProduce(user, res)) return;
+    if (!requirePaidProduce(user, res)) return;
     const job = db.jobs.find(function (j) { return j.id === digPath[1] && j.shop_id === user.shop_id; });
     if (!job) return json(res, 404, { error: "Job not found" });
     const body = parseJsonBody(await readBody(req));
@@ -1215,7 +1232,13 @@ async function handleApi(req, res, url) {
   const expFile = pth.match(/^\/api\/export\/([^/]+)\/([^/]+)$/);
   if (expFile && method === "GET") {
     if (!canRunFloor(user)) return json(res, 403, { error: "Shop login required" });
-    if (!requireProduce(user, res)) return;
+    const exportName = String(expFile[2] || "").toLowerCase();
+    const packetExport = /\.(dst|exp)$/.test(exportName) || exportName.indexOf("dst") !== -1 || exportName.indexOf("exp") !== -1 || exportName.indexOf("stones") !== -1 || exportName.indexOf("packet") !== -1;
+    if (packetExport) {
+      if (!requirePaidProduce(user, res)) return;
+    } else {
+      if (!requireProduce(user, res)) return;
+    }
     const job = db.jobs.find(function (j) { return j.id === expFile[1] && j.shop_id === user.shop_id; });
     if (!job) return json(res, 404, { error: "Job not found" });
     job._shop = db.shops.find(function (s) { return s.id === user.shop_id; });
