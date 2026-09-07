@@ -1307,6 +1307,19 @@ async function handleApi(req, res, url) {
     if (!requireAdmin(user, res)) return;
     return json(res, 200, { users: db.users.map(publicAdminUser) });
   }
+  const delUser = pth.match(/^\/api\/admin\/users\/([^/]+)$/);
+  if (delUser && method === "DELETE") {
+    if (!requireAdmin(user, res)) return;
+    const id = delUser[1];
+    const u = db.users.find(function (x) { return x.id === id; });
+    if (!u) return json(res, 404, { error: "User not found" });
+    if (u.role === "admin") return json(res, 400, { error: "Cannot delete admin" });
+    if (u.id === user.id) return json(res, 400, { error: "Cannot delete yourself" });
+    db.users = db.users.filter(function (x) { return x.id !== id; });
+    db.jobs = (db.jobs || []).filter(function (j) { return j.owner_id !== id && j.client_id !== id; });
+    save(db);
+    return json(res, 200, { ok: true, deleted: id, email: u.email });
+  }
   const planPath = pth.match(/^\/api\/admin\/users\/([^/]+)\/plan$/);
   if (planPath && method === "POST") {
     if (!requireAdmin(user, res)) return;
