@@ -19,6 +19,7 @@ const bezierVectorize = require("./lib/bezierVectorize");
 const inventVectorize = require("./lib/inventVectorize");
 const rasterCorel = require("./lib/rasterCorel");
 const inventWarp = require("./lib/inventWarp");
+const vaiTrace = require("./lib/vaiTrace");
 const colorspec = require("./lib/colorspec");
 const corelImport = require("./lib/corelImport");
 const { listPalettes } = require("./lib/palettes");
@@ -359,7 +360,7 @@ function scheduleVectorize(jobId) {
 }
 function rewriteVectorSvg(job) {
   if (!job || !job.vector || !job.vector.layers) return;
-  if ((job.vector.source === "vectorizer.ai" || job.vector.source === "vtracer" || job.vector.source === "corel-import") && job.vector_svg) {
+  if ((job.vector.source === "vectorizer.ai" || job.vector.source === "vtracer" || job.vector.source === "vai-trace" || job.vector.source === "corel-import") && job.vector_svg) {
     const abs = path.join(UPLOADS, path.basename(job.vector_svg));
     if (fs.existsSync(abs)) {
       let svg = fs.readFileSync(abs, "utf8");
@@ -603,7 +604,7 @@ async function handleApi(req, res, url) {
   const pth = url.pathname;
 
   if (pth === "/api/config" && method === "GET") {
-    return json(res, 200, { demo: allowDemo(), billing: billingConfigured(), imagine: imagineConfigured(), imagineModel: "latest", vectorizerAi: vectorizerAi.configured(), vtracer: vtracer.available(), inventVectorize: true, inventWinner: "ecc-multiROI-TPS", rasterCorel: true, inventWarp: inventWarp.available(), inventWarpReason: inventWarp.available() ? null : (inventWarp.unavailableReason && inventWarp.unavailableReason()), corelImport: true, name: "DecoClub Pro", statuses: STATUSES, methods: METHODS, blanks: BLANKS, seed: allowDemo() ? { owner: "owner@anvil.local", client: "client@anvil.local", password: "anvil123" } : null });
+    return json(res, 200, { demo: allowDemo(), billing: billingConfigured(), imagine: imagineConfigured(), imagineModel: "latest", vectorizerAi: vectorizerAi.configured(), vtracer: vtracer.available(), vaiTrace: vaiTrace.available(), inventVectorize: true, inventWinner: "ecc-multiROI-TPS", rasterCorel: true, inventWarp: inventWarp.available(), inventWarpReason: inventWarp.available() ? null : (inventWarp.unavailableReason && inventWarp.unavailableReason()), corelImport: true, name: "DecoClub Pro", statuses: STATUSES, methods: METHODS, blanks: BLANKS, seed: allowDemo() ? { owner: "owner@anvil.local", client: "client@anvil.local", password: "anvil123" } : null });
   }
   if (pth === "/api/quote" && (method === "POST" || method === "GET")) {
     const body = method === "GET" ? { method: url.searchParams.get("method"), width_in: url.searchParams.get("width_in"), height_in: url.searchParams.get("height_in"), qty: url.searchParams.get("qty"), margin_pct: url.searchParams.get("margin_pct") } : parseJsonBody(await readBody(req));
@@ -1058,6 +1059,7 @@ async function handleApi(req, res, url) {
     if (buf[0] !== 0x89 || buf[1] !== 0x50) return json(res, 400, { error: "Need PNG, JPG, or WebP artwork" });
     const wantApi = body.engine === "vectorizer.ai";
     const wantVtracer = body.engine === "vtracer";
+    const wantVai = body.engine === "vai-trace" || body.engine === "vai" || body.engine === "local-trace";
     const wantLegacy = body.engine === "legacy" || body.engine === "local-js";
     const wantHallucinate = body.engine === "raster-corel" || body.engine === "hallucinate" || body.engine === "invent-hallucinate" || body.engine === "invent-warp";
     const wantInvent = body.engine === "invent" || body.engine === "invent-transfer" || body.engine === "invent-trace" || body.engine === "invent-hybrid";
@@ -1103,6 +1105,21 @@ async function handleApi(req, res, url) {
         event(db, job, "Pro Vectorize · Vectorizer.AI · " + (job.vector.layers || []).length + " colors"); save(db);
         return json(res, 200, { job: presentJob(job, req), vector: job.vector });
       }
+      if (wantVai) {
+        if (!vaiTrace.available()) return json(res, 501, { error: vaiTrace.unavailableReason() || "vai-trace unavailable" });
+        const result = vaiTrace.vectorizeBuffer(buf, {
+          widthIn: job.width_in,
+          heightIn: job.height_in,
+          colors: body.colors,
+          mode: body.mode || "auto",
+          timeoutMs: 180000,
+        });
+        applyVectorResult(job, result.vec, result.svg);
+        if (body.apply_mockup) applyMockup(job);
+        event(db, job, "Vectorized · vai-trace · " + (job.vector.layers || []).length + " colors");
+        save(db);
+        return json(res, 200, { job: presentJob(job, req), vector: job.vector, meta: result.meta });
+      }
       if (wantVtracer) {
         if (!vtracer.available()) return json(res, 501, { error: "VTracer binary missing" });
         runVtracerVectorize(job, buf, body);
@@ -1125,7 +1142,8 @@ async function handleApi(req, res, url) {
       }
       /* Default PNG Vectorize:
        *  1) soft frontal tiger twin → invent-warp bundled (fast, Corel-class for that mark)
-       *  2) everything else → VTracer (never run heavy bezier on the request thread — that 502s Railway)
+       *  2) everything else → vai-trace (Lab hier + cubics); VTracer only if vai-trace missing
+       *  Never run heavy bezier on the request thread — that 502s Railway.
        */
       const opts = {
         colors: body.colors == null ? 8 : body.colors,
@@ -1157,7 +1175,21 @@ async function handleApi(req, res, url) {
           save(db);
           return json(res, 200, { job: presentJob(job, req), vector: job.vector, meta: packed.meta || (packed.vec && packed.vec.meta) });
         }
-        // Non-twin: VTracer first (stable on Railway). Bezier only in worker if VTracer missing.
+        // Non-twin: vai-trace first (general Lab+cubic). VTracer if missing. Bezier only in worker last.
+        if (vaiTrace.available()) {
+          const result = vaiTrace.vectorizeBuffer(buf, {
+            widthIn: job.width_in,
+            heightIn: job.height_in,
+            colors: opts.colors,
+            mode: "auto",
+            timeoutMs: 180000,
+          });
+          applyVectorResult(job, result.vec, result.svg);
+          if (body.apply_mockup) applyMockup(job);
+          event(db, job, "Vectorized · vai-trace · " + (job.vector.layers || []).length + " colors");
+          save(db);
+          return json(res, 200, { job: presentJob(job, req), vector: job.vector, meta: result.meta });
+        }
         if (vtracer.available()) {
           runVtracerVectorize(job, buf, body);
           if (body.apply_mockup) applyMockup(job);
@@ -1183,6 +1215,22 @@ async function handleApi(req, res, url) {
         save(db);
         return json(res, 200, { job: presentJob(job, req), vector: job.vector, meta: job.vector && job.vector.meta });
       } catch (bezErr) {
+        if (vaiTrace.available()) {
+          try {
+            const result = vaiTrace.vectorizeBuffer(buf, {
+              widthIn: job.width_in,
+              heightIn: job.height_in,
+              colors: body.colors,
+              mode: "auto",
+              timeoutMs: 180000,
+            });
+            applyVectorResult(job, result.vec, result.svg);
+            if (body.apply_mockup) applyMockup(job);
+            event(db, job, "Vectorized · vai-trace fallback · " + (job.vector.layers || []).length + " colors");
+            save(db);
+            return json(res, 200, { job: presentJob(job, req), vector: job.vector, meta: result.meta });
+          } catch (vaiErr) { /* fall through */ }
+        }
         if (vtracer.available()) {
           runVtracerVectorize(job, buf, body);
           if (body.apply_mockup) applyMockup(job);
