@@ -407,6 +407,7 @@ def detect_corners(ring: Sequence[Point], cos_thresh: float = 0.5) -> List[int]:
         return []
     flagged = [False] * n
     spans = [1, 2, 3] if n >= 24 else ([1, 2] if n >= 12 else [1])
+    min_leg = 3.2 if n < 80 else 5.0
     for i in range(n):
         hit = False
         for k in spans:
@@ -415,7 +416,7 @@ def detect_corners(ring: Sequence[Point], cos_thresh: float = 0.5) -> List[int]:
             nxt = ring[(i + k) % n]
             raw1 = vsub(cur, prev)
             raw2 = vsub(nxt, cur)
-            if vlen(raw1) < 6 or vlen(raw2) < 6:
+            if vlen(raw1) < min_leg or vlen(raw2) < min_leg:
                 continue
             thr = cos_thresh - (k - 1) * 0.08
             if vdot(vnorm(raw1), vnorm(raw2)) < thr:
@@ -665,16 +666,75 @@ def prepare_contour(
     spacing: float = 0.7,
     simplify_eps: float = 0.28,
     logo: bool = False,
+    sharp: bool = False,
+    kind: Optional[str] = None,
 ) -> Optional[List[Point]]:
-    ring = destaircase(pts)
-    if len(ring) < 3:
-        return None
-    ring = resample_closed(ring, 0.9 if logo else 0.7)
-    ring = chaikin(ring, 2 if logo else 1, -0.08 if logo else -0.28)
-    ring = destaircase(ring)
-    ring = simplify_closed(ring, simplify_eps if not logo else max(simplify_eps, 0.45))
-    ring = resample_closed(ring, spacing)
-    ring = laplacian_smooth(ring, 2, 0.34 if logo else 0.28)
+    """Fair a closed ring. kind: letter | fair | sharp | logo | overlay | None."""
+    if kind == "logo":
+        logo = True
+    if kind == "sharp":
+        sharp = True
+    if kind == "letter":
+        ring = destaircase(pts, max_leg=1.25)
+        if len(ring) < 3:
+            return None
+        ring = resample_closed(ring, 0.38)
+        ring = chaikin(ring, 1, 0.55)
+        ring = destaircase(ring, max_leg=1.25)
+        ring = simplify_closed(ring, min(simplify_eps, 0.07))
+        ring = resample_closed(ring, min(spacing, 0.42))
+        ring = laplacian_smooth(ring, 1, 0.07)
+    elif kind == "fair":
+        ring = destaircase(pts, max_leg=14.0)
+        if len(ring) < 3:
+            return None
+        ring = resample_closed(ring, 0.85)
+        ring = chaikin(ring, 3, -0.65)
+        ring = destaircase(ring, max_leg=14.0)
+        ring = simplify_closed(ring, max(simplify_eps, 0.42))
+        ring = resample_closed(ring, max(spacing, 0.90))
+        ring = laplacian_smooth(ring, 4, 0.44)
+    elif kind == "overlay":
+        ring = destaircase(pts, max_leg=5.5)
+        if len(ring) < 3:
+            return None
+        ring = resample_closed(ring, 0.48)
+        ring = chaikin(ring, 2, -0.08)
+        ring = destaircase(ring, max_leg=5.5)
+        ring = simplify_closed(ring, min(simplify_eps, 0.16))
+        ring = resample_closed(ring, min(spacing, 0.52))
+        ring = laplacian_smooth(ring, 2, 0.22)
+    elif logo:
+        # Identical-line logos: destair pixel jogs only; do not melt corners.
+        ring = destaircase(pts, max_leg=2.4)
+        if len(ring) < 3:
+            return None
+        ring = resample_closed(ring, 0.50)
+        ring = chaikin(ring, 1, 0.18)
+        ring = destaircase(ring, max_leg=2.4)
+        ring = simplify_closed(ring, min(simplify_eps, 0.16))
+        ring = resample_closed(ring, min(spacing, 0.52))
+        ring = laplacian_smooth(ring, 1, 0.12)
+    else:
+        # Gothic lettering / pine tips: destaircase only tiny pixel jogs, keep spikes.
+        ring = destaircase(pts, max_leg=2.6 if sharp else 8.5)
+        if len(ring) < 3:
+            return None
+        ring = resample_closed(ring, 0.50 if sharp else 0.7)
+        if sharp:
+            ring = chaikin(ring, 1, 0.12)
+        else:
+            ring = chaikin(ring, 1, -0.28)
+        ring = destaircase(ring, max_leg=2.6 if sharp else 8.5)
+        eps = simplify_eps
+        if sharp:
+            eps = min(simplify_eps, 0.14)
+        ring = simplify_closed(ring, eps)
+        ring = resample_closed(ring, spacing)
+        if sharp:
+            ring = laplacian_smooth(ring, 1, 0.14)
+        else:
+            ring = laplacian_smooth(ring, 2, 0.28)
     if not ring or len(ring) < 4:
         return None
     if inflate:
@@ -691,13 +751,31 @@ def path_from_ring(
     corner_cos: float = 0.5,
     logo: bool = False,
     min_area: float = 2.5,
+    sharp: bool = False,
+    kind: Optional[str] = None,
 ) -> Optional[str]:
     if not pts or len(pts) < 3:
         return None
     if abs(ring_area(pts)) < min_area:
         return None
+    if kind == "logo":
+        logo = True
+    if kind == "sharp":
+        sharp = True
     if logo:
         d = try_circle(pts, sx, sy) or try_ellipse(pts, sx, sy) or try_triangle(pts, sx, sy) or try_rect(pts, sx, sy)
         if d:
             return d
-    return fit_cubic_path(pts, sx, sy, error=error, corner_cos=corner_cos)
+    if kind == "letter":
+        err = min(error, 0.22)
+        ccos = max(corner_cos, 0.70)
+    elif kind == "fair":
+        err = max(error, 1.05)
+        ccos = min(corner_cos, 0.12)
+    elif kind == "overlay":
+        err = min(error, 0.38)
+        ccos = max(corner_cos, 0.40)
+    else:
+        err = min(error, 0.38) if sharp else error
+        ccos = max(corner_cos, 0.55) if sharp else corner_cos
+    return fit_cubic_path(pts, sx, sy, error=err, corner_cos=ccos)

@@ -1,5 +1,5 @@
 [phases.setup]
-nixPkgs = ["nodejs_20", "python311", "python311Packages.pip", "gcc", "zlib", "librsvg"]
+nixPkgs = ["nodejs_20", "python311", "python311Packages.pip", "gcc", "zlib", "librsvg", "potrace"]
 
 [phases.install]
 cmds = [
