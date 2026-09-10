@@ -4,10 +4,12 @@ DecoClub Pro local raster→SVG engine.
 
 General pipeline (no per-artwork paste / no filename branches):
   1. Classify logo / art / poster from size, flats, and palette.
-  2. Paper flood, true-alpha flatten, JPEG denoise on flats.
+  2. Paper flood, true-alpha flatten; junk-JPEG dens score gates stronger
+     denoise / upsample / sheet-dirt merge / warm-flat collapse.
   3. Logo: Lab palette snap, color-preserving upsample, evenodd holes, potrace.
   4. Art / poster: vtracer spline on a size-capped flattened raster
-     (Lab plates turned busy illustrations into mush).
+     (Lab plates turned busy illustrations into mush). Junk light-sheet
+     soft cartoons stay on cleaned potrace flats (vtracer invents near-colors).
 
 Free/local only: potrace, vtracer, OpenCV, Magick, project libs.
 """
@@ -163,17 +165,268 @@ def detect_paper(rgb: np.ndarray, alpha: np.ndarray):
     return paper, np.clip(mean, 0, 255).astype(np.float32)
 
 
-def denoise_jpeg(rgb, paper, grad):
-    """Median-filter flat interiors so JPEG ringing does not mint extra inks."""
-    q = (rgb.astype(np.int32) >> 3)
-    nuniq = int(np.unique(q.reshape(-1, 3), axis=0).shape[0])
-    if nuniq < 180:
+def unique_color_bins(rgb, shift=3) -> int:
+    q = (rgb.astype(np.int32) >> shift)
+    return int(np.unique(q.reshape(-1, 3), axis=0).shape[0])
+
+
+def junk_raster_score(rgb) -> float:
+    """High when a small soft JPEG invents thousands of near-duplicate colors."""
+    h, w = rgb.shape[:2]
+    n = unique_color_bins(rgb, 3)
+    area = max(1, h * w)
+    # Density scaled so tony (~2963 @ 240x320) scores ~39; bee PNG ~3.
+    return float(n) * 1000.0 / float(area)
+
+
+def denoise_jpeg(rgb, paper, grad, force: bool = False):
+    """Median/bilateral-filter flat interiors so JPEG ringing does not mint extra inks."""
+    nuniq = unique_color_bins(rgb, 3)
+    score = junk_raster_score(rgb)
+    if not force and nuniq < 180 and score < 6.0:
         return rgb
-    med = cv2.medianBlur(rgb, 3)
-    flat = (grad < 22) | paper
     out = rgb.copy()
-    out[flat] = med[flat]
+    # Stronger cleanup on junk soft rasters; keep edges for line art.
+    if score >= 12.0 or force:
+        bil = cv2.bilateralFilter(rgb, 9, 80, 80)
+        med = cv2.medianBlur(bil, 5)
+        flat = (grad < 36) | paper
+        out[flat] = med[flat]
+        med2 = cv2.medianBlur(out, 3)
+        out[flat] = med2[flat]
+    else:
+        med = cv2.medianBlur(rgb, 3)
+        flat = (grad < 22) | paper
+        out[flat] = med[flat]
     return out
+
+
+def punch_sheet_dirt(rgb, paper, paper_rgb, grad=None):
+    """Merge near-paper low-chroma JPEG greys into the sheet (white chests, not grey fur).
+
+    Only on light sheets. Soft tiger on a mid-grey matte is left alone.
+    """
+    if lum(paper_rgb) < 200:
+        return rgb, paper
+    lab = to_lab(rgb)
+    ch = chroma_map(lab)
+    luma = luma_map(rgb)
+    p_lab = lab_of_rgb([paper_rgb])[0]
+    dist = np.sqrt(np.sum((lab - p_lab) ** 2, axis=2))
+    score = junk_raster_score(rgb)
+    # Wider gate on junk JPEGs (tony chest islands sit ~Lab 50–70 from pure white).
+    d_lim = 78.0 if score >= 12.0 else 42.0
+    ch_lim = 22.0 if score >= 12.0 else 14.0
+    dirt = (~paper) & (ch < ch_lim) & (luma > 145.0) & (dist < d_lim)
+    # Very light AA fringe near paper
+    dirt |= (~paper) & (ch < 16.0) & (luma > 200.0) & (dist < d_lim + 10.0)
+    if grad is not None and score >= 12.0:
+        # Flat dirty interiors only — keep chromatic edge AA for outlines.
+        dirt &= grad < 48.0
+    if not dirt.any():
+        return rgb, paper
+    out = rgb.copy()
+    fill = np.clip(np.round(paper_rgb), 0, 255).astype(np.uint8)
+    out[dirt] = fill
+    return out, (paper | dirt)
+
+
+def refine_flat_palette(palette, paper_rgb, *, noisy: bool):
+    """Drop sheet-dirt greys, collapse near-blacks, merge near-duplicate same-hue inks."""
+    if not palette:
+        return palette
+    p_lab = lab_of_rgb([paper_rgb])[0]
+    kept = []
+    for c in palette:
+        la = lab_of_rgb([c])[0]
+        ch = chroma_of_lab(la)
+        d = math.sqrt(float(np.dot(la - p_lab, la - p_lab)))
+        # Light low-chroma → paper (never mint JPEG chest greys as inks).
+        grey_dist = 55.0 if noisy else 28.0
+        if ch < (20.0 if noisy else 14.0) and lum(c) > 130 and d < grey_dist:
+            continue
+        if ch < 12.0 and lum(c) > 185 and d < grey_dist + 15.0:
+            continue
+        kept.append(np.asarray(c, dtype=np.float64))
+    if not kept:
+        kept = [np.asarray(c, dtype=np.float64) for c in palette]
+
+    # Collapse near-black outline inks to a single dark.
+    darks = [c for c in kept if lum(c) < 58 and chroma_of_lab(lab_of_rgb([c])[0]) < 36]
+    rest = [c for c in kept if not (lum(c) < 58 and chroma_of_lab(lab_of_rgb([c])[0]) < 36)]
+    if darks:
+        rest.append(
+            np.array([0.0, 0.0, 0.0])
+            if min(lum(c) for c in darks) < 40
+            else min(darks, key=lum)
+        )
+    kept = rest
+
+    # Merge near-duplicate midtones. Keep red distinct from orange (hue gate).
+    merge_dist = 30.0 if noisy else 16.0
+    labs = [lab_of_rgb([c])[0] for c in kept]
+    used = [False] * len(kept)
+    out = []
+    order = sorted(range(len(kept)), key=lambda i: -chroma_of_lab(labs[i]))
+    for i in order:
+        if used[i]:
+            continue
+        group = [i]
+        used[i] = True
+        for j in range(len(kept)):
+            if used[j]:
+                continue
+            dvec = labs[i] - labs[j]
+            dist = math.sqrt(float(np.dot(dvec, dvec)))
+            if dist > merge_dist:
+                continue
+            if lum(kept[i]) < 60 and lum(kept[j]) < 60:
+                group.append(j)
+                used[j] = True
+                continue
+            ca, cb = chroma_of_lab(labs[i]), chroma_of_lab(labs[j])
+            if ca > 12 and cb > 12:
+                dh = abs(hue_of_lab(labs[i]) - hue_of_lab(labs[j]))
+                dh = min(dh, 2 * math.pi - dh)
+                # Narrow hue: oranges/peach merge; red bandana (dh~0.3+) stays separate.
+                if dh < 0.25 and abs(float(labs[i][0]) - float(labs[j][0])) < 55:
+                    group.append(j)
+                    used[j] = True
+        if lum(kept[group[0]]) < 60:
+            pick = min(group, key=lambda k: lum(kept[k]))
+        else:
+            pick = max(group, key=lambda k: chroma_of_lab(labs[k]))
+        out.append(kept[pick])
+
+    if not noisy:
+        return out
+
+    # Extra cap only when still bloated: at most 2 per very-tight hue family.
+    labs2 = [lab_of_rgb([c])[0] for c in out]
+    used = [False] * len(out)
+    capped = []
+    for i in range(len(out)):
+        if used[i]:
+            continue
+        fam = [i]
+        used[i] = True
+        for j in range(i + 1, len(out)):
+            if used[j]:
+                continue
+            ca, cb = chroma_of_lab(labs2[i]), chroma_of_lab(labs2[j])
+            if ca < 18 or cb < 18:
+                continue
+            dh = abs(hue_of_lab(labs2[i]) - hue_of_lab(labs2[j]))
+            dh = min(dh, 2 * math.pi - dh)
+            if dh > 0.20:
+                continue
+            dvec = labs2[i] - labs2[j]
+            if math.sqrt(float(np.dot(dvec, dvec))) > 36:
+                continue
+            fam.append(j)
+            used[j] = True
+        if len(fam) <= 2:
+            for k in fam:
+                capped.append(out[k])
+            continue
+        fam_sorted = sorted(fam, key=lambda k: lum(out[k]))
+        capped.append(out[fam_sorted[0]])
+        capped.append(out[fam_sorted[-1]])
+    # Final warm-body collapse: JPEG oranges/peach → at most base + shadow.
+    warms, colds = [], []
+    for c in capped:
+        r, g, b = [float(x) for x in c]
+        la = lab_of_rgb([c])[0]
+        ch = chroma_of_lab(la)
+        if ch > 20 and r > 120 and (r - b) > 40 and g > 35 and lum(c) > 55:
+            warms.append(c)
+        else:
+            colds.append(c)
+    if len(warms) > 1:
+        body = max(
+            warms,
+            key=lambda c: chroma_of_lab(lab_of_rgb([c])[0]) * (0.55 + 0.45 * (lum(c) / 255.0)),
+        )
+        warms = [body]
+    # Dark red JPEG shadows (mouth/AA) → black; keep at most one bright bandana red.
+    reds, other = [], []
+    for c in colds:
+        r, g, b = [float(x) for x in c]
+        la = lab_of_rgb([c])[0]
+        ch = chroma_of_lab(la)
+        if ch > 15 and r > b + 25 and r > g and lum(c) < 120:
+            reds.append(c)
+        else:
+            other.append(c)
+    if reds:
+        # Very dark reds fold to black; keep the lightest/most chromatic as bandana.
+        bandana = max(reds, key=lambda c: (lum(c), chroma_of_lab(lab_of_rgb([c])[0])))
+        if lum(bandana) < 45:
+            other.append(np.array([0.0, 0.0, 0.0]))
+        else:
+            other.append(bandana)
+            if not any(lum(c) < 40 for c in other):
+                other.append(np.array([0.0, 0.0, 0.0]))
+    colds = other
+    # Dedup near-blacks
+    darks = [c for c in colds if lum(c) < 45]
+    rest = [c for c in colds if lum(c) >= 45]
+    if darks:
+        rest.append(np.array([0.0, 0.0, 0.0]))
+    capped = rest + warms
+    return capped
+
+
+def snap_to_palette(rgb, paper, palette, paper_rgb, *, paper_win=1.08, despeckle_min=12):
+    """Hard-quantize to intentional flats for tracers that otherwise invent JPEG colors."""
+    if not palette:
+        return rgb
+    assign, _ = assign_pixels(rgb, paper, palette, paper_rgb, paper_win=paper_win)
+    if lum(paper_rgb) >= 200:
+        assign = punch_near_paper(assign, palette, paper_rgb, max_dist=28.0 if junk_raster_score(rgb) >= 12 else 12.0)
+        p_lab = lab_of_rgb([paper_rgb])[0]
+        for i, c in enumerate(palette):
+            la = lab_of_rgb([c])[0]
+            if chroma_of_lab(la) < 18 and lum(c) > 130:
+                assign[assign == i] = -1
+    assign = despeckle(assign, palette, min_size=despeckle_min)
+    out = np.full_like(rgb, np.clip(np.round(paper_rgb), 0, 255).astype(np.uint8))
+    for i, c in enumerate(palette):
+        out[assign == i] = np.clip(np.round(c), 0, 255).astype(np.uint8)
+    return out
+
+
+def clean_fill_mask(mask, *, min_area=40, close_k=3, open_k=2):
+    """Remove speckles and seal small holes in flat fill regions (not thin strokes)."""
+    m = (mask > 0).astype(np.uint8)
+    if int(m.sum()) < 8:
+        return m
+    if open_k and open_k > 0:
+        k = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (open_k, open_k))
+        m = cv2.morphologyEx(m, cv2.MORPH_OPEN, k, iterations=1)
+    if close_k and close_k > 0:
+        k = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (close_k, close_k))
+        m = cv2.morphologyEx(m, cv2.MORPH_CLOSE, k, iterations=1)
+    n, labels, stats, _ = cv2.connectedComponentsWithStats(m, connectivity=4)
+    out = np.zeros_like(m)
+    for i in range(1, n):
+        if int(stats[i, cv2.CC_STAT_AREA]) >= min_area:
+            out[labels == i] = 1
+    return out
+
+
+
+def upsample_small(rgb, alpha, target=1000):
+    """Edge-aware upsample of tiny client uploads before quantize/trace."""
+    h, w = rgb.shape[:2]
+    maxe = max(h, w)
+    if maxe >= target or maxe >= 500:
+        return rgb, alpha
+    s = float(target) / float(maxe)
+    nw, nh = int(round(w * s)), int(round(h * s))
+    up = cv2.resize(rgb, (nw, nh), interpolation=cv2.INTER_CUBIC)
+    au = cv2.resize(alpha, (nw, nh), interpolation=cv2.INTER_NEAREST)
+    return up, au
 
 
 # ---------------------------------------------------------------------------
@@ -338,7 +591,7 @@ def drop_paper_inks(palette, paper_rgb, thresh=14.0):
 
 
 def inject_missing_inks(rgb, paper, palette, grad, min_chroma=18.0, min_px=24):
-    """If a real chromatic ink was dropped, put it back (bee red, etc.)."""
+    """If a real chromatic ink was dropped, put it back (bee red, blue nose, etc.)."""
     if not palette:
         return palette
     lab = to_lab(rgb)
@@ -347,23 +600,41 @@ def inject_missing_inks(rgb, paper, palette, grad, min_chroma=18.0, min_px=24):
     cents = lab_of_rgb(np.array(palette)).reshape(1, 1, -1, 3)
     diff = lab[:, :, None, :] - cents
     dmin = np.sqrt(np.sum(diff * diff, axis=3).min(axis=2))
-    far = art & (ch > min_chroma) & (dmin > 18) & (grad < 36)
+    # Allow slightly busier edges so small accent inks (noses, wristbands) survive.
+    far = art & (ch > min_chroma) & (dmin > 18) & (grad < 55)
     if int(far.sum()) < min_px:
         return palette
     # Cluster leftover chromatic pixels by 5-bit RGB
     pix = rgb[far]
     q = pix.astype(np.int32) >> 3
     keys, inv, counts = np.unique(q, axis=0, return_inverse=True, return_counts=True)
-    order = np.argsort(-counts)
-    out = list(palette)
-    p_lab = [lab_of_rgb([c])[0] for c in out]
-    for idx in order:
+    # Prefer hue-distinct accents (blue nose) over more orange JPEG variants.
+    scored = []
+    for idx in range(len(counts)):
         if counts[idx] < min_px:
             continue
         mean = pix[inv == idx].mean(axis=0)
         la = lab_of_rgb([mean])[0]
-        if chroma_of_lab(la) < min_chroma:
+        ch = chroma_of_lab(la)
+        if ch < min_chroma:
             continue
+        scored.append((idx, mean, la, ch, int(counts[idx])))
+    out = list(palette)
+    p_lab = [lab_of_rgb([c])[0] for c in out]
+
+    def hue_sep(la):
+        best = 1e9
+        for existing in p_lab:
+            if chroma_of_lab(existing) < 12:
+                continue
+            dh = abs(hue_of_lab(la) - hue_of_lab(existing))
+            dh = min(dh, 2 * math.pi - dh)
+            best = min(best, dh)
+        return best if best < 1e8 else 1.0
+
+    # Sort: large hue separation first, then chroma, then population.
+    scored.sort(key=lambda t: (-hue_sep(t[2]), -t[3], -t[4]))
+    for idx, mean, la, ch, n in scored:
         ok = True
         for existing in p_lab:
             dd = la - existing
@@ -374,7 +645,7 @@ def inject_missing_inks(rgb, paper, palette, grad, min_chroma=18.0, min_px=24):
             continue
         out.append(mean)
         p_lab.append(la)
-        if len(out) >= len(palette) + 4:
+        if len(out) >= len(palette) + 6:
             break
     return out
 
@@ -919,12 +1190,13 @@ def svg_from_layers(layers, width_in, height_in, paper_hex=None):
 # Classify
 # ---------------------------------------------------------------------------
 
-def classify(rgb, paper, palette, rec_err, mode: str, paper_rgb=None) -> str:
+def classify(rgb, paper, palette, rec_err, mode: str, paper_rgb=None, src_maxe=None) -> str:
     if mode in ("logo", "art", "poster"):
         return mode
     h, w = rgb.shape[:2]
     k = len(palette)
-    maxe = max(h, w)
+    # Prefer original upload size so tiny junk upsamples don't become "posters".
+    maxe = int(src_maxe) if src_maxe is not None else max(h, w)
     paper_light = lum(paper_rgb) >= 190 if paper_rgb is not None else True
     # Light-sheet few-color marks (mascots, wordmarks). Grey-bg illustrations stay art.
     if paper_light and maxe < 420 and k <= 6:
@@ -1017,9 +1289,21 @@ def wrap_vtracer_svg(svg_text: str, width_in: float, height_in: float) -> tuple[
     return out, n_paths, pal
 
 
-def vtracer_settings(maxe: int, kind: str) -> dict:
+def vtracer_settings(maxe: int, kind: str, *, soft_flat: bool = False) -> dict:
     """General settings — size-based, not per-artwork."""
     # Keep thin keylines (tooth walls, foam, gothic serifs) at native poster res.
+    if soft_flat:
+        # Palette-snapped soft cartoons: do not re-invent JPEG greys/oranges.
+        speckle = 12 if maxe < 1200 else 16
+        return {
+            "mode": "spline",
+            "hierarchical": "stacked",
+            "filter_speckle": str(speckle),
+            "color_precision": "4",
+            "gradient_step": "18",
+            "corner_threshold": "60",
+            "path_precision": "2",
+        }
     if maxe < 1600:
         speckle = 4
     else:
@@ -1066,7 +1350,9 @@ def run_vtracer(png_path: str, svg_path: str, settings: dict, timeout: int = 180
     return r
 
 
-def vectorize_vtracer(rgb, paper_rgb, inches, kind, t0, h0, w0, rec_err, palette):
+def vectorize_vtracer(
+    rgb, paper_rgb, inches, kind, t0, h0, w0, rec_err, palette, *, soft_flat: bool = False
+):
     """Color spline trace of a cleaned raster. Paint order preserved."""
     h, w = rgb.shape[:2]
     cap = 1800
@@ -1085,7 +1371,7 @@ def vectorize_vtracer(rgb, paper_rgb, inches, kind, t0, h0, w0, rec_err, palette
     else:
         height_in = float(inches)
         width_in = float(inches) * (w0 / float(h0))
-    settings = vtracer_settings(max(wh, ww), kind)
+    settings = vtracer_settings(max(wh, ww), kind, soft_flat=soft_flat)
     tmp = tempfile.mkdtemp(prefix="vtr-")
     try:
         png_p = os.path.join(tmp, "in.png")
@@ -1117,6 +1403,7 @@ def vectorize_vtracer(rgb, paper_rgb, inches, kind, t0, h0, w0, rec_err, palette
         "overlay": False,
         "rec_err": round(float(rec_err), 2),
         "vtracer": settings,
+        "soft_flat": bool(soft_flat),
     }
     return svg, meta
 
@@ -1129,25 +1416,35 @@ def vectorize(path: str, inches: float = 10.0, colors=None, mode: str = "auto"):
     t0 = time.time()
     rgb0, alpha0 = load_rgba(path)
     h0, w0 = rgb0.shape[:2]
+    src_score = junk_raster_score(rgb0)
+    # Score the ORIGINAL upload only — cubic upsample invents colors and must not
+    # flip clean logos (bee) into the junk-JPEG recipe.
+    noisy = src_score >= 12.0
 
-    # Working resolution: downsample huge posters; keep small logos native
-    # (color-preserving upsample happens after the palette is known).
+    # Tiny junk uploads: upsample BEFORE paper/palette so flats exist to cluster.
+    rgb_work, alpha_work = rgb0, alpha0
+    if noisy and max(h0, w0) < 500:
+        rgb_work, alpha_work = upsample_small(rgb0, alpha0, target=1000)
+
+    # Working resolution: downsample huge posters.
     cap = 1200
-    rgb, alpha = rgb0, alpha0
-    if max(h0, w0) > cap:
-        s = cap / max(h0, w0)
+    rgb, alpha = rgb_work, alpha_work
+    if max(rgb.shape[0], rgb.shape[1]) > cap:
+        s = cap / max(rgb.shape[0], rgb.shape[1])
         rgb = cv2.resize(
-            rgb0,
-            (int(round(w0 * s)), int(round(h0 * s))),
+            rgb_work,
+            (int(round(rgb_work.shape[1] * s)), int(round(rgb_work.shape[0] * s))),
             interpolation=cv2.INTER_AREA,
         )
-        alpha = cv2.resize(alpha0, (rgb.shape[1], rgb.shape[0]), interpolation=cv2.INTER_NEAREST)
+        alpha = cv2.resize(alpha_work, (rgb.shape[1], rgb.shape[0]), interpolation=cv2.INTER_NEAREST)
     h, w = rgb.shape[:2]
 
     paper, paper_rgb = detect_paper(rgb, alpha)
     rgb, paper, paper_rgb = flatten_alpha(rgb, alpha, paper, paper_rgb)
     grad = gradient_mag(rgb)
-    rgb = denoise_jpeg(rgb, paper, grad)
+    rgb = denoise_jpeg(rgb, paper, grad, force=noisy)
+    grad = gradient_mag(rgb)
+    rgb, paper = punch_sheet_dirt(rgb, paper, paper_rgb, grad=grad)
     grad = gradient_mag(rgb)
 
     # Overlay deblend is only for the potrace-poster fallback. Art/poster use
@@ -1160,6 +1457,8 @@ def vectorize(path: str, inches: float = 10.0, colors=None, mode: str = "auto"):
     if colors is None:
         if overlay is not None or max(h0, w0) >= 900:
             max_k, min_k, merge = 20, 12, 9.5
+        elif noisy and max(h0, w0) < 600:
+            max_k, min_k, merge = 10, 3, 18.0
         elif max(h0, w0) < 400:
             max_k, min_k, merge = 5, 2, 16.0
         elif max(h0, w0) < 600:
@@ -1174,6 +1473,8 @@ def vectorize(path: str, inches: float = 10.0, colors=None, mode: str = "auto"):
     palette = build_palette(rgb_q, paper_q, grad_q, max_k=max_k, min_k=min_k, merge_thresh=merge)
     palette = inject_missing_inks(rgb_q, paper_q, palette, grad_q)
     palette = drop_paper_inks(palette, paper_rgb, thresh=12.0 if lum(paper_rgb) >= 200 else 8.0)
+    if noisy:
+        palette = refine_flat_palette(palette, paper_rgb, noisy=True)
     if not palette:
         palette = [np.array([20.0, 20.0, 20.0])]
 
@@ -1187,48 +1488,86 @@ def vectorize(path: str, inches: float = 10.0, colors=None, mode: str = "auto"):
     rec_err = (
         float(np.abs(rgb_q[art].astype(np.float32) - rec[art]).mean()) if art.any() else 0.0
     )
-    kind = classify(rgb_q, paper_q, palette, rec_err, mode, paper_rgb=paper_rgb)
+    kind = classify(rgb_q, paper_q, palette, rec_err, mode, paper_rgb=paper_rgb, src_maxe=max(h0, w0))
 
     if kind == "logo":
         # Rebuild with a tight merge so AA doesn't mint three near-black outlines.
+        logo_k = 6 if noisy else 4
         palette = build_palette(
-            rgb_q, paper_q, grad_q, max_k=4, min_k=2, merge_thresh=20.0
+            rgb_q, paper_q, grad_q, max_k=logo_k, min_k=2, merge_thresh=22.0 if noisy else 20.0
         )
         palette = inject_missing_inks(rgb_q, paper_q, palette, grad_q)
         palette = drop_paper_inks(
             palette, paper_rgb, thresh=14.0 if lum(paper_rgb) >= 200 else 8.0
         )
+        if noisy:
+            # Dirt merge + warm collapse, then accents (blue), then collapse warms again.
+            palette = refine_flat_palette(palette, paper_rgb, noisy=True)
+            palette = inject_missing_inks(rgb_q, paper_q, palette, grad_q, min_chroma=16.0, min_px=16)
+            palette = drop_paper_inks(palette, paper_rgb, thresh=12.0 if lum(paper_rgb) >= 200 else 8.0)
+            palette = refine_flat_palette(palette, paper_rgb, noisy=True)
         if not palette:
             palette = [np.array([20.0, 20.0, 20.0])]
 
     # Art / poster: vtracer spline on a flattened, size-capped raster.
     # Logos stay palette-snap + potrace (vtracer invents AA inks on 2-color marks).
+    # Noisy light-sheet soft cartoons: snap to flats then potrace (not raw vtracer).
     if kind != "logo":
-        rgb_full, alpha_full = rgb0, alpha0
+        rgb_full, alpha_full = rgb_work, alpha_work
         paper_f, paper_rgb_f = detect_paper(rgb_full, alpha_full)
         rgb_full, paper_f, paper_rgb_f = flatten_alpha(
             rgb_full, alpha_full, paper_f, paper_rgb_f
         )
         grad_f = gradient_mag(rgb_full)
-        rgb_full = denoise_jpeg(rgb_full, paper_f, grad_f)
-        try:
-            return vectorize_vtracer(
-                rgb_full,
-                paper_rgb_f,
-                inches,
-                kind,
-                t0,
-                h0,
-                w0,
-                rec_err,
-                palette,
-            )
-        except Exception:
-            # Fall through to potrace plates if vtracer is missing/broken.
-            overlay = extract_overlay(rgb_q, paper_q, grad_q) if max(h0, w0) >= 700 else None
-            if overlay is not None:
-                rgb_q = overlay["rgb_clean"]
+        noisy_f = noisy
+        rgb_full = denoise_jpeg(rgb_full, paper_f, grad_f, force=noisy_f)
+        grad_f = gradient_mag(rgb_full)
+        rgb_full, paper_f = punch_sheet_dirt(rgb_full, paper_f, paper_rgb_f, grad=grad_f)
+        if noisy_f and lum(paper_rgb_f) >= 200:
+            pal_f = list(palette)
+            if len(pal_f) < 3 or len(pal_f) > 12:
+                g2 = gradient_mag(rgb_full)
+                pal_f = build_palette(rgb_full, paper_f, g2, max_k=10, min_k=3, merge_thresh=18.0)
+                pal_f = inject_missing_inks(rgb_full, paper_f, pal_f, g2)
+                pal_f = drop_paper_inks(pal_f, paper_rgb_f, thresh=16.0)
+                pal_f = refine_flat_palette(pal_f, paper_rgb_f, noisy=True)
+            if pal_f:
+                rgb_full = snap_to_palette(
+                    rgb_full,
+                    paper_f,
+                    pal_f,
+                    paper_rgb_f,
+                    paper_win=1.12,
+                    despeckle_min=max(16, int(0.00008 * rgb_full.shape[0] * rgb_full.shape[1])),
+                )
+                # Fall through to potrace plates on hard flats.
+                rgb_q = rgb_full
+                paper_q = paper_f
+                paper_rgb = paper_rgb_f
                 grad_q = gradient_mag(rgb_q)
+                palette = pal_f
+                kind = "logo"
+                h, w = rgb_q.shape[:2]
+        if kind != "logo":
+            try:
+                return vectorize_vtracer(
+                    rgb_full,
+                    paper_rgb_f,
+                    inches,
+                    kind,
+                    t0,
+                    h0,
+                    w0,
+                    rec_err,
+                    palette,
+                    soft_flat=False,
+                )
+            except Exception:
+                # Fall through to potrace plates if vtracer is missing/broken.
+                overlay = extract_overlay(rgb_q, paper_q, grad_q) if max(h0, w0) >= 700 else None
+                if overlay is not None:
+                    rgb_q = overlay["rgb_clean"]
+                    grad_q = gradient_mag(rgb_q)
 
     # Color-preserving upsample then snap (small logos / art). Posters stay native.
     if kind == "logo" and max(h, w) < 400:
@@ -1243,8 +1582,10 @@ def vectorize(path: str, inches: float = 10.0, colors=None, mode: str = "auto"):
         up_scale = 1
 
     if up_scale > 1:
+        # Nearest on hard-snapped / noisy flats so cubic does not re-invent JPEG greys.
+        interp = cv2.INTER_NEAREST if noisy else cv2.INTER_CUBIC
         up = cv2.resize(
-            rgb_q, (w * up_scale, h * up_scale), interpolation=cv2.INTER_CUBIC
+            rgb_q, (w * up_scale, h * up_scale), interpolation=interp
         )
         paper_up = (
             cv2.resize(
@@ -1258,10 +1599,15 @@ def vectorize(path: str, inches: float = 10.0, colors=None, mode: str = "auto"):
     else:
         up, paper_up, grad_up = rgb_q, paper_q, grad_q
 
-    paper_win = 1.06 if kind == "logo" and lum(paper_rgb) >= 200 else 0.0
+    paper_win = (1.12 if noisy else 1.06) if kind == "logo" and lum(paper_rgb) >= 200 else 0.0
     assign, _ = assign_pixels(up, paper_up, palette, paper_rgb, paper_win=paper_win)
     if kind == "logo" and lum(paper_rgb) >= 200:
-        assign = punch_near_paper(assign, palette, paper_rgb, max_dist=10.0)
+        assign = punch_near_paper(assign, palette, paper_rgb, max_dist=28.0 if noisy else 10.0)
+        if noisy:
+            for i, c in enumerate(palette):
+                la = lab_of_rgb([c])[0]
+                if chroma_of_lab(la) < 18 and lum(c) > 130:
+                    assign[assign == i] = -1
     elif kind == "art" and 80 < lum(paper_rgb) < 200 and chroma_of_lab(lab_of_rgb([paper_rgb])[0]) < 18:
         # Grey-bg illustrations: mid-grey inks are the paper showing through fur.
         p_lab = lab_of_rgb([paper_rgb])[0]
@@ -1371,13 +1717,21 @@ def vectorize(path: str, inches: float = 10.0, colors=None, mode: str = "auto"):
             mask = mask & ~glyph
             if halo is not None:
                 mask = mask & ~halo
+        if noisy and kind == "logo" and lum(palette[i]) > 45:
+            min_a = max(24, int(0.0002 * assign.size))
+            mask = clean_fill_mask(
+                mask.astype(np.uint8),
+                min_area=min_a,
+                close_k=5 if chroma_of_lab(lab_of_rgb([palette[i]])[0]) > 18 else 3,
+                open_k=2,
+            )
         rec = emit(
             mask,
             palette[i],
             alphamax=amax,
             opttol=0.18 if kind == "logo" else 0.22,
-            turdsize=max(2, speckle // 4),
-            smooth=logo_smooth,
+            turdsize=max(2, (speckle // 3 if noisy else speckle // 4)),
+            smooth=0.85 if (noisy and kind == "logo") else logo_smooth,
         )
         if rec:
             layers.append(rec)
