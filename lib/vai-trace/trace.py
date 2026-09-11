@@ -7,6 +7,9 @@ General pipeline (no per-artwork paste / no filename branches):
   2. Paper flood, true-alpha flatten; junk-JPEG dens score gates stronger
      denoise / upsample / sheet-dirt merge / warm-flat collapse.
   3. Logo: Lab palette snap, color-preserving upsample, evenodd holes, potrace.
+     Junk light-sheet mascots: Lanczos upsample + edge-preserve, then an
+     even distance-field keyline (no JPEG stairs), muzzle ridges for
+     whiskers, and assigned-dark specks folded away. White chests are fills.
   4. Art / poster: vtracer spline on a size-capped flattened raster
      (Lab plates turned busy illustrations into mush). Junk light-sheet
      soft cartoons stay on cleaned potrace flats (vtracer invents near-colors).
@@ -202,33 +205,96 @@ def denoise_jpeg(rgb, paper, grad, force: bool = False):
 
 
 def punch_sheet_dirt(rgb, paper, paper_rgb, grad=None):
-    """Merge near-paper low-chroma JPEG greys into the sheet (white chests, not grey fur).
+    """Merge near-paper soft greys into the sheet (white chests, not grey fur).
 
-    Only on light sheets. Soft tiger on a mid-grey matte is left alone.
+    Only on light sheets AND junk soft-JPEGs. Clean few-color logos (bee) must
+    NOT be punched — mild AA punch invented a third navy fringe ink and ate reds.
+    Soft tiger on a mid-grey matte is left alone.
     """
     if lum(paper_rgb) < 200:
+        return rgb, paper
+    score = junk_raster_score(rgb)
+    # Clean logos / crisp PNGs: leave raster alone (morning bee path).
+    if score < 12.0:
         return rgb, paper
     lab = to_lab(rgb)
     ch = chroma_map(lab)
     luma = luma_map(rgb)
     p_lab = lab_of_rgb([paper_rgb])[0]
     dist = np.sqrt(np.sum((lab - p_lab) ** 2, axis=2))
-    score = junk_raster_score(rgb)
-    # Wider gate on junk JPEGs (tony chest islands sit ~Lab 50–70 from pure white).
-    d_lim = 78.0 if score >= 12.0 else 42.0
-    ch_lim = 22.0 if score >= 12.0 else 14.0
-    dirt = (~paper) & (ch < ch_lim) & (luma > 145.0) & (dist < d_lim)
+    # Junk JPEGs: wide gate. Soft chest islands sit ~Lab 50–70 from pure white.
+    d_lim = 88.0
+    ch_lim = 26.0
+    dirt = (~paper) & (ch < ch_lim) & (luma > 135.0) & (dist < d_lim)
     # Very light AA fringe near paper
-    dirt |= (~paper) & (ch < 16.0) & (luma > 200.0) & (dist < d_lim + 10.0)
-    if grad is not None and score >= 12.0:
+    dirt |= (~paper) & (ch < 18.0) & (luma > 195.0) & (dist < d_lim + 12.0)
+    # Soft warm paper bleed on white chests (peach/pink JPEG shading → paper)
+    r = rgb[:, :, 0].astype(np.float32)
+    g = rgb[:, :, 1].astype(np.float32)
+    b = rgb[:, :, 2].astype(np.float32)
+    warm_soft = (
+        (~paper)
+        & (luma > 175.0)
+        & (luma < 250.0)
+        & (ch < 28.0)
+        & (r > g - 8)
+        & (r > b)
+        & (dist < 80.0)
+    )
+    dirt |= warm_soft
+    if grad is not None:
         # Flat dirty interiors only — keep chromatic edge AA for outlines.
-        dirt &= grad < 48.0
+        dirt &= grad < 42.0
     if not dirt.any():
         return rgb, paper
     out = rgb.copy()
     fill = np.clip(np.round(paper_rgb), 0, 255).astype(np.uint8)
     out[dirt] = fill
     return out, (paper | dirt)
+
+
+def collapse_logo_fringe(palette, paper_rgb):
+    """Fold minority dark AA fringe inks into nearest major logo ink (bee navy)."""
+    if not palette or len(palette) <= 2:
+        return palette
+    labs = [lab_of_rgb([c])[0] for c in palette]
+    # Major = high chroma or very dark outline; fringe = darker mid-chroma cousins.
+    majors = []
+    fringe = []
+    for i, c in enumerate(palette):
+        ch = chroma_of_lab(labs[i])
+        if lum(c) < 42 and ch < 40:
+            majors.append(i)  # outline black stays
+            continue
+        if ch >= 40 or lum(c) > 90:
+            majors.append(i)
+        else:
+            fringe.append(i)
+    if not fringe or not majors:
+        return palette
+    keep = []
+    drop = set()
+    for j in fringe:
+        # Nearest major by Lab
+        best = None
+        best_d = 1e9
+        for i in majors:
+            dvec = labs[i] - labs[j]
+            d = math.sqrt(float(np.dot(dvec, dvec)))
+            if d < best_d:
+                best_d = d
+                best = i
+        # Fold dark purple/navy AA into blue; keep distinct reds.
+        if best is not None and best_d < 55:
+            dh = abs(hue_of_lab(labs[best]) - hue_of_lab(labs[j]))
+            dh = min(dh, 2 * math.pi - dh)
+            # Same-ish family or both cool darks
+            if dh < 0.55 or (lum(palette[j]) < 70 and lum(palette[best]) < 120):
+                drop.add(j)
+                continue
+        keep.append(j)
+    out = [palette[i] for i in range(len(palette)) if i not in drop]
+    return out if out else palette
 
 
 def refine_flat_palette(palette, paper_rgb, *, noisy: bool):
@@ -359,14 +425,19 @@ def refine_flat_palette(palette, paper_rgb, *, noisy: bool):
         else:
             other.append(c)
     if reds:
-        # Very dark reds fold to black; keep the lightest/most chromatic as bandana.
-        bandana = max(reds, key=lambda c: (lum(c), chroma_of_lab(lab_of_rgb([c])[0])))
-        if lum(bandana) < 45:
-            other.append(np.array([0.0, 0.0, 0.0]))
-        else:
+        # Soft JPEG body shadows are dark red-brown; bandana is brighter true red.
+        # Keep at most one bandana (lum>=55); fold darker reds into black outline.
+        bright = [c for c in reds if lum(c) >= 55]
+        if bright:
+            bandana = max(
+                bright,
+                key=lambda c: (
+                    chroma_of_lab(lab_of_rgb([c])[0]),
+                    lum(c),
+                ),
+            )
             other.append(bandana)
-            if not any(lum(c) < 40 for c in other):
-                other.append(np.array([0.0, 0.0, 0.0]))
+        other.append(np.array([0.0, 0.0, 0.0]))
     colds = other
     # Dedup near-blacks
     darks = [c for c in colds if lum(c) < 45]
@@ -414,6 +485,1054 @@ def clean_fill_mask(mask, *, min_area=40, close_k=3, open_k=2):
             out[labels == i] = 1
     return out
 
+
+def is_junk_mascot(noisy, kind, paper_rgb, palette) -> bool:
+    """Noisy light-sheet cartoon/mascot: chromatic fills + a dark ink."""
+    if not noisy or kind != "logo":
+        return False
+    if lum(paper_rgb) < 200:
+        return False
+    if not palette or len(palette) < 2:
+        return False
+    has_dark = any(lum(c) < 55 for c in palette)
+    has_chroma = any(chroma_of_lab(lab_of_rgb([c])[0]) > 18 and lum(c) >= 55 for c in palette)
+    return bool(has_dark and has_chroma)
+
+
+def _ink_masks(assign, palette):
+    dark_i = [i for i, c in enumerate(palette) if lum(c) < 55]
+    chrom_i = [
+        i
+        for i, c in enumerate(palette)
+        if i not in dark_i and chroma_of_lab(lab_of_rgb([c])[0]) > 16
+    ]
+    h, w = assign.shape
+    dark_m = np.zeros((h, w), np.uint8)
+    chrom_m = np.zeros((h, w), np.uint8)
+    for i in dark_i:
+        dark_m[assign == i] = 1
+    for i in chrom_i:
+        chrom_m[assign == i] = 1
+    return dark_i, chrom_i, dark_m, chrom_m
+
+
+def keep_accent_ccs(assign, palette, dark_i):
+    """Keep large CCs of non-body chromatic inks (bandana, nose); fold specks into body."""
+    areas = []
+    for i, c in enumerate(palette):
+        if i in dark_i:
+            continue
+        if chroma_of_lab(lab_of_rgb([c])[0]) < 16:
+            continue
+        areas.append((int((assign == i).sum()), i))
+    if len(areas) < 2:
+        return assign
+    areas.sort(reverse=True)
+    body_i = areas[0][1]
+    out = assign.copy()
+    for _n, i in areas[1:]:
+        mask = (out == i).astype(np.uint8)
+        n, labels, stats, _ = cv2.connectedComponentsWithStats(mask, connectivity=4)
+        if n <= 2:
+            continue
+        sizes = [(int(stats[li, cv2.CC_STAT_AREA]), li) for li in range(1, n)]
+        sizes.sort(reverse=True)
+        keep_ids = set()
+        total = sum(s for s, _ in sizes) or 1
+        for idx, (s, li) in enumerate(sizes):
+            bw = int(stats[li, cv2.CC_STAT_WIDTH])
+            bh = int(stats[li, cv2.CC_STAT_HEIGHT])
+            aspect = max(bw, bh) / max(1.0, min(bw, bh))
+            compact = s / float(max(1, bw * bh))
+            # Largest blob always; extra CCs must be compact fills, not AA streaks.
+            if idx == 0:
+                keep_ids.add(li)
+                continue
+            if s >= max(100, int(0.08 * total)) and aspect < 4.5 and compact > 0.18:
+                keep_ids.add(li)
+        for li in range(1, n):
+            if li not in keep_ids:
+                out[labels == li] = body_i
+    return out
+
+
+def _unsharp(rgb, sigma=1.05, amount=1.35):
+    blur = cv2.GaussianBlur(rgb, (0, 0), float(sigma))
+    out = cv2.addWeighted(rgb, 1.0 + float(amount), blur, -float(amount), 0)
+    return np.clip(out, 0, 255).astype(np.uint8)
+
+
+def _geom_fairing():
+    try:
+        from geom import destaircase, resample_closed, chaikin, laplacian_smooth
+    except ImportError:
+        from lib.geom import destaircase, resample_closed, chaikin, laplacian_smooth
+    return destaircase, resample_closed, chaikin, laplacian_smooth
+
+
+def _fair_mask(mask, *, max_leg=28.0, spacing=2.2, chaikin_rounds=2, lap_iters=3, lap_lam=0.38):
+    """Destair JPEG jogs and Laplacian-fair a binary silhouette so potrace sees cubics."""
+    m = (mask > 0).astype(np.uint8)
+    if int(m.sum()) < 24:
+        return m
+    destaircase, resample_closed, chaikin, laplacian_smooth = _geom_fairing()
+    cnts, _ = cv2.findContours(m, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_NONE)
+    if not cnts:
+        return m
+    out = np.zeros_like(m)
+    max_leg = float(max(8.0, max_leg))
+    spacing = float(max(1.0, spacing))
+    for cnt in cnts:
+        if cv2.contourArea(cnt) < 40:
+            continue
+        pts = [(float(p[0][0]), float(p[0][1])) for p in cnt]
+        ring = destaircase(pts, max_leg=max_leg)
+        if len(ring) < 8:
+            cv2.drawContours(out, [cnt], -1, 1, thickness=-1)
+            continue
+        ring = resample_closed(ring, spacing)
+        if len(ring) < 8:
+            cv2.drawContours(out, [cnt], -1, 1, thickness=-1)
+            continue
+        ring = chaikin(ring, int(chaikin_rounds), -0.55)
+        ring = destaircase(ring, max_leg=max_leg)
+        ring = laplacian_smooth(ring, int(lap_iters), float(lap_lam))
+        arr = np.round(np.asarray(ring, dtype=np.float32)).astype(np.int32)
+        if arr.shape[0] >= 3:
+            cv2.fillPoly(out, [arr], 1)
+    if int(out.sum()) < 0.55 * int(m.sum()):
+        return m
+    return out
+
+
+def _fill_shallow_bites(mask, max_depth=28.0):
+    """Fill shallow convexity defects (JPEG bites on a finger) without closing deep gaps."""
+    m = (mask > 0).astype(np.uint8)
+    if int(m.sum()) < 40:
+        return m
+    cnts, _ = cv2.findContours(m, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    if not cnts:
+        return m
+    cnt = max(cnts, key=cv2.contourArea)
+    if len(cnt) < 8:
+        return m
+    hull = cv2.convexHull(cnt, returnPoints=False)
+    if hull is None or len(hull) < 3:
+        return m
+    try:
+        defects = cv2.convexityDefects(cnt, hull)
+    except cv2.error:
+        return m
+    if defects is None:
+        return m
+    out = m.copy()
+    rows = defects.reshape(-1, 4)
+    for s, e, f, d in rows:
+        depth = float(d) / 256.0
+        if depth <= 1.5 or depth > float(max_depth):
+            continue
+        try:
+            pts = np.array([cnt[int(s)][0], cnt[int(f)][0], cnt[int(e)][0]], np.int32)
+        except (IndexError, TypeError):
+            continue
+        cv2.fillConvexPoly(out, pts, 1)
+    return out
+
+
+def _fill_tip_notches(mask, *, tip_h_frac=0.072, tip_w_frac=0.085, max_depth_frac=0.018):
+    """Fair JPEG bites on the highest thin protrusion (a pointing finger).
+
+    Convexity defects of the *whole* silhouette cannot see a fingertip notch
+    (the hull jumps from head to tip). Run shallow-bite fill on a tip crop
+    that stops above the finger–hand gap.
+    """
+    m = (mask > 0).astype(np.uint8)
+    if int(m.sum()) < 80:
+        return m
+    h, w = m.shape
+    ys, xs = np.where(m > 0)
+    if ys.size < 40:
+        return m
+    y_tip = int(ys.min())
+    y_bot = int(ys.max())
+    sil_h = max(1, y_bot - y_tip)
+    x_tip = int(np.round(xs[ys == y_tip].mean()))
+    th = max(18, int(float(tip_h_frac) * sil_h))
+    tw = max(16, int(float(tip_w_frac) * sil_h))
+    y0 = max(0, y_tip - 2)
+    y1 = min(h, y_tip + th)
+    x0 = max(0, x_tip - tw)
+    x1 = min(w, x_tip + tw)
+    crop = m[y0:y1, x0:x1]
+    if int(crop.sum()) < 20:
+        return m
+    max_depth = max(8.0, float(max_depth_frac) * sil_h)
+    filled = _fill_shallow_bites(crop, max_depth=max_depth)
+    rad = max(3, int(round(0.0045 * max(h, w)))) | 1
+    k = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (2 * rad + 1, 2 * rad + 1))
+    filled = cv2.morphologyEx(filled, cv2.MORPH_CLOSE, k)
+    out = m.copy()
+    out[y0:y1, x0:x1] = np.maximum(out[y0:y1, x0:x1], filled)
+    return out
+
+
+def _pyramid_fair_mask(mask, *, block=8, sigma=1.05, thr=0.42):
+    """Fair a binary mask by smoothing at JPEG-block scale, keep topology."""
+    m = (mask > 0).astype(np.float32)
+    if float(m.sum()) < 24:
+        return (m > 0).astype(np.uint8)
+    h, w = m.shape
+    b = max(4, int(block))
+    nw, nh = max(16, w // b), max(16, h // b)
+    small = cv2.resize(m, (nw, nh), interpolation=cv2.INTER_AREA)
+    small = cv2.GaussianBlur(small, (0, 0), float(sigma))
+    up = cv2.resize(small, (w, h), interpolation=cv2.INTER_LINEAR)
+    out = (up >= float(thr)).astype(np.uint8)
+    n, lab, st, _ = cv2.connectedComponentsWithStats(out, connectivity=8)
+    if n > 1:
+        best = 1 + int(np.argmax(st[1:, cv2.CC_STAT_AREA]))
+        out = (lab == best).astype(np.uint8)
+    return _fill_mask_holes(out)
+
+
+def _hessian_ridges(luma, sigmas=(0.9, 1.5, 2.3, 3.2)):
+    """Dark-line vesselness from the Hessian (no skimage)."""
+    img = luma.astype(np.float32)
+    acc = np.zeros_like(img)
+    for s in sigmas:
+        g = cv2.GaussianBlur(img, (0, 0), float(s))
+        ixx = cv2.Sobel(g, cv2.CV_32F, 2, 0, ksize=3)
+        iyy = cv2.Sobel(g, cv2.CV_32F, 0, 2, ksize=3)
+        ixy = cv2.Sobel(g, cv2.CV_32F, 1, 1, ksize=3)
+        tmp = np.sqrt(np.maximum((ixx - iyy) ** 2 + 4.0 * ixy * ixy, 0.0))
+        lam1 = 0.5 * (ixx + iyy + tmp)
+        lam2 = 0.5 * (ixx + iyy - tmp)
+        rb = np.abs(lam2) / (np.abs(lam1) + 1e-6)
+        v = np.where(lam1 > 0.0, lam1 * np.exp(-(rb * rb) / 0.5), 0.0)
+        acc = np.maximum(acc, v)
+    return acc
+
+
+def _fill_mask_holes(mask):
+    m = (mask > 0).astype(np.uint8)
+    if int(m.sum()) < 8:
+        return m
+    h, w = m.shape
+    ff = m.copy()
+    pad = np.zeros((h + 2, w + 2), np.uint8)
+    cv2.floodFill(ff, pad, (0, 0), 255)
+    m[ff == 0] = 1
+    return m
+
+
+def _even_ring(mask, width=2.4, sigma=1.7, outer_scale=0.55):
+    """Smooth even stroke around a filled mask (distance field, not morph-gradient)."""
+    m = (mask > 0).astype(np.uint8)
+    if int(m.sum()) < 8:
+        return m
+    mf = cv2.GaussianBlur(m.astype(np.float32), (0, 0), float(sigma))
+    ms = (mf >= 0.45).astype(np.uint8)
+    din = cv2.distanceTransform(ms, cv2.DIST_L2, 5)
+    dout = cv2.distanceTransform((1 - ms).astype(np.uint8), cv2.DIST_L2, 5)
+    ring = ((ms > 0) & (din <= width)) | ((ms == 0) & (dout <= width * outer_scale))
+    return ring.astype(np.uint8)
+
+
+def _line_kernel(length, width, angle_deg):
+    length = int(max(7, length)) | 1
+    k = np.zeros((length, length), np.uint8)
+    c = length // 2
+    cv2.line(k, (0, c), (length - 1, c), 1, thickness=max(1, int(width)))
+    M = cv2.getRotationMatrix2D((float(c), float(c)), float(angle_deg), 1.0)
+    kr = cv2.warpAffine(k, M, (length, length))
+    return (kr > 0).astype(np.uint8)
+
+
+def _directional_blackhat(luma, length=23, width=2, n_ang=16):
+    acc = np.zeros(luma.shape, np.float32)
+    src = luma.astype(np.uint8)
+    for i in range(int(n_ang)):
+        ang = i * (180.0 / float(n_ang))
+        k = _line_kernel(length, width, ang)
+        bh = cv2.morphologyEx(src, cv2.MORPH_BLACKHAT, k)
+        acc = np.maximum(acc, bh.astype(np.float32))
+    return acc
+
+
+def _morph_skeleton(mask):
+    img = (mask > 0).astype(np.uint8)
+    if int(img.sum()) < 4:
+        return img
+    skel = np.zeros_like(img)
+    kernel = cv2.getStructuringElement(cv2.MORPH_CROSS, (3, 3))
+    while int(img.sum()) > 0:
+        eroded = cv2.erode(img, kernel)
+        opened = cv2.dilate(eroded, kernel)
+        skel |= cv2.subtract(img, opened)
+        img = eroded
+    return skel
+
+
+def _extend_skeleton(skel, score, gate, max_step=36, origin=None, coast=0):
+    """Walk skeleton endpoints along a ridge so JPEG ticks become strokes.
+
+    `origin` (x, y) is the muzzle centre: walk the end that points away from it.
+    After the ridge dies, `coast` extra steps continue the same heading so a
+    JPEG-broken hair can finish without inventing a new one.
+    """
+    sk = (skel > 0).astype(np.uint8)
+    if int(sk.sum()) < 4:
+        return sk
+    h, w = sk.shape
+    nbr = np.array([[1, 1, 1], [1, 0, 1], [1, 1, 1]], np.float32)
+    ncnt = cv2.filter2D(sk.astype(np.float32), -1, nbr)
+    ends = np.argwhere((sk > 0) & (ncnt <= 1.5))
+    if ends.shape[0] == 0 or ends.shape[0] > 240:
+        return sk
+    n, labels, stats, cents = cv2.connectedComponentsWithStats(sk, connectivity=8)
+    out = sk.copy()
+    ox, oy = (None, None) if origin is None else (float(origin[0]), float(origin[1]))
+    for y, x in ends:
+        li = int(labels[y, x])
+        if li <= 0:
+            continue
+        cx = float(cents[li, 0])
+        cy = float(cents[li, 1])
+        if ox is not None:
+            vx, vy = float(x) - ox, float(y) - oy
+        else:
+            vx, vy = float(x) - cx, float(y) - cy
+        nrm = math.hypot(vx, vy) or 1.0
+        dx, dy = vx / nrm, vy / nrm
+        # Skip the inward end (points toward muzzle).
+        if ox is not None:
+            inward = (float(x) - ox) * dx + (float(y) - oy) * dy
+            if inward < 0:
+                continue
+        s0 = float(score[y, x])
+        floor = max(0.018 * s0, 0.02)
+        px, py = float(x), float(y)
+        walked = 0
+        for _ in range(int(max_step)):
+            best, bdx, bdy = -1.0, dx, dy
+            for ang in (-0.40, -0.22, 0.0, 0.22, 0.40):
+                ca, sa = math.cos(ang), math.sin(ang)
+                rx = dx * ca - dy * sa
+                ry = dx * sa + dy * ca
+                ix = int(round(px + rx))
+                iy = int(round(py + ry))
+                if ix < 1 or iy < 1 or ix >= w - 1 or iy >= h - 1:
+                    continue
+                if gate[iy, ix] == 0:
+                    continue
+                val = float(score[iy, ix])
+                if val > best:
+                    best, bdx, bdy = val, rx, ry
+            if best < floor:
+                break
+            n2 = math.hypot(bdx, bdy) or 1.0
+            dx, dy = bdx / n2, bdy / n2
+            px += dx
+            py += dy
+            ix, iy = int(round(px)), int(round(py))
+            out[max(0, iy - 1) : iy + 2, max(0, ix - 1) : ix + 2] = 1
+            walked += 1
+        extra = int(coast) if walked >= 4 else min(int(coast), max(0, int(0.55 * walked)))
+        for _ in range(extra):
+            px += dx
+            py += dy
+            ix, iy = int(round(px)), int(round(py))
+            if ix < 1 or iy < 1 or ix >= w - 1 or iy >= h - 1:
+                break
+            if gate[iy, ix] == 0:
+                break
+            out[max(0, iy - 1) : iy + 2, max(0, ix - 1) : ix + 2] = 1
+    return out
+
+
+def _stroke_skeleton(skel, thickness=3):
+    """Even-width polyline stroke of each skeleton CC (survives potrace, looks like hair)."""
+    sk = (skel > 0).astype(np.uint8)
+    if int(sk.sum()) < 4:
+        return sk
+    h, w = sk.shape
+    canvas = np.zeros((h, w), np.uint8)
+    n, labels, _, _ = cv2.connectedComponentsWithStats(sk, connectivity=8)
+    t = max(2, int(thickness))
+    for i in range(1, n):
+        ys, xs = np.where(labels == i)
+        if ys.size < 5:
+            canvas[labels == i] = 255
+            continue
+        pts = np.stack([xs.astype(np.float64), ys.astype(np.float64)], axis=1)
+        mean = pts.mean(axis=0)
+        centered = pts - mean
+        cov = np.cov(centered.T)
+        if cov.shape != (2, 2) or not np.all(np.isfinite(cov)):
+            canvas[labels == i] = 255
+            continue
+        eigvals, eigvecs = np.linalg.eigh(cov)
+        axis = eigvecs[:, int(np.argmax(eigvals))]
+        proj = centered @ axis
+        ordered = pts[np.argsort(proj)]
+        # Light moving-average so JPEG jogs don't become kinks.
+        k = 3 if ordered.shape[0] >= 9 else 1
+        if k > 1:
+            ker = np.ones(k) / float(k)
+            xs_s = np.convolve(ordered[:, 0], ker, mode="same")
+            ys_s = np.convolve(ordered[:, 1], ker, mode="same")
+            xs_s[: k // 2] = ordered[: k // 2, 0]
+            ys_s[: k // 2] = ordered[: k // 2, 1]
+            xs_s[-(k // 2) :] = ordered[-(k // 2) :, 0]
+            ys_s[-(k // 2) :] = ordered[-(k // 2) :, 1]
+            ordered = np.stack([xs_s, ys_s], axis=1)
+        step = max(1, ordered.shape[0] // 28)
+        poly = ordered[::step]
+        if math.hypot(poly[-1, 0] - ordered[-1, 0], poly[-1, 1] - ordered[-1, 1]) > 1.5:
+            poly = np.vstack([poly, ordered[-1]])
+        poly_i = np.round(poly).astype(np.int32)
+        cv2.polylines(canvas, [poly_i], False, 255, thickness=t, lineType=cv2.LINE_8)
+    return (canvas > 0).astype(np.uint8)
+
+
+def _walk_ridge(score, gate, x, y, dx, dy, max_step, floor, gap=4):
+    """Trace a dark ridge from (x,y) along heading (dx,dy) with a small snap cone.
+
+    A short coast (`gap` steps) bridges JPEG breaks; the walk still has to ride
+    a real ridge — it will not invent a fan across empty paper.
+    """
+    h, w = score.shape
+    nrm = math.hypot(dx, dy) or 1.0
+    dx, dy = dx / nrm, dy / nrm
+    path = [(int(x), int(y))]
+    px, py = float(x), float(y)
+    cur_floor = float(floor)
+    missed = 0
+    for _ in range(int(max_step)):
+        best, bdx, bdy = -1.0, dx, dy
+        for step in (1.2, 1.8):
+            for ang in (-0.50, -0.28, 0.0, 0.28, 0.50):
+                ca, sa = math.cos(ang), math.sin(ang)
+                rx = dx * ca - dy * sa
+                ry = dx * sa + dy * ca
+                ix = int(round(px + rx * step))
+                iy = int(round(py + ry * step))
+                if ix < 1 or iy < 1 or ix >= w - 1 or iy >= h - 1:
+                    continue
+                if gate[iy, ix] == 0:
+                    continue
+                val = float(score[iy, ix])
+                if val > best:
+                    best, bdx, bdy = val, rx, ry
+        if best < cur_floor:
+            missed += 1
+            if missed > int(gap):
+                break
+            px += dx * 1.4
+            py += dy * 1.4
+            ix, iy = int(round(px)), int(round(py))
+            if ix < 1 or iy < 1 or ix >= w - 1 or iy >= h - 1:
+                break
+            if gate[iy, ix] == 0:
+                break
+            if path and abs(ix - path[-1][0]) + abs(iy - path[-1][1]) == 0:
+                continue
+            path.append((ix, iy))
+            cur_floor = max(0.35 * float(floor), cur_floor * 0.92)
+            continue
+        missed = 0
+        n2 = math.hypot(bdx, bdy) or 1.0
+        dx, dy = bdx / n2, bdy / n2
+        px += dx * 1.4
+        py += dy * 1.4
+        ix, iy = int(round(px)), int(round(py))
+        if path and abs(ix - path[-1][0]) + abs(iy - path[-1][1]) == 0:
+            continue
+        path.append((ix, iy))
+        cur_floor = max(0.40 * float(floor), cur_floor * 0.985)
+    return path
+
+
+def _stroke_polylines(paths, shape, thickness=3):
+    canvas = np.zeros(shape, np.uint8)
+    t = max(2, int(thickness))
+    for path in paths:
+        if len(path) < 3:
+            continue
+        poly = np.round(np.asarray(path, dtype=np.float32)).astype(np.int32)
+        cv2.polylines(canvas, [poly], False, 255, thickness=t, lineType=cv2.LINE_8)
+    return (canvas > 0).astype(np.uint8)
+
+
+def _junk_mascot_whiskers(
+    luma, ch, muz_f, sil, assign, red_i, dark_m, inner, maxe, sil_h
+):
+    """Long thin muzzle-flank hairs from Hessian ridges, not short ticks.
+
+    JPEG breaks each hair into dashes. Cluster those dashes by angle from a
+    *filled* muzzle and stitch radial bins — a walk must sit on real ridge
+    pixels (occupancy), never an invented fan.
+    """
+    h, w = luma.shape
+    if int(muz_f.sum()) < 40:
+        return np.zeros((h, w), np.uint8)
+    k5 = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5, 5))
+    k7 = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (7, 7))
+    muz = _fill_mask_holes(muz_f)
+    hess = _hessian_ridges(luma, sigmas=(0.6, 1.0, 1.6, 2.4, 3.4))
+    hn = hess / (float(hess.max()) or 1.0)
+
+    ys_m, xs_m = np.where(muz > 0)
+    xmid = float(xs_m.mean())
+    ymid = float(ys_m.mean())
+    mw = float(xs_m.max() - xs_m.min() + 1)
+    mh = float(ys_m.max() - ys_m.min() + 1)
+    xx = np.arange(w, dtype=np.float32)[None, :]
+    yy = np.arange(h, dtype=np.float32)[:, None]
+    rx = max(40.0, 1.50 * mw)
+    ry = max(28.0, 1.05 * mh)
+    ell = (((xx - xmid) / rx) ** 2 + ((yy - ymid) / ry) ** 2) <= 1.0
+    thick_dark = cv2.morphologyEx(dark_m, cv2.MORPH_OPEN, k5)
+    if red_i is not None:
+        red_d = cv2.dilate((assign == red_i).astype(np.uint8), k7)
+    else:
+        red_d = np.zeros((h, w), np.uint8)
+    gate = (ell & (thick_dark == 0) & (red_d == 0) & (muz == 0)).astype(np.uint8)
+    pos = hn[gate > 0]
+    if pos.size < 40:
+        return np.zeros((h, w), np.uint8)
+    t_lo = float(np.percentile(pos, 90))
+    cand = ((hn >= t_lo) & (gate > 0)).astype(np.uint8)
+    dist = cv2.distanceTransform(cand, cv2.DIST_L2, 3)
+    cand[dist > max(2.2, 0.0016 * maxe)] = 0
+    sk = _morph_skeleton(cand)
+    py, px = np.where(sk > 0)
+    if px.size < 24:
+        return np.zeros((h, w), np.uint8)
+    dx = px.astype(np.float32) - xmid
+    dy = py.astype(np.float32) - ymid
+    rad = np.hypot(dx, dy)
+    ang = np.arctan2(dy, dx)
+    # Whisker cones: sideways, not ears/chin. Right can tilt up toward an arm.
+    right_cone = (ang >= -0.95) & (ang <= 0.45)
+    left_cone = (ang >= 2.82) | (ang <= -2.82)
+    ok = (right_cone | left_cone) & (rad > 0.10 * mw) & (rad < 1.40 * mw)
+    if int(ok.sum()) < 16:
+        return np.zeros((h, w), np.uint8)
+
+    nbins = 144
+    edges = np.linspace(-math.pi, math.pi, nbins + 1)
+    hist, _ = np.histogram(ang[ok], bins=edges)
+    peaks = []
+    for i in range(nbins):
+        if hist[i] < 10:
+            continue
+        if hist[i] >= hist[(i - 1) % nbins] and hist[i] >= hist[(i + 1) % nbins]:
+            peaks.append((int(hist[i]), 0.5 * (edges[i] + edges[i + 1])))
+    peaks.sort(reverse=True)
+
+    def _ray_chain(sel, bin_r=10.0):
+        idx = np.where(sel)[0]
+        if idx.size < 8:
+            return None, 0.0
+        rmin = float(rad[idx].min())
+        rmax = float(rad[idx].max())
+        rs = np.arange(rmin, rmax + 0.5, bin_r)
+        raw = []
+        hit = 0
+        for r in rs:
+            inbin = idx[(rad[idx] >= r) & (rad[idx] < r + bin_r)]
+            if inbin.size >= 1:
+                raw.append(
+                    (float(np.median(px[inbin])), float(np.median(py[inbin])))
+                )
+                hit += 1
+            else:
+                raw.append(None)
+        while raw and raw[-1] is None:
+            raw.pop()
+        occ = hit / float(max(1, len(rs)))
+        chain = []
+        for i, p in enumerate(raw):
+            if p is not None:
+                chain.append(p)
+                continue
+            j = i + 1
+            while j < len(raw) and raw[j] is None:
+                j += 1
+            if not chain or j >= len(raw):
+                continue
+            a, b = chain[-1], raw[j]
+            t = 1.0 / (j - i + 1)
+            chain.append((a[0] + (b[0] - a[0]) * t, a[1] + (b[1] - a[1]) * t))
+        return chain, occ
+
+    def _clip(chain):
+        out = []
+        for x, y in chain:
+            ix, iy = int(round(x)), int(round(y))
+            if ix < 1 or iy < 1 or ix >= w - 1 or iy >= h - 1:
+                break
+            r = math.hypot(x - xmid, y - ymid)
+            # Bandana is below the muzzle. Hairs that leave into paper must
+            # not be clipped by a dilated red halo around the scarf.
+            if red_d[iy, ix] and sil[iy, ix] and y > ymid + 0.22 * mh:
+                break
+            if dark_m[iy, ix] and r > 0.70 * mw:
+                break
+            if sil[iy, ix] and r > 1.18 * mw:
+                break
+            out.append((x, y))
+        return out
+
+    def _smooth(chain, k=3):
+        if len(chain) < k + 2:
+            return chain
+        xs = np.array([p[0] for p in chain], np.float32)
+        ys = np.array([p[1] for p in chain], np.float32)
+        ker = np.ones(k, np.float32) / float(k)
+        xs2 = np.convolve(xs, ker, "same")
+        ys2 = np.convolve(ys, ker, "same")
+        xs2[: k // 2] = xs[: k // 2]
+        ys2[: k // 2] = ys[: k // 2]
+        xs2[-(k // 2) :] = xs[-(k // 2) :]
+        ys2[-(k // 2) :] = ys[-(k // 2) :]
+        return list(zip(xs2.tolist(), ys2.tolist()))
+
+    paths = []
+    for _count, a0 in peaks[:16]:
+        da = np.abs(ang - a0)
+        da = np.minimum(da, 2.0 * math.pi - da)
+        sel = ok & (da < 0.072)
+        chain, occ = _ray_chain(sel, 10.0)
+        if chain is None or occ < 0.34:
+            continue
+        chain = _clip(chain)
+        if len(chain) < 6:
+            continue
+        chain = _smooth(chain, 5)
+        if len(chain) > 10:
+            step = max(1, (len(chain) - 1) // 7)
+            simp = chain[::step]
+            if simp[-1] != chain[-1]:
+                simp.append(chain[-1])
+            chain = simp
+        span = math.hypot(chain[-1][0] - chain[0][0], chain[-1][1] - chain[0][1])
+        ca, sa = math.cos(a0), math.sin(a0)
+        rms = math.sqrt(
+            float(
+                np.mean(
+                    [((x - xmid) * sa - (y - ymid) * ca) ** 2 for x, y in chain]
+                )
+            )
+        )
+        if span < 0.24 * mw or rms > 16.0:
+            continue
+        side_r = math.cos(a0) > 0.0
+        paths.append((span, chain, a0, side_r))
+
+    paths.sort(key=lambda t: -t[0])
+    kept = []
+    n_left = n_right = 0
+    for span, chain, a0, side_r in paths:
+        if side_r and n_right >= 4:
+            continue
+        if (not side_r) and n_left >= 4:
+            continue
+        twin = False
+        for _sp, _ch, kang, _sr in kept:
+            dang = abs(a0 - kang)
+            dang = min(dang, 2.0 * math.pi - dang)
+            if dang < 0.12:
+                twin = True
+                break
+        if twin:
+            continue
+        kept.append((span, chain, a0, side_r))
+        if side_r:
+            n_right += 1
+        else:
+            n_left += 1
+
+    thick = max(2, int(round(0.0017 * maxe)))
+    int_paths = [
+        [(int(round(x)), int(round(y))) for x, y in ch] for _s, ch, _a, _r in kept
+    ]
+    out = _stroke_polylines(int_paths, (h, w), thickness=thick)
+
+    dbg = os.environ.get("VECTORIZER_DEBUG")
+    if dbg:
+        os.makedirs(dbg, exist_ok=True)
+
+        def _sv(name, a):
+            Image.fromarray((a > 0).astype(np.uint8) * 255).save(os.path.join(dbg, name))
+
+        _sv("w-gate.png", gate)
+        _sv("w-cand.png", cand)
+        _sv("w-keep.png", sk)
+        _sv("w-skel.png", out)
+        _sv("w-sk2.png", out)
+        hn8 = (np.clip(hn, 0, 1) * 255).astype(np.uint8)
+        Image.fromarray(hn8).save(os.path.join(dbg, "w-score.png"))
+    return out
+
+
+def _fold_unkept_dark(assign, di, keep):
+    """Reassign dark specks (not in keep) to neighboring non-dark ink or paper."""
+    fold = (assign == di) & (keep == 0)
+    if not fold.any():
+        return assign
+    out = assign.copy()
+    n, labels, stats, _ = cv2.connectedComponentsWithStats(fold.astype(np.uint8), connectivity=4)
+    h, w = assign.shape
+    k3 = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5, 5))
+    for i in range(1, n):
+        comp = labels == i
+        ring = cv2.dilate(comp.astype(np.uint8), k3) > 0
+        ring &= ~comp
+        votes = out[ring]
+        votes = votes[(votes >= 0) & (votes != di)]
+        if votes.size:
+            out[comp] = int(np.bincount(votes.astype(np.int32)).argmax())
+        else:
+            out[comp] = -1
+    return out
+
+
+def apply_junk_mascot_keyline(rgb_edge, assign, palette):
+    """Edge-aware black keyline + interior-white seal for junk light-sheet mascots.
+
+    Builds a silhouette by flooding paper around chromatic/dark walls, then:
+      - even outer keyline (smoothed distance-field stroke — kills JPEG stairs)
+      - inner rings on muzzle / chest-against-chroma / compact pads
+      - thin dark ridges on the muzzle (whiskers), skeletonized + extended
+      - bandana script kept only if letter-like; otherwise omitted
+    Assigned-dark specks are folded away (they used to survive as ear/finger dirt).
+    Exterior (ground shadow) is punched to paper. General — not per-artwork.
+    """
+    h, w = assign.shape
+    luma = luma_map(rgb_edge)
+    lab = to_lab(rgb_edge)
+    ch = chroma_map(lab)
+    dark_i, chrom_i, dark_m, chrom_m = _ink_masks(assign, palette)
+    if not dark_i or not chrom_i:
+        return assign, palette, None
+
+    k3 = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (3, 3))
+    k5 = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5, 5))
+    k7 = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (7, 7))
+    maxe = float(max(h, w))
+    stroke_w = max(2.3, 0.0021 * maxe)
+
+    local = cv2.GaussianBlur(luma, (0, 0), 1.8)
+    edge_dark = ((luma + 16 < local) & (luma < 80)).astype(np.uint8)
+    hard = (luma < 38).astype(np.uint8)
+    chrom_m = cv2.morphologyEx(chrom_m, cv2.MORPH_CLOSE, k5)
+    chromish = ((ch > 16) & (luma < 235)).astype(np.uint8)
+    chromish = cv2.morphologyEx(chromish, cv2.MORPH_CLOSE, k5)
+    walls = ((dark_m > 0) | (chrom_m > 0) | (chromish > 0) | (edge_dark > 0) | (hard > 0)).astype(np.uint8)
+    walls = cv2.morphologyEx(walls, cv2.MORPH_CLOSE, k7)
+
+    passable = (1 - walls).astype(np.uint8)
+    passable[0, :] = 1
+    passable[-1, :] = 1
+    passable[:, 0] = 1
+    passable[:, -1] = 1
+    nlab, labels = cv2.connectedComponents(passable, connectivity=4)
+    keep = np.zeros(nlab, dtype=bool)
+    bids = np.unique(np.concatenate([labels[0], labels[-1], labels[:, 0], labels[:, -1]]))
+    keep[bids] = True
+    keep[0] = False
+    exterior = keep[labels]
+    sil = (~exterior).astype(np.uint8)
+    sil = cv2.morphologyEx(sil, cv2.MORPH_CLOSE, k7)
+    sil = cv2.morphologyEx(sil, cv2.MORPH_OPEN, k5)
+    # Dilate thin extremities (pointing finger) so they survive fairing.
+    sil = cv2.dilate(sil, k3)
+    # Close fingertip JPEG bites before the pyramid can keep them as notches.
+    k9 = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (9, 9))
+    sil = cv2.morphologyEx(sil, cv2.MORPH_CLOSE, k9)
+    # JPEG 8×8 stairs become tens of px at trace res. Smooth at block scale
+    # (keeps a pointing finger) rather than destaircasing a self-intersecting contour.
+    sil = _pyramid_fair_mask(sil, block=8, sigma=1.05, thr=0.40)
+    sil = cv2.morphologyEx(sil, cv2.MORPH_CLOSE, k7)
+    sil = cv2.dilate(sil, k3)
+    sf = cv2.GaussianBlur(sil.astype(np.float32), (0, 0), max(1.2, 0.0010 * maxe))
+    sil = (sf >= 0.38).astype(np.uint8)
+    sil = _fill_mask_holes(sil)
+    # JPEG notch on a pointing fingertip: fair only the highest protrusion.
+    sil = _fill_tip_notches(sil, tip_h_frac=0.072, tip_w_frac=0.085, max_depth_frac=0.018)
+
+    ys = np.arange(h)[:, None]
+    chrom_d = cv2.dilate(chrom_m, cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (31, 31)))
+    shadow = (
+        (sil > 0)
+        & (ch < 18)
+        & (luma > 100)
+        & (luma < 210)
+        & (chrom_d == 0)
+        & (ys > 0.68 * h)
+    )
+    sil[shadow] = 0
+    if int(sil.sum()) > 0:
+        ff = sil.copy()
+        mh = np.zeros((h + 2, w + 2), np.uint8)
+        cv2.floodFill(ff, mh, (0, 0), 255)
+        sil[ff == 0] = 1
+
+    # Fair silhouette + even ring: morph-only rings copy JPEG stairs; a pure
+    # distance-field ring used to pinch thin fingers. OR of both on a faired sil.
+    rad = max(3, int(round(0.0034 * maxe)))
+    k_out = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (2 * rad + 1, 2 * rad + 1))
+    rin = max(1, rad - 2)
+    k_in = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (2 * rin + 1, 2 * rin + 1))
+    outer_morph = ((cv2.dilate(sil, k_out) > 0) & (cv2.erode(sil, k_in) == 0)).astype(np.uint8)
+    outer_even = _even_ring(sil, width=max(2.4, 0.0024 * maxe), sigma=max(1.4, 0.0012 * maxe), outer_scale=0.65)
+    outer = cv2.bitwise_or(outer_morph, outer_even)
+
+    # Paper-assigned interiors. Do not require low chroma on the Lanczos
+    # original — a cream muzzle is warm in the JPEG and would lose to a
+    # paler finger pad / arm bite.
+    interior_light = ((sil > 0) & (assign < 0) & (luma > 148) & (ch < 52)).astype(np.uint8)
+    interior_light = cv2.morphologyEx(interior_light, cv2.MORPH_CLOSE, k5)
+    # Drop paper AA on the silhouette fringe so hole-fill cannot flood the body.
+    interior_light[cv2.erode(sil, k7) == 0] = 0
+    n, labels, stats, _ = cv2.connectedComponentsWithStats(interior_light, connectivity=8)
+    filled_il = np.zeros_like(interior_light)
+    for i in range(1, n):
+        comp = (labels == i).astype(np.uint8)
+        filled_il = cv2.bitwise_or(filled_il, _fill_mask_holes(comp))
+    interior_light = filled_il
+    # Break thin paper-AA necks so an inner-arm JPEG bite cannot merge into the chest.
+    k_split = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (9, 9))
+    split = cv2.erode(interior_light, k_split)
+    n_s, lab_s, st_s, _ = cv2.connectedComponentsWithStats(split, connectivity=8)
+    if n_s > 2:
+        recovered = np.zeros_like(interior_light)
+        for i in range(1, n_s):
+            rec = cv2.dilate((lab_s == i).astype(np.uint8), k_split)
+            recovered = cv2.bitwise_or(recovered, cv2.bitwise_and(rec, interior_light))
+        if int(recovered.sum()) > 0.50 * int(interior_light.sum()):
+            interior_light = recovered
+    n, labels, stats, _ = cv2.connectedComponentsWithStats(interior_light, connectivity=8)
+    ys_idx = np.where(sil > 0)[0]
+    y0 = int(ys_idx.min()) if ys_idx.size else 0
+    y1 = int(ys_idx.max()) if ys_idx.size else h
+    sil_h = max(1, y1 - y0)
+    sil_a = max(int(sil.sum()), 1)
+
+    muz = np.zeros((h, w), np.uint8)
+    chest = np.zeros((h, w), np.uint8)
+    best_m, best_mi = 0, -1
+    best_c, best_ci = 0, -1
+    for i in range(1, n):
+        area = int(stats[i, cv2.CC_STAT_AREA])
+        bw = int(stats[i, cv2.CC_STAT_WIDTH])
+        bh_ = int(stats[i, cv2.CC_STAT_HEIGHT])
+        top = int(stats[i, cv2.CC_STAT_TOP])
+        compact = area / float(max(1, bw * bh_))
+        if area < 80:
+            continue
+        cy_comp = top + 0.5 * bh_
+        rel_y = (cy_comp - y0) / float(sil_h)
+        # Face sits in the upper-middle of the sil; pointing-hand pads are higher.
+        if 0.16 <= rel_y <= 0.50 and compact > 0.14 and bh_ < 0.42 * sil_h and area > best_m:
+            best_m, best_mi = area, i
+        if bh_ >= 0.22 * sil_h and area > best_c:
+            best_c, best_ci = area, i
+    if best_mi > 0:
+        muz[labels == best_mi] = 1
+    if best_ci > 0:
+        chest[labels == best_ci] = 1
+
+    muz_f = _fill_mask_holes(muz) if int(muz.sum()) else muz
+    if int(muz_f.sum()):
+        k15 = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (15, 15))
+        muz_f = _fill_mask_holes(cv2.morphologyEx(muz_f, cv2.MORPH_CLOSE, k15))
+        mf = cv2.GaussianBlur(muz_f.astype(np.float32), (0, 0), 2.2)
+        muz_f = _fill_mask_holes((mf >= 0.42).astype(np.uint8))
+    inner = _even_ring(muz_f, width=max(1.8, 0.0017 * maxe), sigma=2.0) if int(muz_f.sum()) else muz_f
+    if int(chest.sum()) > 0:
+        cr = _even_ring(chest, width=max(1.8, 0.0017 * maxe), sigma=1.5)
+        cr = cv2.bitwise_and(cr, cv2.dilate(chrom_m, k7))
+        cr = cv2.bitwise_and(cr, (1 - cv2.dilate(outer, k3)))
+        inner = cv2.bitwise_or(inner, cr)
+    # Compact pads (finger, inner ear) — skip: even-rings on JPEG pads mint holes.
+
+    # Paper leftovers inside the sil that are not muzzle/chest/hand-pad are
+    # JPEG bites (inner arm). Fill them with body later; keep high compact pads.
+    leftover = interior_light.copy()
+    leftover[cv2.dilate(chest, k7) > 0] = 0
+    leftover[cv2.dilate(muz_f, k7) > 0] = 0
+    leftover[cv2.erode(sil, k7) == 0] = 0
+    n_l, lab_l, st_l, _ = cv2.connectedComponentsWithStats(leftover, connectivity=8)
+    arm_bite = np.zeros((h, w), np.uint8)
+    for i in range(1, n_l):
+        area = int(st_l[i, cv2.CC_STAT_AREA])
+        top = int(st_l[i, cv2.CC_STAT_TOP])
+        bw = int(st_l[i, cv2.CC_STAT_WIDTH])
+        bh_ = int(st_l[i, cv2.CC_STAT_HEIGHT])
+        cy_comp = top + 0.5 * bh_
+        rel_y = (cy_comp - y0) / float(sil_h)
+        if rel_y < 0.16:
+            continue
+        if area > 0.06 * sil_a:
+            continue
+        comp = lab_l == i
+        ring = cv2.dilate(comp.astype(np.uint8), k5) > 0
+        ring &= ~comp
+        chrom_frac = float(chrom_m[ring].mean()) if ring.any() else 0.0
+        if chrom_frac >= 0.42 and rel_y >= 0.24:
+            arm_bite[comp] = 1
+
+    red_i = None
+    best_red = -1.0
+    for i, c in enumerate(palette):
+        r, g, b = [float(x) for x in c]
+        if r > 140 and r > g + 40 and r > b + 40 and g < 80:
+            score = (r - g) + (r - b)
+            if score > best_red:
+                best_red = score
+                red_i = i
+
+    # --- Whiskers: long thin muzzle-flank hairs (paper halo + orange fur) ---
+    whisk_raw = _junk_mascot_whiskers(
+        luma, ch, muz_f, sil, assign, red_i, dark_m, inner, maxe, sil_h
+    )
+
+    # 6–12px JPEG "lettering" becomes a black smudge — omit. Always fold
+    # dark-on-red mush to red so the bandana stays a clean fill.
+    script = np.zeros((h, w), np.uint8)
+    script_omit = np.zeros((h, w), np.uint8)
+
+    # Assigned dark: keep stripes / eyes / mouth; drop compact JPEG specks.
+    n_d, lab_d, st_d, _ = cv2.connectedComponentsWithStats(dark_m, connectivity=4)
+    dark_clean = np.zeros_like(dark_m)
+    min_blob = max(220, int(0.00022 * h * w))
+    for i in range(1, n_d):
+        area = int(st_d[i, cv2.CC_STAT_AREA])
+        bw = int(st_d[i, cv2.CC_STAT_WIDTH])
+        bh_ = int(st_d[i, cv2.CC_STAT_HEIGHT])
+        aspect = max(bw, bh_) / max(1.0, min(bw, bh_))
+        compact = area / float(max(1, bw * bh_))
+        if aspect >= 2.8 and area >= 80:
+            dark_clean[lab_d == i] = 1
+        elif area >= min_blob:
+            dark_clean[lab_d == i] = 1
+        elif area >= 120 and compact > 0.38 and aspect < 2.3:
+            # Eyes/nose live on the muzzle. Compact specks on an arm are dirt.
+            muz_hit = int(cv2.dilate(muz_f, k7)[lab_d == i].sum()) if int(muz_f.sum()) else 0
+            if muz_hit > 0:
+                dark_clean[lab_d == i] = 1
+
+    # Dark islands sitting on the bandana are mushy script — omit unless letter-like.
+    if red_i is not None:
+        red_d = cv2.dilate((assign == red_i).astype(np.uint8), k5)
+        n5, lab5, st5, _ = cv2.connectedComponentsWithStats(dark_clean, connectivity=4)
+        for i in range(1, n5):
+            comp = lab5 == i
+            area = int(st5[i, cv2.CC_STAT_AREA])
+            frac = float(red_d[comp].mean()) if area else 0.0
+            if frac > 0.55 and area < 0.018 * sil_a:
+                if int(script[comp].sum()) == 0:
+                    dark_clean[comp] = 0
+                    script_omit[comp] = 1
+
+    outer = cv2.morphologyEx(outer, cv2.MORPH_CLOSE, k5)
+    # Clip bulky key to the silhouette; whiskers may extend into paper.
+    bulky = (dark_clean | outer | inner | script).astype(np.uint8)
+    near = cv2.dilate(sil, cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (13, 13)))
+    bulky[near == 0] = 0
+    key = (bulky | whisk_raw).astype(np.uint8)
+
+    n, labels, stats, _ = cv2.connectedComponentsWithStats(key, connectivity=8)
+    key2 = np.zeros_like(key)
+    for i in range(1, n):
+        area = int(stats[i, cv2.CC_STAT_AREA])
+        bw = int(stats[i, cv2.CC_STAT_WIDTH])
+        bh_ = int(stats[i, cv2.CC_STAT_HEIGHT])
+        aspect = max(bw, bh_) / max(1.0, min(bw, bh_))
+        if area >= 24 or (aspect >= 3.2 and area >= 8):
+            key2[labels == i] = 1
+
+    out = assign.copy()
+    out[sil == 0] = -1
+    di = dark_i[0]
+    pal = list(palette)
+    pal[di] = np.array([0.0, 0.0, 0.0])
+    for extra in dark_i[1:]:
+        out[out == extra] = di
+    keep_dark = ((dark_clean > 0) | (key2 > 0)).astype(np.uint8)
+    out = _fold_unkept_dark(out, di, keep_dark)
+    out[key2 > 0] = di
+    # Small paper bites inside the silhouette (JPEG stairs on a thin finger)
+    # become body fill so the keyline isn't a dashed line on white.
+    if chrom_i:
+        body_i = max(chrom_i, key=lambda ii: int((assign == ii).sum()))
+        holes = ((sil > 0) & (out < 0)).astype(np.uint8)
+        holes[cv2.dilate(chest, k7) > 0] = 0
+        holes[cv2.dilate(muz_f, k7) > 0] = 0
+        n_h, lab_h, st_h, _ = cv2.connectedComponentsWithStats(holes, connectivity=4)
+        # Only JPEG-stair pinholes, not a pointing-hand pad or muzzle.
+        max_pocket = max(80, int(0.0020 * sil_a))
+        for i in range(1, n_h):
+            area = int(st_h[i, cv2.CC_STAT_AREA])
+            top = int(st_h[i, cv2.CC_STAT_TOP])
+            bw = int(st_h[i, cv2.CC_STAT_WIDTH])
+            bh_ = int(st_h[i, cv2.CC_STAT_HEIGHT])
+            compact = area / float(max(1, bw * bh_))
+            if top <= y0 + 0.16 * sil_h:
+                continue
+            if area <= max_pocket or (area <= int(0.008 * sil_a) and compact > 0.24):
+                out[lab_h == i] = body_i
+        if int(arm_bite.sum()):
+            out[arm_bite > 0] = body_i
+        # Orange leaking into the white muzzle (JPEG mix on the inner ring).
+        if int(muz_f.sum()):
+            muz_in = cv2.erode(muz_f, k5)
+            accent = np.zeros(out.shape, dtype=bool)
+            for ii, cc in enumerate(pal):
+                if ii == di or ii == body_i:
+                    continue
+                if chroma_of_lab(lab_of_rgb([cc])[0]) > 16:
+                    accent |= out == ii
+            leak = (muz_in > 0) & (out == body_i)
+            out[leak] = -1
+            # Keep blue/other accents; muzzle interior that's not dark is paper.
+            mush = (muz_in > 0) & (out != di) & (~accent) & (out >= 0)
+            out[mush] = -1
+    if red_i is not None:
+        if script_omit.any():
+            out[script_omit > 0] = red_i
+        # Fill holes in the assigned red (script punches) so interior dirt
+        # is red, not black. Compute from assign so already-black script counts.
+        red_fill = _fill_mask_holes((assign == red_i).astype(np.uint8))
+        red_in = cv2.erode(red_fill, k3)
+        dirt = (out == di) & (red_in > 0) & (outer == 0)
+        out[dirt] = red_i
+        key2[dirt] = 0
+    out = keep_accent_ccs(out, pal, [di])
+    dbg = os.environ.get("VECTORIZER_DEBUG")
+    if dbg:
+        os.makedirs(dbg, exist_ok=True)
+        def _sv(name, a):
+            Image.fromarray((a > 0).astype(np.uint8) * 255).save(os.path.join(dbg, name))
+        _sv("sil.png", sil)
+        _sv("outer.png", outer)
+        _sv("inner.png", inner)
+        _sv("whisk.png", whisk_raw)
+        _sv("dark_clean.png", dark_clean)
+        _sv("key2.png", key2)
+        _sv("muz.png", muz_f)
+        _sv("script_omit.png", script_omit)
+        _sv("intlight.png", interior_light)
+        _sv("arm_bite.png", arm_bite)
+    return out, pal, {
+        "keyline": True,
+        "dark_i": di,
+        "script": bool(int(script.sum()) > 0),
+        "whisk": whisk_raw,
+    }
 
 
 def upsample_small(rgb, alpha, target=1000):
@@ -1422,6 +2541,8 @@ def vectorize(path: str, inches: float = 10.0, colors=None, mode: str = "auto"):
     noisy = src_score >= 12.0
 
     # Tiny junk uploads: upsample BEFORE paper/palette so flats exist to cluster.
+    # Palette stays near 1000px (1800px denoise merged bandana red into body).
+    # Hair-thin strokes are recovered later by a junk-mascot keyline upsample.
     rgb_work, alpha_work = rgb0, alpha0
     if noisy and max(h0, w0) < 500:
         rgb_work, alpha_work = upsample_small(rgb0, alpha0, target=1000)
@@ -1442,6 +2563,21 @@ def vectorize(path: str, inches: float = 10.0, colors=None, mode: str = "auto"):
     paper, paper_rgb = detect_paper(rgb, alpha)
     rgb, paper, paper_rgb = flatten_alpha(rgb, alpha, paper, paper_rgb)
     grad = gradient_mag(rgb)
+    # Edge-preserving copy for junk-mascot keylines (median on flats eats whiskers).
+    # Rebuild from the original raster with Lanczos so thin strokes aren't
+    # interpolated from the palette-work cubic. Unsharp runs after upsample.
+    if noisy:
+        src_e = rgb0
+        if src_e.shape[:2] != rgb.shape[:2]:
+            src_e = cv2.resize(
+                rgb0, (rgb.shape[1], rgb.shape[0]), interpolation=cv2.INTER_LANCZOS4
+            )
+        try:
+            rgb_edge = cv2.edgePreservingFilter(src_e, flags=1, sigma_s=48, sigma_r=0.38)
+        except Exception:
+            rgb_edge = cv2.bilateralFilter(src_e, 9, 60, 60)
+    else:
+        rgb_edge = rgb
     rgb = denoise_jpeg(rgb, paper, grad, force=noisy)
     grad = gradient_mag(rgb)
     rgb, paper = punch_sheet_dirt(rgb, paper, paper_rgb, grad=grad)
@@ -1506,6 +2642,11 @@ def vectorize(path: str, inches: float = 10.0, colors=None, mode: str = "auto"):
             palette = inject_missing_inks(rgb_q, paper_q, palette, grad_q, min_chroma=16.0, min_px=16)
             palette = drop_paper_inks(palette, paper_rgb, thresh=12.0 if lum(paper_rgb) >= 200 else 8.0)
             palette = refine_flat_palette(palette, paper_rgb, noisy=True)
+        else:
+            # Clean logos: mild refine + fringe fold so AA cannot mint a 3rd navy.
+            palette = refine_flat_palette(palette, paper_rgb, noisy=False)
+            palette = collapse_logo_fringe(palette, paper_rgb)
+        palette = collapse_logo_fringe(palette, paper_rgb)
         if not palette:
             palette = [np.array([20.0, 20.0, 20.0])]
 
@@ -1548,6 +2689,7 @@ def vectorize(path: str, inches: float = 10.0, colors=None, mode: str = "auto"):
                 palette = pal_f
                 kind = "logo"
                 h, w = rgb_q.shape[:2]
+                rgb_edge = cv2.bilateralFilter(rgb_full, 7, 50, 50)
         if kind != "logo":
             try:
                 return vectorize_vtracer(
@@ -1580,10 +2722,19 @@ def vectorize(path: str, inches: float = 10.0, colors=None, mode: str = "auto"):
         up_scale = 2
     else:
         up_scale = 1
+    # Junk light-sheet mascots: trace at ≥1800px so whiskers/keylines are cubics.
+    if (
+        noisy
+        and kind == "logo"
+        and lum(paper_rgb) >= 200
+        and max(h, w) < 1600
+    ):
+        up_scale = max(up_scale, int(math.ceil(1800.0 / float(max(h, w)))))
 
     if up_scale > 1:
-        # Nearest on hard-snapped / noisy flats so cubic does not re-invent JPEG greys.
-        interp = cv2.INTER_NEAREST if noisy else cv2.INTER_CUBIC
+        # Linear on junk (not nearest) so silhouette stairs don't get 2× blockier.
+        # Cubic stays for clean logos; cubic-on-junk re-invents JPEG greys.
+        interp = cv2.INTER_LINEAR if noisy else cv2.INTER_CUBIC
         up = cv2.resize(
             rgb_q, (w * up_scale, h * up_scale), interpolation=interp
         )
@@ -1596,8 +2747,23 @@ def vectorize(path: str, inches: float = 10.0, colors=None, mode: str = "auto"):
             > 0
         )
         grad_up = gradient_mag(up)
+        rgb_edge_up = cv2.resize(
+            rgb_edge, (up.shape[1], up.shape[0]), interpolation=cv2.INTER_CUBIC
+        )
     else:
         up, paper_up, grad_up = rgb_q, paper_q, grad_q
+        rgb_edge_up = rgb_edge
+        if rgb_edge_up.shape[:2] != up.shape[:2]:
+            rgb_edge_up = cv2.resize(
+                rgb_edge, (up.shape[1], up.shape[0]), interpolation=cv2.INTER_CUBIC
+            )
+    if noisy and kind == "logo" and lum(paper_rgb) >= 200:
+        # Lanczos the original to trace res. Edge-preserving at work res eats
+        # hair-thin whiskers; cubic-of-EP cannot put them back.
+        rgb_edge_up = cv2.resize(
+            rgb0, (up.shape[1], up.shape[0]), interpolation=cv2.INTER_LANCZOS4
+        )
+        rgb_edge_up = _unsharp(rgb_edge_up, 0.95, 1.55)
 
     paper_win = (1.12 if noisy else 1.06) if kind == "logo" and lum(paper_rgb) >= 200 else 0.0
     assign, _ = assign_pixels(up, paper_up, palette, paper_rgb, paper_win=paper_win)
@@ -1608,6 +2774,25 @@ def vectorize(path: str, inches: float = 10.0, colors=None, mode: str = "auto"):
                 la = lab_of_rgb([c])[0]
                 if chroma_of_lab(la) < 18 and lum(c) > 130:
                     assign[assign == i] = -1
+            # Tiny red speckles only (not bandana): fold into orange body.
+            orange_i = None
+            for j, oc in enumerate(palette):
+                rr, gg, bb = [float(x) for x in oc]
+                if rr > 140 and (rr - bb) > 50 and gg > 55 and lum(oc) > 85:
+                    orange_i = j
+                    break
+            if orange_i is not None:
+                for i, c in enumerate(palette):
+                    r, g, b = [float(x) for x in c]
+                    if not (r > 140 and r > b + 35 and lum(c) >= 50):
+                        continue
+                    mask = (assign == i).astype(np.uint8)
+                    n, labels, stats, _ = cv2.connectedComponentsWithStats(mask, connectivity=4)
+                    for li in range(1, n):
+                        area = int(stats[li, cv2.CC_STAT_AREA])
+                        if area < max(30, int(0.004 * mask.size)):
+                            assign[labels == li] = orange_i
+
     elif kind == "art" and 80 < lum(paper_rgb) < 200 and chroma_of_lab(lab_of_rgb([paper_rgb])[0]) < 18:
         # Grey-bg illustrations: mid-grey inks are the paper showing through fur.
         p_lab = lab_of_rgb([paper_rgb])[0]
@@ -1619,10 +2804,21 @@ def vectorize(path: str, inches: float = 10.0, colors=None, mode: str = "auto"):
             if math.sqrt(float(np.dot(d, d))) < 38:
                 assign[assign == i] = -1
     speckle = max(6 if kind == "logo" else 10, int(0.00012 * assign.size))
-    assign = despeckle(assign, palette, min_size=speckle)
+    keylined = False
+    whisk_m = None
+    if is_junk_mascot(noisy, kind, paper_rgb, palette):
+        assign, palette, kmeta = apply_junk_mascot_keyline(rgb_edge_up, assign, palette)
+        keylined = bool(kmeta)
+        if kmeta:
+            whisk_m = kmeta.get("whisk")
+    if not keylined:
+        assign = despeckle(assign, palette, min_size=speckle)
     if kind != "logo":
         assign, palette = collapse_aa_inks(assign, palette, grad_up, min_keep=4 if kind == "art" else 8)
-    palette = recolor_palette(up, assign, palette, grad=grad_up)
+    # Junk soft-JPEG logos: keep intentional screenprint inks. Recolor averages
+    # soft shadows into the bandana slot and turns #e91a25 → muddy #920201.
+    if not (noisy and kind == "logo"):
+        palette = recolor_palette(up, assign, palette, grad=grad_up)
     # Recolor can pull a leftover AA ink toward paper-grey; punch those holes.
     if kind == "art" and 80 < lum(paper_rgb) < 200:
         p_lab = lab_of_rgb([paper_rgb])[0]
@@ -1717,7 +2913,8 @@ def vectorize(path: str, inches: float = 10.0, colors=None, mode: str = "auto"):
             mask = mask & ~glyph
             if halo is not None:
                 mask = mask & ~halo
-        if noisy and kind == "logo" and lum(palette[i]) > 45:
+        is_dark = lum(palette[i]) < 50
+        if noisy and kind == "logo" and lum(palette[i]) > 45 and not keylined:
             min_a = max(24, int(0.0002 * assign.size))
             mask = clean_fill_mask(
                 mask.astype(np.uint8),
@@ -1725,14 +2922,42 @@ def vectorize(path: str, inches: float = 10.0, colors=None, mode: str = "auto"):
                 close_k=5 if chroma_of_lab(lab_of_rgb([palette[i]])[0]) > 18 else 3,
                 open_k=2,
             )
-        rec = emit(
-            mask,
-            palette[i],
-            alphamax=amax,
-            opttol=0.18 if kind == "logo" else 0.22,
-            turdsize=max(2, (speckle // 3 if noisy else speckle // 4)),
-            smooth=0.85 if (noisy and kind == "logo") else logo_smooth,
-        )
+        if keylined and is_dark:
+            bulky = mask.astype(np.uint8)
+            if whisk_m is not None:
+                bulky = bulky.copy()
+                bulky[whisk_m > 0] = 0
+            rec = emit(
+                bulky,
+                palette[i],
+                alphamax=1.333,
+                opttol=0.24,
+                turdsize=2,
+                smooth=0.45,
+            )
+            if rec:
+                layers.append(rec)
+            if whisk_m is not None and int(np.asarray(whisk_m).sum()) > 8:
+                wrec = emit(
+                    whisk_m,
+                    palette[i],
+                    alphamax=1.333,
+                    opttol=0.08,
+                    turdsize=1,
+                    smooth=0.0,
+                )
+                if wrec:
+                    layers.append(wrec)
+            continue
+        else:
+            rec = emit(
+                mask,
+                palette[i],
+                alphamax=amax,
+                opttol=0.18 if kind == "logo" else 0.22,
+                turdsize=max(2, (speckle // 3 if noisy else speckle // 4)),
+                smooth=0.85 if (noisy and kind == "logo" and not keylined) else logo_smooth,
+            )
         if rec:
             layers.append(rec)
 
@@ -1807,6 +3032,7 @@ def vectorize(path: str, inches: float = 10.0, colors=None, mode: str = "auto"):
         "paper": paper_hex,
         "overlay": bool(overlay is not None),
         "rec_err": round(rec_err, 2),
+        "keyline": bool(keylined),
     }
     return svg, meta
 
