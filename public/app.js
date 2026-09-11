@@ -511,8 +511,9 @@ function palSelect(kind, palettes, currentHex) {
 }
 
 async function fillArt(el, job, shopControls) {
-  const pals = shopControls ? await loadPalettes() : { pantone: [], vinyl: [], thread: [], stone: [] };
+  const pals = shopControls ? await loadPalettes() : { pantone: [], vinyl: [], thread: [], stone: [], madeiraRayon: [], madeiraPolyneon: [] };
   const pantones = pals.pantone || [];
+  const madeira = (pals.madeiraRayon && pals.madeiraRayon.length) ? pals.madeiraRayon : (pals.thread || []);
   const layers = (job.vector && job.vector.layers) || [];
   const vzMeta = (job.vector && job.vector.meta) || {};
   const vzRecipe = vzMeta.recipe || vzMeta.engine || (job.vector && job.vector.source) || "";
@@ -539,9 +540,10 @@ async function fillArt(el, job, shopControls) {
         <span class="layer-sub muted">${escapeHtml((L.hex || "").toUpperCase())}</span>
       </div>
       <input type="color" class="layer-pick" value="${escapeHtml((L.hex || "#111111").slice(0, 7))}" title="Recolor" />
-      <select class="layer-pal" data-layer="${i}" title="Pantone">
-        <option value="">Pantone…</option>
-        ${pantones.map((c) => `<option value="${escapeHtml(c.hex)}" data-name="${escapeHtml(c.name)}" ${String(L.pantone||"")===String(c.name)?"selected":""}>${escapeHtml(c.name)}</option>`).join("")}
+      <select class="layer-pal" data-layer="${i}" title="Thread / Pantone">
+        <option value="">Thread / Pantone…</option>
+        <optgroup label="Madeira Rayon">${madeira.map((c) => `<option value="${escapeHtml(c.hex)}" data-name="${escapeHtml(c.name)}" ${String(L.pantone||L.thread||"")===String(c.name)?"selected":""}>${escapeHtml(c.code ? (c.code + " · " + c.name) : c.name)}</option>`).join("")}</optgroup>
+        <optgroup label="Pantone">${pantones.map((c) => `<option value="${escapeHtml(c.hex)}" data-name="${escapeHtml(c.name)}" ${String(L.pantone||"")===String(c.name)?"selected":""}>${escapeHtml(c.name)}</option>`).join("")}</optgroup>
       </select>
     </div>`).join("") || `<p class="muted">Click Vectorize after you drop art.</p>`;
   el.innerHTML = `
