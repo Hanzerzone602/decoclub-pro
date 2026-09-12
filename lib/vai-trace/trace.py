@@ -10,7 +10,11 @@ General pipeline (no per-artwork paste / no filename branches):
      Junk light-sheet mascots: Lanczos upsample + edge-preserve, then an
      even distance-field keyline (no JPEG stairs), muzzle ridges for
      whiskers, and assigned-dark specks folded away. White chests are fills.
-  4. Art / poster: vtracer spline on a size-capped flattened raster
+  4. Soft-flat AI/illustration (smooth shading, few semantic regions, many
+     unique gradient colors): k-means screenprint inks (8–16), snap the
+     raster, regularize cells, potrace plates. Raw vtracer invents thousands
+     of near-colors on ChatGPT/Grok Imagine art.
+  5. Art / poster: vtracer spline on a size-capped flattened raster
      (Lab plates turned busy illustrations into mush). Junk light-sheet
      soft cartoons stay on cleaned potrace flats (vtracer invents near-colors).
 
@@ -465,6 +469,416 @@ def snap_to_palette(rgb, paper, palette, paper_rgb, *, paper_win=1.08, despeckle
     for i, c in enumerate(palette):
         out[assign == i] = np.clip(np.round(c), 0, 255).astype(np.uint8)
     return out
+
+
+def mid_gradient_frac(rgb, paper) -> float:
+    """Share of figure pixels in the smooth-shading band (not flat, not a hard edge)."""
+    art = ~paper
+    if not art.any():
+        return 0.0
+    g = gradient_mag(rgb)[art]
+    return float(((g >= 10.0) & (g < 42.0)).mean())
+
+
+def cell_luma_p50(rgb, paper, cell: int = 8) -> float:
+    """Median 8×8 luma std on the figure. Low = smooth AI shading; high = JPEG dirt / busy texture."""
+    luma = luma_map(rgb)
+    h, w = luma.shape
+    vals = []
+    for y in range(0, h - cell + 1, cell):
+        for x in range(0, w - cell + 1, cell):
+            if float(paper[y : y + cell, x : x + cell].mean()) > 0.6:
+                continue
+            vals.append(float(luma[y : y + cell, x : x + cell].std()))
+    return float(np.median(vals)) if vals else 0.0
+
+
+def is_soft_flat_illustration(rgb, paper, paper_rgb) -> bool:
+    """ChatGPT/Grok Imagine (and similar) soft-flat art: smooth shading, few regions, many unique colors.
+
+    Not photos (high local texture), not busy posters, not few-color logos, not junk-JPEG mascots.
+    """
+    if lum(paper_rgb) < 190:
+        return False
+    art = ~paper
+    if float(art.mean()) < 0.10:
+        return False
+    nuniq = unique_color_bins(rgb, 3)
+    if nuniq < 1000:
+        return False
+    midg = mid_gradient_frac(rgb, paper)
+    if midg < 0.18:
+        return False
+    p50 = cell_luma_p50(rgb, paper)
+    if p50 > 16.0:
+        return False
+    return True
+
+
+def _sample_lab_pixels(pix: np.ndarray, n: int = 22000) -> np.ndarray:
+    if len(pix) <= n:
+        return pix
+    step = len(pix) / float(n)
+    idx = (np.arange(n) * step).astype(np.int64)
+    return pix[idx]
+
+
+def kmeans_screenprint_palette(rgb, paper, paper_rgb, *, max_k=12):
+    """Lab k-means on figure pixels → 8–16 intentional inks (not JPEG near-colors)."""
+    lab = to_lab(rgb)
+    art = ~paper
+    if int(art.sum()) < 80:
+        return []
+    pix = lab[art].reshape(-1, 3).astype(np.float32)
+    pix_s = _sample_lab_pixels(pix, 22000)
+    k = int(max(8, min(16, max_k)))
+    k = min(k, max(2, len(pix_s) // 40))
+    crit = (cv2.TERM_CRITERIA_EPS + cv2.TERM_CRITERIA_MAX_ITER, 40, 0.4)
+    _, _, centers = cv2.kmeans(pix_s, k, None, crit, 4, cv2.KMEANS_PP_CENTERS)
+    cents = np.clip(centers, 0, 255).astype(np.uint8).reshape(-1, 1, 3)
+    pal = cv2.cvtColor(cents, cv2.COLOR_LAB2RGB).reshape(-1, 3).astype(np.float32)
+    pal = _merge_near_inks(pal, thresh=16.0)
+    pal = _cap_hue_families(pal, rgb, paper, paper_rgb, max_per=2)
+    pal = _collapse_screenprint_neutrals(pal, paper_rgb)
+    luma = luma_map(rgb)
+    dark_frac = float((luma[art] < 42).mean()) if art.any() else 0.0
+    if dark_frac > 0.008 and not any(lum(c) < 48 for c in pal):
+        pal.append(np.array([0.0, 0.0, 0.0]))
+    return pal
+
+
+def _merge_near_inks(palette, thresh=16.0):
+    if len(palette) <= 2:
+        return list(palette)
+    labs = [lab_of_rgb([c])[0] for c in palette]
+    used = [False] * len(palette)
+    out = []
+    order = sorted(range(len(palette)), key=lambda i: -chroma_of_lab(labs[i]))
+    for i in order:
+        if used[i]:
+            continue
+        used[i] = True
+        group = [i]
+        for j in range(len(palette)):
+            if used[j]:
+                continue
+            dvec = labs[i] - labs[j]
+            dist = math.sqrt(float(np.dot(dvec, dvec)))
+            if dist > thresh:
+                continue
+            if chroma_of_lab(labs[i]) > 14 and chroma_of_lab(labs[j]) > 14:
+                dh = abs(hue_of_lab(labs[i]) - hue_of_lab(labs[j]))
+                dh = min(dh, 2 * math.pi - dh)
+                if dh > 0.32:
+                    continue
+            used[j] = True
+            group.append(j)
+        if min(lum(palette[g]) for g in group) < 48:
+            pick = min(group, key=lambda g: lum(palette[g]))
+        else:
+            pick = max(group, key=lambda g: chroma_of_lab(labs[g]))
+        out.append(np.asarray(palette[pick], dtype=np.float32))
+    return out
+
+
+def _cap_hue_families(palette, rgb, paper, paper_rgb, max_per=2):
+    """At most two inks per hue (fill + shadow). Stops shirt/fur camo from extra shades."""
+    if len(palette) <= max_per + 3:
+        return list(palette)
+    labs = [lab_of_rgb([c])[0] for c in palette]
+    assign, _ = assign_pixels(rgb, paper, palette, paper_rgb, paper_win=0.0)
+    counts = [int((assign == i).sum()) for i in range(len(palette))]
+    chroma_i = [i for i, c in enumerate(palette) if chroma_of_lab(labs[i]) >= 16 and lum(c) >= 40]
+    rest = [palette[i] for i in range(len(palette)) if i not in chroma_i]
+    used = set()
+    families = []
+    for i in chroma_i:
+        if i in used:
+            continue
+        fam = [i]
+        used.add(i)
+        for j in chroma_i:
+            if j in used:
+                continue
+            dh = abs(hue_of_lab(labs[i]) - hue_of_lab(labs[j]))
+            dh = min(dh, 2 * math.pi - dh)
+            if dh > 0.28:
+                continue
+            used.add(j)
+            fam.append(j)
+        families.append(fam)
+    out = list(rest)
+    for fam in families:
+        if len(fam) <= max_per:
+            out.extend(palette[i] for i in fam)
+            continue
+        # keep the largest fill and the darkest shadow
+        fill = max(fam, key=lambda i: counts[i])
+        dark = min(fam, key=lambda i: lum(palette[i]))
+        keep = [fill]
+        if dark != fill:
+            keep.append(dark)
+        else:
+            # second: next-most-populous
+            rest_f = [i for i in fam if i != fill]
+            if rest_f:
+                keep.append(max(rest_f, key=lambda i: counts[i]))
+        out.extend(palette[i] for i in keep[:max_per])
+    return out
+
+
+def _collapse_screenprint_neutrals(palette, paper_rgb):
+    """At most one black, one dark grey, one light grey, one near-white. Keep chroma."""
+    p_lab = lab_of_rgb([paper_rgb])[0]
+    blacks, lgreys, dgreys, whites, chroma = [], [], [], [], []
+    for c in palette:
+        c = np.asarray(c, dtype=np.float32)
+        la = lab_of_rgb([c])[0]
+        ch = chroma_of_lab(la)
+        L = lum(c)
+        d = math.sqrt(float(np.dot(la - p_lab, la - p_lab)))
+        if ch < 16 and L > 210 and d < 42:
+            whites.append(c)
+        elif ch < 18 and L < 42:
+            blacks.append(c)
+        elif ch < 18 and L > 155:
+            lgreys.append(c)
+        elif ch < 18:
+            dgreys.append(c)
+        else:
+            chroma.append(c)
+    out = list(chroma)
+    if blacks:
+        out.append(np.array([0.0, 0.0, 0.0], np.float32))
+    if dgreys:
+        out.append(min(dgreys, key=lum))
+    keep_lg = [c for c in lgreys if lum(c) < 200]
+    if keep_lg:
+        out.append(max(keep_lg, key=lum))
+    if whites:
+        out.append(max(whites, key=lum))
+    return out
+
+
+def regularize_assign(assign, palette, *, win=5, min_fill=70):
+    """Spatial cell fairing: majority labels, absorb tiny islands, keep thin dark keylines."""
+    h, w = assign.shape
+    k = len(palette)
+    if k < 1:
+        return assign
+    is_dark = np.array([lum(c) < 50 for c in palette], dtype=bool)
+    shifted = (assign + 1).clip(0, 255).astype(np.uint8)
+    med = cv2.medianBlur(shifted, win if win % 2 == 1 else win + 1)
+    out = med.astype(np.int16) - 1
+    # Restore dark keylines / whiskers / pupils eaten by the majority window.
+    for i, d in enumerate(is_dark):
+        if d:
+            out[assign == i] = i
+    # Absorb tiny non-dark islands into the neighbor majority.
+    for i in range(k):
+        if is_dark[i]:
+            continue
+        mask = (out == i).astype(np.uint8)
+        if int(mask.sum()) == 0:
+            continue
+        n, labels, stats, _ = cv2.connectedComponentsWithStats(mask, connectivity=4)
+        for li in range(1, n):
+            area = int(stats[li, cv2.CC_STAT_AREA])
+            if area >= min_fill:
+                continue
+            ys, xs = np.where(labels == li)
+            votes = np.zeros(k + 1, np.int32)
+            for dx, dy in ((1, 0), (-1, 0), (0, 1), (0, -1), (2, 0), (-2, 0), (0, 2), (0, -2)):
+                nx = np.clip(xs + dx, 0, w - 1)
+                ny = np.clip(ys + dy, 0, h - 1)
+                v = out[ny, nx]
+                votes[0] += int((v < 0).sum())
+                ok = v >= 0
+                if ok.any():
+                    votes[1:] += np.bincount(v[ok].astype(np.int32), minlength=k)
+            # Don't vote for ourselves
+            votes[i + 1] = 0
+            best = int(np.argmax(votes))
+            if votes[best] == 0:
+                continue
+            out[ys, xs] = -1 if best == 0 else (best - 1)
+    # Light close on chromatic fills so shirt/paw plates seal.
+    dark_m = np.zeros((h, w), np.uint8)
+    for i, d in enumerate(is_dark):
+        if d:
+            dark_m[out == i] = 1
+    ker = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (3, 3))
+    for i, c in enumerate(palette):
+        if is_dark[i]:
+            continue
+        m = (out == i).astype(np.uint8)
+        if int(m.sum()) < 40:
+            continue
+        m2 = cv2.morphologyEx(m, cv2.MORPH_CLOSE, ker, iterations=1)
+        m2[dark_m > 0] = 0
+        out[m2 > 0] = i
+    return out
+
+
+def flatten_soft_interiors(rgb, paper, grad=None):
+    """Mean-shift cells so AI gradients collapse to screenprint flats; keep ink edges."""
+    bgr = cv2.cvtColor(rgb, cv2.COLOR_RGB2BGR)
+    try:
+        ms = cv2.pyrMeanShiftFiltering(bgr, 14, 40)
+        out = cv2.cvtColor(ms, cv2.COLOR_BGR2RGB)
+    except Exception:
+        if grad is None:
+            grad = gradient_mag(rgb)
+        try:
+            bil = cv2.bilateralFilter(rgb, 9, 64, 64)
+        except Exception:
+            bil = cv2.medianBlur(rgb, 5)
+        out = rgb.copy()
+        out[grad < 40] = bil[grad < 40]
+    med = cv2.medianBlur(out, 3)
+    g2 = gradient_mag(out)
+    out[(g2 < 12) | paper] = med[(g2 < 12) | paper]
+    return out
+
+
+def fill_small_assign_holes(assign, palette, max_hole=120):
+    """Fill tiny interior holes (JPEG/AI distress specks) without merging separate pads."""
+    out = assign.copy()
+    h, w = assign.shape
+    for i, c in enumerate(palette):
+        if lum(c) < 50:
+            continue
+        m = (out == i).astype(np.uint8)
+        if int(m.sum()) < 24:
+            continue
+        inv = (1 - m).astype(np.uint8)
+        n, labels, stats, _ = cv2.connectedComponentsWithStats(inv, connectivity=4)
+        for li in range(1, n):
+            area = int(stats[li, cv2.CC_STAT_AREA])
+            if area <= 0 or area > max_hole:
+                continue
+            ys, xs = np.where(labels == li)
+            if (
+                (xs == 0).any()
+                or (ys == 0).any()
+                or (xs == w - 1).any()
+                or (ys == h - 1).any()
+            ):
+                continue
+            out[labels == li] = i
+    return out
+
+
+def absorb_internal_shadows(assign, palette):
+    """Shadow inks of a hue family that live inside the fill become the fill (paw pads, not stripes)."""
+    if len(palette) < 2:
+        return assign
+    labs = [lab_of_rgb([c])[0] for c in palette]
+    out = assign.copy()
+    used = set()
+    for i in range(len(palette)):
+        if i in used:
+            continue
+        if chroma_of_lab(labs[i]) < 16:
+            continue
+        fam = [i]
+        for j in range(len(palette)):
+            if j == i or j in used:
+                continue
+            if chroma_of_lab(labs[j]) < 16:
+                continue
+            dh = abs(hue_of_lab(labs[i]) - hue_of_lab(labs[j]))
+            dh = min(dh, 2 * math.pi - dh)
+            if dh > 0.28:
+                continue
+            fam.append(j)
+        if len(fam) < 2:
+            continue
+        for x in fam:
+            used.add(x)
+        fill_i = max(fam, key=lambda k: int((assign == k).sum()))
+        h, w = assign.shape
+        fill_m = (out == fill_i).astype(np.uint8)
+        if int(fill_m.sum()) < 80:
+            continue
+        dil = cv2.dilate(fill_m, cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5, 5)))
+        fill_n = int(fill_m.sum())
+        for sh in fam:
+            if sh == fill_i:
+                continue
+            if lum(palette[sh]) >= lum(palette[fill_i]) - 8:
+                continue
+            mask = (out == sh).astype(np.uint8)
+            n, labels, stats, _ = cv2.connectedComponentsWithStats(mask, connectivity=4)
+            if n <= 1:
+                continue
+            largest = max(int(stats[li, cv2.CC_STAT_AREA]) for li in range(1, n))
+            # No large shadow plate → gradient shading, not a stripe. Fold into fill.
+            if largest < 0.08 * fill_n:
+                out[out == sh] = fill_i
+                continue
+            for li in range(1, n):
+                area = int(stats[li, cv2.CC_STAT_AREA])
+                if area > 0.22 * fill_n:
+                    continue
+                ys, xs = np.where(labels == li)
+                # absorb if the island sits on/next to the fill (paw pad shadows)
+                if float(dil[ys, xs].mean()) < 0.28:
+                    continue
+                out[labels == li] = fill_i
+    return out
+
+
+def punch_border_strips(assign, *, thick_frac=0.03):
+    """Drop thin full-width (or full-height) frame bars that ride the sheet edge."""
+    h, w = assign.shape
+    out = assign.copy()
+    th = max(3, int(round(min(h, w) * thick_frac)))
+    # top / bottom
+    for sl in (slice(0, th), slice(h - th, h)):
+        band = out[sl, :]
+        if float((band >= 0).mean()) > 0.65 and float((band >= 0).mean()) > 0:
+            # only punch if the band is much inkier than the interior next to it
+            neigh = slice(th, min(h, th * 4)) if sl.start == 0 else slice(max(0, h - th * 4), h - th)
+            if float((out[neigh, :] >= 0).mean()) < 0.35:
+                out[sl, :] = -1
+    for sl in (slice(0, th), slice(w - th, w)):
+        band = out[:, sl]
+        if float((band >= 0).mean()) > 0.65:
+            neigh = slice(th, min(w, th * 4)) if sl.start == 0 else slice(max(0, w - th * 4), w - th)
+            if float((out[:, neigh] >= 0).mean()) < 0.35:
+                out[:, sl] = -1
+    return out
+
+
+def remap_svg_fills_to_palette(svg_text: str, palette, paper_rgb) -> str:
+    """Snap vtracer-invented near-colors back onto the screenprint inks."""
+    pal = [np.asarray(c, dtype=np.float32) for c in palette]
+    pal.append(np.asarray(paper_rgb, dtype=np.float32))
+    pal_labs = [lab_of_rgb([c])[0] for c in pal]
+    pal_hex = [to_hex(c) for c in pal]
+
+    def repl(m):
+        hx = m.group(1)
+        if len(hx) == 4:
+            hx = "#" + "".join(ch * 2 for ch in hx[1:])
+        try:
+            r = int(hx[1:3], 16)
+            g = int(hx[3:5], 16)
+            b = int(hx[5:7], 16)
+        except ValueError:
+            return m.group(0)
+        lab = lab_of_rgb([np.array([r, g, b], np.float32)])[0]
+        best_i, best_d = 0, 1e18
+        for i, la in enumerate(pal_labs):
+            dvec = lab - la
+            d = float(np.dot(dvec, dvec))
+            if d < best_d:
+                best_d = d
+                best_i = i
+        return f'fill="{pal_hex[best_i]}"'
+
+    return re.sub(r'fill="(#[0-9A-Fa-f]{3,8})"', repl, svg_text)
 
 
 def clean_fill_mask(mask, *, min_area=40, close_k=3, open_k=2):
@@ -2527,6 +2941,209 @@ def vectorize_vtracer(
     return svg, meta
 
 
+def _soft_flat_assign(work, paper_w, pal, paper_rgb):
+    assign, _ = assign_pixels(work, paper_w, pal, paper_rgb, paper_win=0.0)
+    assign = despeckle(assign, pal, min_size=6)
+    assign = fill_small_assign_holes(
+        assign, pal, max_hole=max(40, int(0.00012 * assign.size))
+    )
+    min_fill = max(36, int(0.00008 * assign.size))
+    assign = regularize_assign(assign, pal, win=3, min_fill=min_fill)
+    assign = absorb_internal_shadows(assign, pal)
+    assign = punch_border_strips(assign, thick_frac=0.028)
+    assign = despeckle(assign, pal, min_size=max(8, int(0.00003 * assign.size)))
+    return assign
+
+
+def compact_assign_palette(assign, pal):
+    """Drop inks with no pixels after absorb so remap cannot revive them."""
+    keep = []
+    remap = {}
+    for i, c in enumerate(pal):
+        if int((assign == i).sum()) < 12:
+            remap[i] = -1
+            continue
+        remap[i] = len(keep)
+        keep.append(c)
+    if not keep:
+        return assign, pal
+    out = np.full_like(assign, -1)
+    for i, j in remap.items():
+        if j >= 0:
+            out[assign == i] = j
+    return out, keep
+
+
+def _soft_flat_raster(assign, pal, paper_rgb):
+    out = np.full(
+        (assign.shape[0], assign.shape[1], 3),
+        np.clip(np.round(paper_rgb), 0, 255).astype(np.uint8),
+    )
+    for i, c in enumerate(pal):
+        out[assign == i] = np.clip(np.round(c), 0, 255).astype(np.uint8)
+    return out
+
+
+def vectorize_soft_flat(rgb, paper, paper_rgb, inches, kind, t0, h0, w0, rec_err):
+    """Snap smooth AI/illustration art to screenprint inks, then trace the snapped raster."""
+    work = flatten_soft_interiors(rgb, paper)
+    h, w = work.shape[:2]
+    cap = 900
+    if max(h, w) > cap:
+        s = cap / float(max(h, w))
+        work = cv2.resize(
+            work,
+            (int(round(w * s)), int(round(h * s))),
+            interpolation=cv2.INTER_AREA,
+        )
+        paper = cv2.resize(
+            paper.astype(np.uint8),
+            (work.shape[1], work.shape[0]),
+            interpolation=cv2.INTER_NEAREST,
+        ) > 0
+        h, w = work.shape[:2]
+    paper_w = paper
+    pal = kmeans_screenprint_palette(work, paper_w, paper_rgb, max_k=12)
+    if not pal:
+        pal = [np.array([20.0, 20.0, 20.0])]
+    pal = drop_paper_inks(pal, paper_rgb, thresh=10.0)
+    if not pal:
+        pal = [np.array([20.0, 20.0, 20.0])]
+
+    assign = _soft_flat_assign(work, paper_w, pal, paper_rgb)
+    assign, pal = compact_assign_palette(assign, pal)
+    snapped = _soft_flat_raster(assign, pal, paper_rgb)
+
+    if w0 >= h0:
+        width_in = float(inches)
+        height_in = float(inches) * (h0 / float(w0))
+    else:
+        height_in = float(inches)
+        width_in = float(inches) * (w0 / float(h0))
+
+    # Prefer spline trace of the *snapped* raster (not raw gradients).
+    try:
+        settings = {
+            "mode": "spline",
+            "hierarchical": "stacked",
+            "filter_speckle": "4",
+            "color_precision": "8",
+            "gradient_step": "64",
+            "corner_threshold": "55",
+            "path_precision": "2",
+        }
+        tmp = tempfile.mkdtemp(prefix="sflat-")
+        try:
+            png_p = os.path.join(tmp, "in.png")
+            svg_p = os.path.join(tmp, "out.svg")
+            Image.fromarray(snapped).save(png_p)
+            run_vtracer(png_p, svg_p, settings)
+            raw = open(svg_p, encoding="utf-8").read()
+        finally:
+            try:
+                for fn in os.listdir(tmp):
+                    os.remove(os.path.join(tmp, fn))
+                os.rmdir(tmp)
+            except Exception:
+                pass
+        svg, n_paths, vpal = wrap_vtracer_svg(raw, width_in, height_in)
+        svg = remap_svg_fills_to_palette(svg, pal, paper_rgb)
+        fills = re.findall(r'fill="(#[0-9A-Fa-f]{3,8})"', svg)
+        n_paths = len(re.findall(r"<path\b", svg, re.I))
+        pal_out = []
+        seen = set()
+        for f in fills:
+            u = f.upper()
+            if u not in seen:
+                seen.add(u)
+                pal_out.append(u)
+        meta = {
+            "engine": "decoclub-vector",
+            "backend": "vtracer",
+            "mode": kind,
+            "paths": n_paths,
+            "colors": len(pal_out),
+            "palette": pal_out[:24],
+            "pixel": [w0, h0],
+            "work": [w, h],
+            "up": 1,
+            "inches": [width_in, height_in],
+            "ms": int((time.time() - t0) * 1000),
+            "paper": to_hex(paper_rgb),
+            "overlay": False,
+            "rec_err": round(float(rec_err), 2),
+            "vtracer": settings,
+            "soft_flat": True,
+            "keyline": False,
+        }
+        return svg, meta
+    except Exception:
+        pass
+
+    # Potrace plates on nearest-upsampled hard cells.
+    up = 2 if max(h, w) < 1100 else 1
+    if up > 1:
+        assign_u = cv2.resize(
+            assign.astype(np.int16),
+            (w * up, h * up),
+            interpolation=cv2.INTER_NEAREST,
+        )
+    else:
+        assign_u = assign
+    sx = width_in / assign_u.shape[1]
+    sy = height_in / assign_u.shape[0]
+    layers = []
+    order = list(range(len(pal)))
+    order.sort(key=lambda i: (-lum(pal[i]), -int((assign_u == i).sum())))
+    for i in order:
+        mask = (assign_u == i).astype(np.uint8)
+        if int(mask.sum()) < 16:
+            continue
+        is_dark = lum(pal[i]) < 50
+        paths = potrace_paths(
+            mask,
+            sx,
+            sy,
+            scale=1,
+            alphamax=1.333 if is_dark else 1.0,
+            opttol=0.14 if is_dark else 0.22,
+            turdsize=1 if is_dark else 4,
+            smooth=0.15 if is_dark else 0.22,
+        )
+        if not paths:
+            continue
+        layers.append(
+            {
+                "hex": to_hex(pal[i]),
+                "name": layer_name(pal[i]),
+                "paths": paths,
+                "lum": lum(pal[i]),
+                "n": int(mask.sum()),
+            }
+        )
+    svg = svg_from_layers(layers, width_in, height_in, to_hex(paper_rgb))
+    n_paths = sum(len(L["paths"]) for L in layers)
+    meta = {
+        "engine": "decoclub-vector",
+        "backend": "potrace",
+        "mode": kind,
+        "paths": n_paths,
+        "colors": len(layers),
+        "palette": [to_hex(c) for c in pal],
+        "pixel": [w0, h0],
+        "work": [w, h],
+        "up": up,
+        "inches": [width_in, height_in],
+        "ms": int((time.time() - t0) * 1000),
+        "paper": to_hex(paper_rgb),
+        "overlay": False,
+        "rec_err": round(float(rec_err), 2),
+        "soft_flat": True,
+        "keyline": False,
+    }
+    return svg, meta
+
+
 # ---------------------------------------------------------------------------
 # Main
 # ---------------------------------------------------------------------------
@@ -2661,9 +3278,26 @@ def vectorize(path: str, inches: float = 10.0, colors=None, mode: str = "auto"):
         )
         grad_f = gradient_mag(rgb_full)
         noisy_f = noisy
+        # Detect on the flattened original. Denoise collapses unique-color count
+        # and would miss smooth AI gradients.
+        soft_flat = is_soft_flat_illustration(rgb_full, paper_f, paper_rgb_f)
         rgb_full = denoise_jpeg(rgb_full, paper_f, grad_f, force=noisy_f)
         grad_f = gradient_mag(rgb_full)
         rgb_full, paper_f = punch_sheet_dirt(rgb_full, paper_f, paper_rgb_f, grad=grad_f)
+        # Soft-flat AI/illustration: snap to 8–16 inks then potrace. Must run
+        # before raw vtracer (which invents thousands of near-colors on gradients).
+        if soft_flat:
+            return vectorize_soft_flat(
+                rgb_full,
+                paper_f,
+                paper_rgb_f,
+                inches,
+                kind,
+                t0,
+                h0,
+                w0,
+                rec_err,
+            )
         if noisy_f and lum(paper_rgb_f) >= 200:
             pal_f = list(palette)
             if len(pal_f) < 3 or len(pal_f) > 12:
