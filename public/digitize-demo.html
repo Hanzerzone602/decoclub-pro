@@ -1,0 +1,203 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Digitize preview · DecoClub Pro</title>
+  <style>
+    :root { --bg:#0f141c; --panel:#171e29; --line:#2a3648; --ink:#e8eef6; --muted:#8a97a8; --gold:#3b82f6; }
+    * { box-sizing: border-box; }
+    body { margin:0; font-family:"IBM Plex Sans", system-ui, sans-serif; background:var(--bg); color:var(--ink); }
+    .wrap { display:grid; grid-template-columns: 1fr 340px; min-height:100vh; }
+    canvas { width:100%; height:100vh; display:block; background:#10141c; }
+    aside { border-left:1px solid var(--line); padding:18px; overflow:auto; background:var(--panel); }
+    h1 { font-size:18px; margin:0 0 6px; }
+    p { color:var(--muted); font-size:13px; line-height:1.45; }
+    label { display:block; font-size:11px; letter-spacing:.08em; text-transform:uppercase; color:var(--muted); margin:14px 0 6px; }
+    input[type=range] { width:100%; }
+    select, button, input[type=file] { width:100%; padding:8px 10px; background:#10141c; color:var(--ink); border:1px solid var(--line); }
+    button { background:var(--gold); border-color:var(--gold); font-weight:700; cursor:pointer; margin-top:10px; color:#fff; }
+    button.ghost { background:transparent; color:var(--ink); }
+    .row { display:flex; gap:8px; }
+    .row button { flex:1; }
+    .stat { font-variant-numeric: tabular-nums; font-size:22px; font-weight:700; color:var(--ink); }
+    .swatch { display:flex; gap:8px; align-items:center; margin-top:8px; }
+    .swatch i { width:22px; height:22px; display:block; border:1px solid var(--line); }
+    .note { font-size:12px; border:1px solid var(--line); padding:10px; margin-top:16px; }
+    .drop { border:1px dashed var(--line); padding:12px; text-align:center; color:var(--muted); font-size:12px; margin-top:8px; }
+    .drop.hot { border-color:var(--gold); color:var(--ink); }
+    @media (max-width: 800px) { .wrap { grid-template-columns:1fr; } canvas { height:55vh; } }
+  </style>
+</head>
+<body>
+  <div class="wrap">
+    <canvas id="view"></canvas>
+    <aside>
+      <h1>Digitize · thread preview</h1>
+      <p>Drop any logo. Vectorize → object IR → stitches. Orbit the hoop. Stitch player + fabric. Not Wilcom TrueView — thread tubes + sheen.</p>
+      <div class="stat" id="count">— stitches</div>
+      <p id="meta">—</p>
+      <label>Art</label>
+      <select id="art">
+        <option value="tony">tony-test.jpg (junk JPEG mascot)</option>
+        <option value="purple-paw">purple-paw-tiger.png (Imagine art)</option>
+        <option value="bee" selected>bee-soft.png (clean logo)</option>
+        <option value="bee-desktop">bee-test-desktop.png</option>
+        <option value="puma">puma-test.jpg</option>
+        <option value="carpenters">carpenters.png</option>
+        <option value="tiger">tiger-test.png</option>
+        <option value="drop">Dropped file</option>
+        <option value="diagonal">Synthetic: diagonal satin</option>
+        <option value="square">Synthetic: tatami square</option>
+        <option value="letter">Synthetic: letter I</option>
+      </select>
+      <div class="drop" id="drop">Drop PNG/JPG here — any art, same as Vectorize</div>
+      <input id="file" type="file" accept="image/png,image/jpeg,image/webp,image/svg+xml" />
+      <label>Fabric</label>
+      <select id="fabric">
+        <option value="knit" selected>Knit / jersey</option>
+        <option value="woven">Woven / poplin</option>
+        <option value="twill">Twill / chino</option>
+        <option value="pique">Pique / polo</option>
+        <option value="fleece">Fleece / sweat</option>
+        <option value="cap">Cap front</option>
+      </select>
+      <label>Width (in) <span id="wRead">3.00</span></label>
+      <input id="width" type="range" min="0.4" max="6" step="0.05" value="3" />
+      <label>Height (in) <span id="hRead">3.00</span></label>
+      <input id="height" type="range" min="0.4" max="6" step="0.05" value="3" />
+      <label><input id="lock" type="checkbox" checked /> Lock aspect</label>
+      <label>Density mm <span id="dRead">0.40</span></label>
+      <input id="density" type="range" min="0.22" max="0.7" step="0.02" value="0.40" />
+      <label>Madeira thread</label>
+      <select id="thread"></select>
+      <div class="swatch"><i id="chip"></i><span id="threadName">—</span></div>
+      <label>Stitch player <span id="pRead">100%</span></label>
+      <input id="player" type="range" min="0" max="100" step="1" value="100" />
+      <div class="row">
+        <button type="button" class="ghost" id="play">Play</button>
+        <button type="button" class="ghost" id="pause">Pause</button>
+      </div>
+      <button type="button" id="dst">Download DST</button>
+      <div class="note">On-screen match, not a certified spool. Resize restitches (density held in mm). Thread swap recolors only. Real art uses the Vectorize engine — no filename special-cases.</div>
+    </aside>
+  </div>
+  <script src="/digitize-preview.js"></script>
+  <script>
+    const $ = (s) => document.querySelector(s);
+    let view = null, payload = null, timer = 0, aspect = 1, dropped = null;
+    const MADEIRA = [
+      { code:"1166", name:"Royal", hex:"#1e4482" },
+      { code:"1242", name:"Blue Ink", hex:"#233d5b" },
+      { code:"1037", name:"Tuxedo Red", hex:"#be1422" },
+      { code:"1146", name:"Saffron", hex:"#d42727" },
+      { code:"1000", name:"Black", hex:"#28292a" },
+      { code:"1001", name:"Bright White", hex:"#e3e5fb" },
+      { code:"1051", name:"Kelly", hex:"#008745" },
+    ];
+    MADEIRA.forEach((m) => {
+      const o = document.createElement("option");
+      o.value = m.hex; o.textContent = m.code + " · " + m.name;
+      $("#thread").appendChild(o);
+    });
+    function restitch() {
+      const widthIn = Number($("#width").value);
+      const heightIn = Number($("#height").value);
+      const density = Number($("#density").value);
+      $("#wRead").textContent = widthIn.toFixed(2);
+      $("#hRead").textContent = heightIn.toFixed(2);
+      $("#dRead").textContent = density.toFixed(2);
+      $("#meta").textContent = "Digitizing…";
+      const body = {
+        art: $("#art").value,
+        widthIn: widthIn,
+        heightIn: heightIn,
+        density: density,
+        fabric: $("#fabric").value,
+      };
+      if (dropped) body.imageBase64 = dropped;
+      fetch("/api/digitize-demo", { method:"POST", headers:{ "Content-Type":"application/json" }, body: JSON.stringify(body) })
+        .then((r) => r.json())
+        .then((data) => {
+          if (data.error) { $("#meta").textContent = data.error; return; }
+          payload = data.preview;
+          payload._dst = data.dstBase64;
+          $("#count").textContent = Number(data.stitchCount).toLocaleString() + " stitches";
+          const types = (data.objects || []).map((o) => o.type);
+          const uniq = [];
+          types.forEach((t) => { if (uniq.indexOf(t) < 0) uniq.push(t); });
+          $("#meta").textContent = (data.vectorLayers || types.length) + " layers · " +
+            uniq.join("+") + " × " + types.length + " objs · " + (data.exporter || "") +
+            (data.usedFallback ? " · FALLBACK" : "") +
+            (data.fabric ? " · " + data.fabric : "") +
+            (data.colorStops && data.colorStops[0] ? " · " + data.colorStops[0].madeiraCode + " " + data.colorStops[0].name : "");
+          if (data.colorStops && data.colorStops[0]) {
+            $("#thread").value = data.colorStops[0].hex;
+            $("#chip").style.background = data.colorStops[0].hex;
+            $("#threadName").textContent = (data.colorStops[0].madeiraCode || "") + " " + (data.colorStops[0].name || "");
+          }
+          if (!view) view = DigitizePreview.mount($("#view"), payload);
+          else view.setPayload(payload);
+          view.setPlayhead(Number($("#player").value) / 100);
+        })
+        .catch((e) => { $("#meta").textContent = String(e.message || e); });
+    }
+    function debounce() { clearTimeout(timer); timer = setTimeout(restitch, 220); }
+    $("#width").oninput = () => {
+      if ($("#lock").checked) { $("#height").value = (Number($("#width").value) / aspect).toFixed(2); }
+      debounce();
+    };
+    $("#height").oninput = () => {
+      if ($("#lock").checked) { $("#width").value = (Number($("#height").value) * aspect).toFixed(2); }
+      debounce();
+    };
+    $("#density").oninput = debounce;
+    $("#fabric").onchange = restitch;
+    $("#art").onchange = () => { dropped = null; aspect = 1; restitch(); };
+    $("#thread").onchange = () => {
+      const hex = $("#thread").value;
+      const m = MADEIRA.find((x) => x.hex === hex) || { hex: hex, name: "Custom", code: "" };
+      $("#chip").style.background = hex;
+      $("#threadName").textContent = m.code + " " + m.name;
+      if (payload && view) {
+        payload.threads = (payload.threads || []).map((t, i) => i === 0 ? Object.assign({}, t, { hex: hex, code: m.code, name: m.name }) : t);
+        view.recolor(payload.threads);
+      }
+    };
+    $("#player").oninput = () => {
+      const t = Number($("#player").value) / 100;
+      $("#pRead").textContent = Math.round(t * 100) + "%";
+      if (view) view.setPlayhead(t);
+    };
+    $("#play").onclick = () => { if (view) { view.play(0.18); } };
+    $("#pause").onclick = () => { if (view) view.pause(); };
+    $("#dst").onclick = () => {
+      if (!payload || !payload._dst) return;
+      const bin = Uint8Array.from(atob(payload._dst), (c) => c.charCodeAt(0));
+      const blob = new Blob([bin], { type: "application/octet-stream" });
+      const a = document.createElement("a");
+      a.href = URL.createObjectURL(blob);
+      a.download = "decoclub-digitize.dst";
+      a.click();
+    };
+    function takeFile(file) {
+      const reader = new FileReader();
+      reader.onload = () => {
+        dropped = String(reader.result).split(",")[1];
+        $("#art").value = "drop";
+        restitch();
+      };
+      reader.readAsDataURL(file);
+    }
+    $("#file").onchange = () => { if ($("#file").files[0]) takeFile($("#file").files[0]); };
+    const drop = $("#drop");
+    drop.addEventListener("dragover", (e) => { e.preventDefault(); drop.classList.add("hot"); });
+    drop.addEventListener("dragleave", () => drop.classList.remove("hot"));
+    drop.addEventListener("drop", (e) => {
+      e.preventDefault(); drop.classList.remove("hot");
+      if (e.dataTransfer.files[0]) takeFile(e.dataTransfer.files[0]);
+    });
+    restitch();
+  </script>
+</body>
+</html>

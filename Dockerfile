@@ -17,6 +17,8 @@ COPY . .
 
 ENV PATH="/venv/bin:${PATH}"
 ENV INVENT_WARP_PYTHON=/venv/bin/python3
+ENV DIGITIZE_PYTHON=/venv/bin/python3
+ENV DIGITIZE_EXPORTER=pyembroidery
 
 EXPOSE 3000
 CMD ["node", "server.js"]
