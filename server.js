@@ -1300,11 +1300,38 @@ async function handleApi(req, res, url) {
     const job = db.jobs.find(function (j) { return j.id === digPath[1] && j.shop_id === user.shop_id; });
     if (!job) return json(res, 404, { error: "Job not found" });
     const body = parseJsonBody(await readBody(req));
-    const dig = digitizeJob(job, UPLOADS, { satinMm: body.satinMm, density: body.density });
+    if (body.widthIn != null || body.width_in != null) job.width_in = Number(body.widthIn || body.width_in);
+    if (body.heightIn != null || body.height_in != null) job.height_in = Number(body.heightIn || body.height_in);
+    const dig = digitizeJob(job, UPLOADS, {
+      satinMm: body.satinMm,
+      satinSpacingMm: body.satinSpacingMm,
+      density: body.density,
+      widthIn: job.width_in,
+      heightIn: job.height_in,
+      threads: body.threads,
+      typeOverrides: body.typeOverrides,
+      previewOnly: !!body.previewOnly,
+      recolorOnly: !!body.recolorOnly,
+      angleDeg: body.angleDeg,
+      madeiraCatalog: body.madeiraCatalog,
+      fabric: body.fabric,
+    });
     job.stitchCount = dig.stitchCount;
     job.colorStops = dig.colorStops;
-    event(db, job, "Digitized · " + dig.stitchCount + " stitches"); save(db);
-    return json(res, 200, { job: presentJob(job, req), stitchCount: dig.stitchCount, colorStops: dig.colorStops });
+    if (dig.objects) job.digitizeObjects = dig.objects;
+    if (dig.exporter) job.digitizeExporter = dig.exporter;
+    event(db, job, dig.recolored ? ("Thread swap · " + (dig.colorStops[0] && dig.colorStops[0].madeiraCode || "Madeira")) : ("Digitized · " + dig.stitchCount + " stitches"));
+    save(db);
+    return json(res, 200, {
+      job: presentJob(job, req),
+      stitchCount: dig.stitchCount,
+      colorStops: dig.colorStops,
+      preview: dig.preview,
+      objects: dig.objects,
+      exporter: dig.exporter,
+      usedFallback: !!dig.usedFallback,
+      fabric: dig.fabric || body.fabric || null,
+    });
   }
 
   const poster = pth.match(/^\/api\/export\/([^/]+)\/intake-poster.svg$/);
