@@ -14,7 +14,13 @@ General pipeline (no per-artwork paste / no filename branches):
      unique gradient colors): k-means screenprint inks (8–16), snap the
      raster, regularize cells, potrace plates. Raw vtracer invents thousands
      of near-colors on ChatGPT/Grok Imagine art.
-  5. Art / poster: vtracer spline on a size-capped flattened raster
+  5. Plate posters (Canva / screenprint / already-quantized JPEGs): many AA
+     unique colors but locally flat cells, including dark sheets. Hierarchical
+     flats palette (8–20 inks), snap, potrace plates. Dark glyphs with a
+     chromatic halo are corner-traced on top. A circular stroke frame plus a
+     grey-shifted interior becomes a translucent overlay with even-width
+     keyline (tooth walls / sockets), not 400-color vtracer mush.
+  6. Art / poster: vtracer spline on a size-capped flattened raster
      (Lab plates turned busy illustrations into mush). Junk light-sheet
      soft cartoons stay on cleaned potrace flats (vtracer invents near-colors).
 
@@ -518,6 +524,26 @@ def is_soft_flat_illustration(rgb, paper, paper_rgb) -> bool:
         return False
     p50 = cell_luma_p50(rgb, paper)
     if p50 > 16.0:
+        return False
+    return True
+
+
+def is_plate_poster(rgb, paper, paper_rgb) -> bool:
+    """Canva / screenprint plates: many AA colors, locally flat cells.
+
+    Dark sheets allowed (union badges). Distinct from Imagine soft-flat
+    (smooth mid-gradient shading — that path already matches
+    is_soft_flat_illustration) and from fur/photos (high 8×8 luma std).
+    Few-color logos never reach this gate (classified first).
+    """
+    art = ~paper
+    if float(art.mean()) < 0.08:
+        return False
+    nuniq = unique_color_bins(rgb, 3)
+    if nuniq < 900:
+        return False
+    p50 = cell_luma_p50(rgb, paper)
+    if p50 > 14.0:
         return False
     return True
 
@@ -1992,6 +2018,7 @@ def vector_graph_layers(
     try_primitives=True,
     min_area_px=12,
     gap_fill=True,
+    destair_leg: float = 6.0,
 ):
     """
     Path-level Vector Graph: one Schneider fit per shared crack, loops reuse it.
@@ -2014,7 +2041,7 @@ def vector_graph_layers(
         pts = list(c.get("pts") or [])
         closed0 = len(pts) >= 4 and _qkey_pt(pts[0]) == _qkey_pt(pts[-1])
         if len(pts) >= 4:
-            pts = Gpre["destaircase"](pts, max_leg=6.0, closed=closed0)
+            pts = Gpre["destaircase"](pts, max_leg=float(destair_leg), closed=closed0)
             if closed0:
                 if len(pts) >= 3 and _qkey_pt(pts[0]) != _qkey_pt(pts[-1]):
                     pts = list(pts) + [pts[0]]
@@ -2273,7 +2300,7 @@ def svg_from_layers_with_gaps(
     ]
     if paper_hex:
         parts.append(
-            f'  <rect x="0" y="0" width="{w}" height="{h}" fill="{paper_hex}" data-name="paper-underlay"/>'
+            f'  <path d="M 0 0 L {w} 0 L {w} {h} L 0 {h} Z" fill="{paper_hex}" data-name="paper-underlay"/>'
         )
     if gap_strokes:
         parts.append('  <g fill="none" stroke-linejoin="round" stroke-linecap="round" data-name="gap-filler">')
@@ -3837,6 +3864,126 @@ def recolor_palette(rgb, assign, palette, grad=None):
 # Overlay (translucent grey veil sitting on many hues) + olive keyline
 # ---------------------------------------------------------------------------
 
+def _even_width_strokes(mask, max_half=5.5):
+    """Skeleton + constant-width dilate; punch original holes so windows stay open.
+
+    Used for poster keylines (tooth walls, sockets, circular frames). A raw
+    blob-with-holes skeleton without punching fills the windows.
+    """
+    m = (mask > 0).astype(np.uint8)
+    if int(m.sum()) < 30:
+        return m
+    dist = cv2.distanceTransform(m, cv2.DIST_L2, 3)
+    on = m > 0
+    half = float(np.median(dist[on]))
+    half = float(np.clip(half, 1.2, max_half))
+    skel = _morph_skeleton(m)
+    if int(skel.sum()) < 16:
+        return m
+    k = 2 * int(round(half)) + 1
+    even = cv2.dilate(skel, cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (k, k)))
+    inv = (m == 0).astype(np.uint8)
+    n, lab, st, _ = cv2.connectedComponentsWithStats(inv, 4)
+    hh, ww = m.shape
+    for i in range(1, n):
+        x, y, bw, bh, aa = (
+            int(st[i, cv2.CC_STAT_LEFT]),
+            int(st[i, cv2.CC_STAT_TOP]),
+            int(st[i, cv2.CC_STAT_WIDTH]),
+            int(st[i, cv2.CC_STAT_HEIGHT]),
+            int(st[i, cv2.CC_STAT_AREA]),
+        )
+        if x <= 0 or y <= 0 or (x + bw) >= ww or (y + bh) >= hh:
+            continue
+        if aa < 4:
+            continue
+        even[lab == i] = 0
+    even = cv2.bitwise_and(even, cv2.dilate(m, np.ones((3, 3), np.uint8)))
+    return even
+
+
+def _thin_olive_strokes(rgb, paper):
+    """Thin olive/gold-brown strokes (badge keylines), not thick landscape fills."""
+    luma = luma_map(rgb)
+    lab = to_lab(rgb)
+    ch = chroma_map(lab)
+    art = ~paper
+    la, lb = lab[:, :, 1], lab[:, :, 2]
+    olive = (
+        art
+        & (luma > 40)
+        & (luma < 180)
+        & (ch > 10)
+        & (ch < 70)
+        & (lb > 126)
+        & (la > 106)
+        & (la < 156)
+    )
+    bone = olive.astype(np.uint8)
+    dist = cv2.distanceTransform(bone, cv2.DIST_L2, 3)
+    thin = bone.copy()
+    thin[dist > 7.0] = 0
+    thin = cv2.morphologyEx(thin, cv2.MORPH_CLOSE, np.ones((3, 3), np.uint8), 1)
+    return thin
+
+
+def _destair_glyph_paths(paths):
+    """Keep gothic terminals: destair 1px jogs, corner-preserving cubics."""
+    if not paths:
+        return paths
+    try:
+        from geom import sample_path_d, destaircase, path_from_ring, clean_ring, ring_bbox
+    except Exception:
+        try:
+            from lib.geom import (
+                sample_path_d,
+                destaircase,
+                path_from_ring,
+                clean_ring,
+                ring_bbox,
+            )
+        except Exception:
+            return paths
+    out = []
+    for d in paths:
+        rings = sample_path_d(d, curve_samples=3)
+        if not rings:
+            out.append(d)
+            continue
+        all_pts = [pt for ring in rings for pt in ring]
+        if len(all_pts) < 3:
+            out.append(d)
+            continue
+        minx, miny, maxx, maxy = ring_bbox(all_pts)
+        diag = math.hypot(maxx - minx, maxy - miny) or 1.0
+        scale_up = (80.0 / diag) if diag < 40.0 else 1.0
+        parts = []
+        ok = True
+        for ring in rings:
+            ring = clean_ring(ring, 0.02 if diag < 40 else 0.12)
+            if len(ring) < 4:
+                continue
+            work = (
+                [(p[0] * scale_up, p[1] * scale_up) for p in ring]
+                if scale_up != 1.0
+                else list(ring)
+            )
+            faired = destaircase(work, max_leg=2.4, closed=True)
+            if len(faired) < 3:
+                ok = False
+                break
+            if scale_up != 1.0:
+                faired = [(p[0] / scale_up, p[1] / scale_up) for p in faired]
+            # Polygon only — cubic fit rounds gothic terminals into blobs.
+            pd = f"M {fmt(faired[0][0])} {fmt(faired[0][1])}"
+            for p in faired[1:]:
+                pd += f" L {fmt(p[0])} {fmt(p[1])}"
+            pd += " Z"
+            parts.append(pd)
+        out.append(" ".join(parts) if ok and parts else d)
+    return out
+
+
 def extract_overlay(rgb, paper, grad):
     """Grey veil on multi-hue art (poster skull, etc.). Tiger-safe: fur has low hue diversity."""
     h, w = rgb.shape[:2]
@@ -3848,83 +3995,172 @@ def extract_overlay(rgb, paper, grad):
     lab = to_lab(rgb)
     ch = chroma_map(lab)
     luma = luma_map(rgb)
-    seed = art & (ch < 26) & (luma > 78) & (luma < 198)
-    mask = seed.astype(np.uint8)
-    n, labels, stats, _ = cv2.connectedComponentsWithStats(mask, connectivity=8)
-    keep = np.zeros((h, w), np.uint8)
-    k7 = np.ones((7, 7), np.uint8)
-    hue = np.arctan2(lab[:, :, 2] - 128.0, lab[:, :, 1] - 128.0)
-    scores = []
-    for i in range(1, n):
-        area = int(stats[i, cv2.CC_STAT_AREA])
-        if area < 250 or area > 0.35 * h * w:
-            continue
-        comp = (labels == i).astype(np.uint8)
-        dist = cv2.distanceTransform(comp, cv2.DIST_L2, 3)
-        med_t = float(np.median(dist[comp > 0])) if area else 0.0
-        if med_t < 2.2:
-            continue
-        dil = cv2.dilate(comp, k7)
-        ring = (dil > 0) & (comp == 0) & art
-        if int(ring.sum()) < 40:
-            continue
-        nch = float(ch[ring].mean())
-        if nch < 14:
-            continue
-        # Hue diversity of neighbors — overlay sits on sunset+trees+water
-        rh = hue[ring]
-        # wrap-safe bins
-        bins = np.unique(np.round(rh * 4).astype(np.int32))
-        if bins.size < 4:
-            continue
-        scores.append((area * (1.0 + med_t / 6.0), i, area))
-    if not scores:
-        return None
-    scores.sort(reverse=True)
-    if scores[0][2] < 0.012 * int(art.sum()):
-        return None
-    keep[labels == scores[0][1]] = 1
-    hull = cv2.dilate(keep, cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (81, 81)))
-    for _sc, i, a in scores[1:]:
-        piece = labels == i
-        if np.any(hull[piece]):
-            keep[piece] = 1
-    frac = float(keep.sum()) / max(int(art.sum()), 1)
-    if frac < 0.012 or frac > 0.38:
-        return None
-    # Punch chromatic windows (sockets, landscape showing through)
-    on = keep > 0
-    punch = on & (ch > 38) & (luma > 70)
-    keep[punch] = 0
-    bright = on & (luma > 215)
-    keep[bright] = 0
-    # Olive/gold thin keyline near the veil
-    la, lb = lab[:, :, 1], lab[:, :, 2]
-    orange_halo = (
-        (rgb[:, :, 0] > 200)
-        & (rgb[:, :, 1] > 90)
-        & (rgb[:, :, 1] < 190)
-        & (rgb[:, :, 2] < 120)
-        & ((rgb[:, :, 0].astype(np.int16) - rgb[:, :, 2]) > 80)
-    )
-    olive = (
-        art
-        & (luma > 40)
-        & (luma < 175)
-        & (ch > 12)
-        & (ch < 62)
-        & (lb > 128)
-        & (la > 110)
-        & (la < 152)
-        & ~orange_halo
-    )
-    bone = olive.astype(np.uint8)
-    distb = cv2.distanceTransform(bone, cv2.DIST_L2, 3)
-    thin = bone.copy()
-    thin[distb > 6.5] = 0
-    near = cv2.dilate(keep, cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (55, 55)))
-    key = ((thin > 0) & (near > 0)).astype(np.uint8)
-    key = cv2.morphologyEx(key, cv2.MORPH_CLOSE, np.ones((3, 3), np.uint8), 2)
+    keep = None
+    key = np.zeros((h, w), np.uint8)
+    thin = _thin_olive_strokes(rgb, paper)
+    # Circular stroke frame + grey-shifted interior = overlay hull.
+    # Tiger fur scores high ring-mass on edge circles but low interior grey.
+    if int(thin.sum()) >= 400:
+        blur = cv2.GaussianBlur((thin * 255).astype(np.uint8), (5, 5), 0)
+        min_r = int(0.10 * min(h, w))
+        max_r = int(0.36 * min(h, w))
+        circles = None
+        try:
+            circles = cv2.HoughCircles(
+                blur,
+                cv2.HOUGH_GRADIENT,
+                dp=1.2,
+                minDist=int(0.18 * min(h, w)),
+                param1=80,
+                param2=22,
+                minRadius=min_r,
+                maxRadius=max_r,
+            )
+        except Exception:
+            circles = None
+        if circles is not None:
+            yy, xx = np.ogrid[:h, :w]
+            best = None
+            for c in circles[0]:
+                cx, cy, rad = float(c[0]), float(c[1]), float(c[2])
+                if rad < min_r or rad > max_r:
+                    continue
+                ring = np.abs(np.hypot(xx - cx, yy - cy) - rad) <= max(4.0, 0.03 * rad)
+                ring &= art
+                if int(ring.sum()) < 40:
+                    continue
+                cov = float(thin[ring].mean())
+                interior = np.hypot(xx - cx, yy - cy) <= rad
+                art_in = interior & art
+                if int(art_in.sum()) < 800:
+                    continue
+                ov = art_in & (luma > 70) & (luma < 205) & (ch < 42)
+                ofrac = float(ov[art_in].mean())
+                border = min(cx, cy, w - 1.0 - cx, h - 1.0 - cy) / max(rad, 1.0)
+                if cov < 0.20 or ofrac < 0.35 or border < 0.80:
+                    continue
+                score = cov * ofrac * min(border, 2.5) * (rad / float(min(h, w)))
+                if best is None or score > best[0]:
+                    best = (score, cx, cy, rad)
+            if best is not None:
+                _sc, cx, cy, rad = best
+                distc = np.hypot(xx.astype(np.float32) - cx, yy.astype(np.float32) - cy)
+                # Emblem (jaw, chin) often hangs below the scored circular frame.
+                interior = distc <= rad * 1.02
+                below = (distc <= rad * 1.38) & (yy > (cy - 0.12 * rad))
+                hull = interior | below
+                keep = (
+                    hull & art & (luma > 68) & (luma < 205) & (ch < 48)
+                ).astype(np.uint8)
+                punch = hull & art & (ch > 36) & (luma > 72)
+                keep[punch] = 0
+                keep[hull & (luma > 215)] = 0
+                nkeep, klab, kst, _ = cv2.connectedComponentsWithStats(keep, 8)
+                keep2 = np.zeros_like(keep)
+                min_a = max(80, int(0.0005 * keep.size))
+                for i in range(1, nkeep):
+                    if int(kst[i, cv2.CC_STAT_AREA]) >= min_a:
+                        keep2[klab == i] = 1
+                keep = keep2
+                near = distc <= rad * 1.38
+                key = ((thin > 0) & near).astype(np.uint8)
+                # Drop landscape ridges: keep strokes on the ring or next to the veil.
+                near_ov = cv2.dilate(keep, cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (15, 15)))
+                ring_band = np.abs(distc - rad) <= max(8.0, 0.05 * rad)
+                key = (key > 0) & ((near_ov > 0) | ring_band)
+                key = key.astype(np.uint8)
+                on_ring = (np.abs(distc - rad) <= 7.0) & (thin > 0)
+                half = 2.8
+                if int(on_ring.sum()) >= 40:
+                    rd = cv2.distanceTransform((thin > 0).astype(np.uint8), cv2.DIST_L2, 3)
+                    half = float(np.clip(np.median(rd[on_ring]), 1.6, 5.5))
+                frame = (np.abs(distc - rad) <= half).astype(np.uint8)
+                if float(thin[frame > 0].mean()) >= 0.22:
+                    key = np.maximum(key, frame)
+                key = _even_width_strokes(key, max_half=5.5)
+                keep[key > 0] = 0
+                if int(keep.sum()) < 400:
+                    keep = None
+                    key = np.zeros((h, w), np.uint8)
+    if keep is None:
+        seed = art & (ch < 26) & (luma > 78) & (luma < 198)
+        mask = seed.astype(np.uint8)
+        n, labels, stats, _ = cv2.connectedComponentsWithStats(mask, connectivity=8)
+        keep = np.zeros((h, w), np.uint8)
+        k7 = np.ones((7, 7), np.uint8)
+        hue = np.arctan2(lab[:, :, 2] - 128.0, lab[:, :, 1] - 128.0)
+        scores = []
+        for i in range(1, n):
+            area = int(stats[i, cv2.CC_STAT_AREA])
+            if area < 250 or area > 0.35 * h * w:
+                continue
+            comp = (labels == i).astype(np.uint8)
+            dist = cv2.distanceTransform(comp, cv2.DIST_L2, 3)
+            med_t = float(np.median(dist[comp > 0])) if area else 0.0
+            if med_t < 2.2:
+                continue
+            dil = cv2.dilate(comp, k7)
+            ring = (dil > 0) & (comp == 0) & art
+            if int(ring.sum()) < 40:
+                continue
+            nch = float(ch[ring].mean())
+            if nch < 14:
+                continue
+            rh = hue[ring]
+            bins = np.unique(np.round(rh * 4).astype(np.int32))
+            if bins.size < 4:
+                continue
+            scores.append((area * (1.0 + med_t / 6.0), i, area))
+        if not scores:
+            return None
+        scores.sort(reverse=True)
+        if scores[0][2] < 0.012 * int(art.sum()):
+            return None
+        keep[labels == scores[0][1]] = 1
+        hull = cv2.dilate(keep, cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (81, 81)))
+        for _sc, i, a in scores[1:]:
+            piece = labels == i
+            if np.any(hull[piece]):
+                keep[piece] = 1
+        frac = float(keep.sum()) / max(int(art.sum()), 1)
+        if frac < 0.012 or frac > 0.38:
+            return None
+        on = keep > 0
+        punch = on & (ch > 38) & (luma > 70)
+        keep[punch] = 0
+        bright = on & (luma > 215)
+        keep[bright] = 0
+        la, lb = lab[:, :, 1], lab[:, :, 2]
+        orange_halo = (
+            (rgb[:, :, 0] > 200)
+            & (rgb[:, :, 1] > 90)
+            & (rgb[:, :, 1] < 190)
+            & (rgb[:, :, 2] < 120)
+            & ((rgb[:, :, 0].astype(np.int16) - rgb[:, :, 2]) > 80)
+        )
+        olive = (
+            art
+            & (luma > 40)
+            & (luma < 175)
+            & (ch > 12)
+            & (ch < 62)
+            & (lb > 128)
+            & (la > 110)
+            & (la < 152)
+            & ~orange_halo
+        )
+        bone = olive.astype(np.uint8)
+        distb = cv2.distanceTransform(bone, cv2.DIST_L2, 3)
+        thin_fb = bone.copy()
+        thin_fb[distb > 6.5] = 0
+        near = cv2.dilate(keep, cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (55, 55)))
+        key = ((thin_fb > 0) & (near > 0)).astype(np.uint8)
+        key = cv2.morphologyEx(key, cv2.MORPH_CLOSE, np.ones((3, 3), np.uint8), 2)
+        if int(key.sum()) >= 80:
+            key = _even_width_strokes(key, max_half=5.5)
+            keep[key > 0] = 0
+        else:
+            key = np.zeros((h, w), np.uint8)
     if int(key.sum()) < 80:
         key = np.zeros((h, w), np.uint8)
         key_rgb = None
@@ -3975,6 +4211,11 @@ def extract_overlay(rgb, paper, grad):
 # ---------------------------------------------------------------------------
 
 def extract_letters(rgb, paper):
+    """Dark glyphs with a chromatic (gold/orange) halo — Canva gothic/script wordmarks.
+
+    The whole arched word is often one CC (AA merges letters). Do not reject
+    large haloed CCs; trees/frames fail the halo gate instead.
+    """
     h, w = rgb.shape[:2]
     if max(h, w) < 700:
         return np.zeros((h, w), dtype=bool), np.zeros((h, w), dtype=bool), None
@@ -3982,49 +4223,59 @@ def extract_letters(rgb, paper):
     lab = to_lab(rgb)
     ch = chroma_map(lab)
     art = ~paper
-    black = art & (luma < 52) & (ch < 32)
+    black = art & (luma < 58) & (ch < 36)
     r, g, b = rgb[:, :, 0], rgb[:, :, 1], rgb[:, :, 2]
-    orange = art & (r > 200) & (g > 100) & (g < 185) & (b < 115) & ((r.astype(np.int16) - b) > 80)
+    # Gold/orange halo (gothic Canva wordmarks). Mid G keeps red-mountain rims out.
+    warm = (
+        art
+        & (r > 185)
+        & (g > 90)
+        & (g < 195)
+        & (b < 130)
+        & ((r.astype(np.int16) - b) > 60)
+        & (ch > 18)
+    )
     ncc, labels, stats, _ = cv2.connectedComponentsWithStats(black.astype(np.uint8), 4)
     if ncc <= 2:
         return np.zeros((h, w), dtype=bool), np.zeros((h, w), dtype=bool), None
     areas = [(i, int(stats[i, cv2.CC_STAT_AREA])) for i in range(1, ncc)]
     areas.sort(key=lambda t: -t[1])
-    skip = areas[0][0] if areas else -1
     k5 = np.ones((5, 5), np.uint8)
-    max_area = 0.04 * h * w
+    max_area = 0.12 * h * w
     glyph = np.zeros((h, w), dtype=bool)
     for ci, area in areas:
-        if ci == skip or area < 50 or area > max_area:
+        if area < max(200, int(0.00012 * h * w)) or area > max_area:
             continue
         bw = int(stats[ci, cv2.CC_STAT_WIDTH])
         bh = int(stats[ci, cv2.CC_STAT_HEIGHT])
-        if max(bw, bh) > 0.55 * max(h, w):
+        if max(bw, bh) > 0.92 * max(h, w):
             continue
         dist = cv2.distanceTransform((labels == ci).astype(np.uint8), cv2.DIST_L2, 3)
         on = dist > 0
-        if not on.any() or float(np.median(dist[on])) < 1.6:
+        if not on.any() or float(np.median(dist[on])) < 1.35:
             continue
         comp = labels == ci
         dil = cv2.dilate(comp.astype(np.uint8), k5)
         ring = (dil > 0) & (~comp)
         if int(ring.sum()) < 12:
             continue
-        ofrac = float(orange[ring].mean())
+        ofrac = float(warm[ring].mean()) if ring.any() else 0.0
         if ofrac < 0.18:
             continue
         glyph[comp] = True
     if not glyph.any():
         return glyph, np.zeros((h, w), dtype=bool), None
     dist = cv2.distanceTransform((~glyph).astype(np.uint8), cv2.DIST_L2, 3)
-    on = orange & (dist > 0.6) & (dist < 14)
+    on = warm & (dist > 0.6) & (dist < 16)
     width = 5
     if int(on.sum()) >= 40:
-        width = int(np.clip(round(float(np.percentile(dist[on], 68))), 3, 10))
+        width = int(np.clip(round(float(np.percentile(dist[on], 68))), 3, 12))
     ksz = 2 * width + 1
-    near = cv2.dilate(glyph.astype(np.uint8), cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (ksz, ksz)))
+    near = cv2.dilate(
+        glyph.astype(np.uint8), cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (ksz, ksz))
+    )
     halo = (near > 0) & (~glyph)
-    halo_rgb = rgb[orange & halo].mean(axis=0) if (orange & halo).any() else rgb[halo].mean(axis=0)
+    halo_rgb = rgb[warm & halo].mean(axis=0) if (warm & halo).any() else rgb[halo].mean(axis=0)
     return glyph, halo, halo_rgb.astype(np.float32)
 
 
@@ -4211,7 +4462,7 @@ def svg_from_layers(layers, width_in, height_in, paper_hex=None):
     ]
     if paper_hex:
         parts.append(
-            f'  <rect x="0" y="0" width="{w}" height="{h}" fill="{paper_hex}" data-name="paper-underlay"/>'
+            f'  <path d="M 0 0 L {w} 0 L {w} {h} L 0 {h} Z" fill="{paper_hex}" data-name="paper-underlay"/>'
         )
     for L in layers:
         hex_ = L["hex"]
@@ -4907,6 +5158,372 @@ def vectorize_soft_flat(rgb, paper, paper_rgb, inches, kind, t0, h0, w0, rec_err
     return svg, meta
 
 
+def _plate_poster_palette(rgb, paper, paper_rgb, grad):
+    """Hierarchical flats palette — k-means samples AA and invents mud inks."""
+    pal = build_palette(rgb, paper, grad, max_k=16, min_k=8, merge_thresh=10.5)
+    pal = inject_missing_inks(rgb, paper, pal, grad, min_chroma=14.0, min_px=18)
+    pal = drop_paper_inks(pal, paper_rgb, thresh=10.0 if lum(paper_rgb) >= 200 else 8.0)
+    pal = _merge_near_inks(pal, thresh=12.0)
+    if not pal:
+        pal = [np.array([20.0, 20.0, 20.0], np.float32)]
+    return pal
+
+
+def _plate_poster_assign(work, paper_w, pal, paper_rgb):
+    """Light cleanup: keep thin foam / gothic serifs (no SLIC / heavy close)."""
+    assign, _ = assign_pixels(work, paper_w, pal, paper_rgb, paper_win=0.0)
+    pal2 = recolor_palette(work, assign, pal, grad=gradient_mag(work))
+    assign = despeckle(assign, pal2, min_size=6)
+    assign = fill_small_assign_holes(
+        assign, pal2, max_hole=max(24, int(0.00005 * assign.size))
+    )
+    assign = merge_small_islands(
+        assign, pal2, min_size=max(28, int(0.00008 * assign.size))
+    )
+    assign, pal2 = compact_assign_palette(assign, pal2)
+    return assign, pal2
+
+
+def vectorize_plate_poster(rgb, paper, paper_rgb, inches, kind, t0, h0, w0, rec_err):
+    """Snap Canva/screenprint plates to 8–20 inks, then potrace named plates.
+
+    Raw vtracer on these rasters mints 400+ near-colors. Mean-shift / SLIC
+    (the Imagine recipe) melts gothic serifs and water foam.
+    Overlay + even-width keyline are extracted at native res so tooth walls
+    and gothic terminals survive the working cap.
+    """
+    h, w = rgb.shape[:2]
+    glyph, halo, halo_rgb = extract_letters(rgb, paper)
+    if glyph is not None and not np.any(glyph):
+        glyph = halo = halo_rgb = None
+    overlay = extract_overlay(rgb, paper, gradient_mag(rgb))
+    src_rgb = rgb
+    if overlay is not None:
+        src_rgb = overlay["rgb_clean"]
+        if glyph is not None and np.any(glyph):
+            overlay["mask"][glyph] = 0
+            if overlay.get("key") is not None:
+                overlay["key"][glyph] = 0
+            if halo is not None:
+                overlay["mask"][halo] = 0
+                if overlay.get("key") is not None:
+                    overlay["key"][halo] = 0
+
+    cap = 1200
+    work = src_rgb
+    paper_w = paper
+    if max(h, w) > cap:
+        s = cap / float(max(h, w))
+        work = cv2.resize(
+            src_rgb,
+            (int(round(w * s)), int(round(h * s))),
+            interpolation=cv2.INTER_AREA,
+        )
+        paper_w = (
+            cv2.resize(
+                paper.astype(np.uint8),
+                (work.shape[1], work.shape[0]),
+                interpolation=cv2.INTER_NEAREST,
+            )
+            > 0
+        )
+        h, w = work.shape[:2]
+
+    def _resize_mask(m, like):
+        if m is None:
+            return None
+        if m.shape[:2] == like.shape[:2]:
+            return m
+        return cv2.resize(
+            m.astype(np.uint8), (like.shape[1], like.shape[0]), interpolation=cv2.INTER_NEAREST
+        )
+
+    if glyph is not None:
+        glyph = _resize_mask(glyph.astype(np.uint8), work) > 0
+        halo = _resize_mask(halo.astype(np.uint8), work) > 0 if halo is not None else None
+    ov_mask = ov_key = None
+    ov_alpha = ov_rgb = ov_key_rgb = None
+    if overlay is not None:
+        ov_mask = _resize_mask(overlay["mask"], work)
+        ov_key = _resize_mask(overlay.get("key"), work)
+        ov_alpha = overlay.get("alpha")
+        ov_rgb = overlay.get("rgb")
+        ov_key_rgb = overlay.get("key_rgb")
+
+    grad = gradient_mag(work)
+    pal = _plate_poster_palette(work, paper_w, paper_rgb, grad)
+    assign, pal = _plate_poster_assign(work, paper_w, pal, paper_rgb)
+    if not pal:
+        pal = [np.array([20.0, 20.0, 20.0], np.float32)]
+        assign = np.full(work.shape[:2], 0, np.int32)
+        assign[paper_w] = -1
+    if ov_mask is not None:
+        assign[ov_mask > 0] = -1
+    if ov_key is not None:
+        assign[ov_key > 0] = -1
+    if glyph is not None and np.any(glyph):
+        assign[glyph] = -1
+        if halo is not None:
+            assign[halo] = -1
+
+    if w0 >= h0:
+        width_in = float(inches)
+        height_in = float(inches) * (h0 / float(w0))
+    else:
+        height_in = float(inches)
+        width_in = float(inches) * (w0 / float(h0))
+    sx = width_in / assign.shape[1]
+    sy = height_in / assign.shape[0]
+
+    def emit(
+        mask,
+        rgb_c,
+        *,
+        alphamax=1.0,
+        opttol=0.2,
+        turdsize=2,
+        smooth=0.12,
+        suffix="",
+        scale=1,
+        opacity=None,
+        destair=False,
+    ):
+        m = (mask > 0).astype(np.uint8)
+        if int(m.sum()) < 12:
+            return None
+        hh, ww = m.shape
+        corners = (m[0, 0], m[0, ww - 1], m[hh - 1, 0], m[hh - 1, ww - 1])
+        if sum(int(c) for c in corners) >= 3 and int(m.mean()) > 0.45:
+            w_s, h_s = fmt(width_in, 4), fmt(height_in, 4)
+            paths = [f"M 0 0 L {w_s} 0 L {w_s} {h_s} L 0 {h_s} Z"]
+        else:
+            paths = potrace_paths(
+                m,
+                sx,
+                sy,
+                scale=scale,
+                alphamax=alphamax,
+                opttol=opttol,
+                turdsize=turdsize,
+                smooth=smooth,
+            )
+            if destair and paths:
+                paths = _destair_glyph_paths(paths)
+        if not paths:
+            return None
+        rec = {
+            "hex": to_hex(rgb_c),
+            "name": layer_name(rgb_c) + suffix,
+            "paths": paths,
+            "lum": lum(rgb_c),
+            "n": int(m.sum()),
+        }
+        if opacity is not None:
+            rec["opacity"] = float(opacity)
+        return rec
+
+    layers = []
+    order = list(range(len(pal)))
+    order.sort(key=lambda i: (-lum(pal[i]), -int((assign == i).sum())))
+    for i in order:
+        mask = assign == i
+        if glyph is not None:
+            mask = mask & ~glyph
+            if halo is not None:
+                mask = mask & ~halo
+        if ov_mask is not None:
+            mask = mask & ~(ov_mask > 0)
+        if ov_key is not None:
+            mask = mask & ~(ov_key > 0)
+        is_dark = lum(pal[i]) < 50
+        rec = emit(
+            mask,
+            pal[i],
+            alphamax=0.70 if is_dark else 0.95,
+            opttol=0.10 if is_dark else 0.16,
+            turdsize=1 if is_dark else 2,
+            smooth=0.08 if is_dark else 0.12,
+        )
+        if rec:
+            layers.append(rec)
+
+    if ov_mask is not None and ov_rgb is not None and int(np.asarray(ov_mask).sum()) > 80:
+        rec = emit(
+            ov_mask,
+            ov_rgb,
+            alphamax=0.92,
+            opttol=0.16,
+            turdsize=2,
+            smooth=0.20,
+            suffix=" · overlay",
+            opacity=ov_alpha,
+        )
+        if rec:
+            layers.append(rec)
+    if ov_key is not None and ov_key_rgb is not None and int(np.asarray(ov_key).sum()) > 40:
+        rec = emit(
+            ov_key,
+            ov_key_rgb,
+            alphamax=0.55,
+            opttol=0.08,
+            turdsize=1,
+            smooth=0.0,
+            suffix=" · keyline",
+        )
+        if rec:
+            layers.append(rec)
+
+    if halo is not None and halo_rgb is not None and np.any(halo):
+        rec = emit(
+            halo.astype(np.uint8),
+            halo_rgb,
+            alphamax=0.88,
+            opttol=0.12,
+            turdsize=1,
+            smooth=0.0,
+            scale=2,
+            suffix=" · letter-halo",
+        )
+        if rec:
+            layers.append(rec)
+    if glyph is not None and np.any(glyph):
+        dark = min(pal, key=lambda c: lum(c)) if pal else np.array([10.0, 10.0, 10.0])
+        rec = emit(
+            glyph.astype(np.uint8),
+            dark,
+            alphamax=0.0,
+            opttol=0.2,
+            turdsize=1,
+            smooth=0.0,
+            scale=2,
+            suffix=" · lettering",
+            destair=True,
+        )
+        if rec:
+            layers.append(rec)
+
+    n_paths = sum(len(L["paths"]) for L in layers)
+    if layers and n_paths >= 4:
+        svg = svg_from_layers(layers, width_in, height_in, to_hex(paper_rgb))
+        polish_stats = {}
+        # Heavy fairing destairs gothic terminals and is too slow on 1k+ plates.
+        if n_paths <= 180:
+            svg, polish_stats = polish_traced_svg(
+                svg, kind="fair", try_primitives=True
+            )
+            n_paths = len(re.findall(r"<path\b", svg, re.I)) or n_paths
+        meta = {
+            "engine": "decoclub-vector",
+            "backend": "potrace",
+            "mode": kind,
+            "paths": n_paths,
+            "colors": len(layers),
+            "palette": [to_hex(c) for c in pal],
+            "pixel": [w0, h0],
+            "work": [w, h],
+            "up": 1,
+            "inches": [width_in, height_in],
+            "ms": int((time.time() - t0) * 1000),
+            "paper": to_hex(paper_rgb),
+            "overlay": bool(ov_mask is not None and int(np.asarray(ov_mask).sum()) > 80),
+            "rec_err": round(float(rec_err), 2),
+            "soft_flat": False,
+            "plate_poster": True,
+            "keyline": bool(ov_key is not None and int(np.asarray(ov_key).sum()) > 40),
+            "vector_graph": "plate-potrace",
+            "polish": polish_stats,
+        }
+        return svg, meta
+
+    # Fallback: spline of the snapped raster, remapped onto the inks.
+    snapped = _soft_flat_raster(assign, pal, paper_rgb)
+    try:
+        settings = {
+            "mode": "spline",
+            "hierarchical": "stacked",
+            "filter_speckle": "8",
+            "color_precision": "8",
+            "gradient_step": "64",
+            "corner_threshold": "55",
+            "path_precision": "2",
+        }
+        tmp = tempfile.mkdtemp(prefix="plate-")
+        try:
+            png_p = os.path.join(tmp, "in.png")
+            svg_p = os.path.join(tmp, "out.svg")
+            Image.fromarray(snapped).save(png_p)
+            run_vtracer(png_p, svg_p, settings)
+            raw = open(svg_p, encoding="utf-8").read()
+        finally:
+            try:
+                for fn in os.listdir(tmp):
+                    os.remove(os.path.join(tmp, fn))
+                os.rmdir(tmp)
+            except Exception:
+                pass
+        svg, n_paths, vpal = wrap_vtracer_svg(raw, width_in, height_in)
+        svg = remap_svg_fills_to_palette(svg, pal, paper_rgb)
+        n_paths = len(re.findall(r"<path\b", svg, re.I))
+        fills = re.findall(r'fill="(#[0-9A-Fa-f]{3,8})"', svg)
+        pal_out = []
+        seen = set()
+        for f in fills:
+            u = f.upper()
+            if u not in seen:
+                seen.add(u)
+                pal_out.append(u)
+        meta = {
+            "engine": "decoclub-vector",
+            "backend": "vtracer",
+            "mode": kind,
+            "paths": n_paths,
+            "colors": len(pal_out),
+            "palette": pal_out[:24],
+            "pixel": [w0, h0],
+            "work": [w, h],
+            "up": 1,
+            "inches": [width_in, height_in],
+            "ms": int((time.time() - t0) * 1000),
+            "paper": to_hex(paper_rgb),
+            "overlay": False,
+            "rec_err": round(float(rec_err), 2),
+            "vtracer": settings,
+            "soft_flat": False,
+            "plate_poster": True,
+            "keyline": False,
+            "vector_graph": "plate-snap",
+            "polish": {},
+        }
+        return svg, meta
+    except Exception:
+        pass
+
+    svg = svg_from_layers(layers, width_in, height_in, to_hex(paper_rgb))
+    n_paths = len(re.findall(r"<path\b", svg, re.I))
+    meta = {
+        "engine": "decoclub-vector",
+        "backend": "potrace",
+        "mode": kind,
+        "paths": n_paths,
+        "colors": len(layers),
+        "palette": [to_hex(c) for c in pal],
+        "pixel": [w0, h0],
+        "work": [w, h],
+        "up": 1,
+        "inches": [width_in, height_in],
+        "ms": int((time.time() - t0) * 1000),
+        "paper": to_hex(paper_rgb),
+        "overlay": False,
+        "rec_err": round(float(rec_err), 2),
+        "soft_flat": False,
+        "plate_poster": True,
+        "keyline": False,
+        "vector_graph": "plate-empty",
+        "polish": {},
+    }
+    return svg, meta
+
+
 # ---------------------------------------------------------------------------
 # Main
 # ---------------------------------------------------------------------------
@@ -5044,12 +5661,13 @@ def vectorize(path: str, inches: float = 10.0, colors=None, mode: str = "auto"):
         # Detect on the flattened original. Denoise collapses unique-color count
         # and would miss smooth AI gradients.
         soft_flat = is_soft_flat_illustration(rgb_full, paper_f, paper_rgb_f)
-        rgb_full = denoise_jpeg(rgb_full, paper_f, grad_f, force=noisy_f)
-        grad_f = gradient_mag(rgb_full)
-        rgb_full, paper_f = punch_sheet_dirt(rgb_full, paper_f, paper_rgb_f, grad=grad_f)
+        plate = is_plate_poster(rgb_full, paper_f, paper_rgb_f)
         # Soft-flat AI/illustration: snap to 8–16 inks then potrace. Must run
         # before raw vtracer (which invents thousands of near-colors on gradients).
         if soft_flat:
+            rgb_full = denoise_jpeg(rgb_full, paper_f, grad_f, force=noisy_f)
+            grad_f = gradient_mag(rgb_full)
+            rgb_full, paper_f = punch_sheet_dirt(rgb_full, paper_f, paper_rgb_f, grad=grad_f)
             return vectorize_soft_flat(
                 rgb_full,
                 paper_f,
@@ -5061,6 +5679,23 @@ def vectorize(path: str, inches: float = 10.0, colors=None, mode: str = "auto"):
                 w0,
                 rec_err,
             )
+        # Canva / screenprint plates: already-flat cells, many AA colors.
+        # Do not bilateral-blur gothic serifs / foam before the snap.
+        if plate:
+            return vectorize_plate_poster(
+                rgb_full,
+                paper_f,
+                paper_rgb_f,
+                inches,
+                kind,
+                t0,
+                h0,
+                w0,
+                rec_err,
+            )
+        rgb_full = denoise_jpeg(rgb_full, paper_f, grad_f, force=noisy_f)
+        grad_f = gradient_mag(rgb_full)
+        rgb_full, paper_f = punch_sheet_dirt(rgb_full, paper_f, paper_rgb_f, grad=grad_f)
         if noisy_f and lum(paper_rgb_f) >= 200:
             pal_f = list(palette)
             if len(pal_f) < 3 or len(pal_f) > 12:
@@ -5130,8 +5765,14 @@ def vectorize(path: str, inches: float = 10.0, colors=None, mode: str = "auto"):
 
     if up_scale > 1:
         # Linear on junk (not nearest) so silhouette stairs don't get 2× blockier.
-        # Cubic stays for clean logos; cubic-on-junk re-invents JPEG greys.
-        interp = cv2.INTER_LINEAR if noisy else cv2.INTER_CUBIC
+        # Tiny clean mascots: nearest keeps hard edges. Cubic on 225px palette
+        # logos invents wobble destaircase cannot kill (not H/V stairs).
+        if noisy:
+            interp = cv2.INTER_LINEAR
+        elif kind == "logo" and max(h, w) <= 260:
+            interp = cv2.INTER_NEAREST
+        else:
+            interp = cv2.INTER_CUBIC
         up = cv2.resize(
             rgb_q, (w * up_scale, h * up_scale), interpolation=interp
         )
@@ -5294,6 +5935,11 @@ def vectorize(path: str, inches: float = 10.0, colors=None, mode: str = "auto"):
     # potrace plates if coverage fails so finger/whiskers survive.
     if kind == "logo" and glyph is None and ov_mask is None:
         try:
+            dleg = 6.0
+            if (not noisy) and kind == "logo" and up_scale >= 4:
+                # Match upsample so 1px original stairs collapse; larger
+                # legs melt designed corners and zero graph coverage.
+                dleg = max(6.0, float(up_scale) + 1.5)
             glayers, gaux = vector_graph_layers(
                 assign.astype(np.int32),
                 palette,
@@ -5304,6 +5950,7 @@ def vectorize(path: str, inches: float = 10.0, colors=None, mode: str = "auto"):
                 try_primitives=(not keylined),
                 min_area_px=max(4 if keylined else 10, int(0.00003 * assign.size)),
                 gap_fill=True,
+                destair_leg=dleg,
             )
             gpaths = sum(len(L["paths"]) for L in glayers)
             cov = float(gaux.get("coverage") or 0.0)
