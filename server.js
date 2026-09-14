@@ -21,6 +21,7 @@ const rasterCorel = require("./lib/rasterCorel");
 const inventWarp = require("./lib/inventWarp");
 const vaiTrace = require("./lib/vaiTrace");
 const colorspec = require("./lib/colorspec");
+const { hasRealPaths: vectorHasRealPaths } = require("./lib/stitch/svgLayers");
 const corelImport = require("./lib/corelImport");
 const { listPalettes } = require("./lib/palettes");
 const { digitizeJob } = require("./lib/digitize");
@@ -360,23 +361,27 @@ function scheduleVectorize(jobId) {
 }
 function rewriteVectorSvg(job) {
   if (!job || !job.vector || !job.vector.layers) return;
-  if ((job.vector.source === "vectorizer.ai" || job.vector.source === "vtracer" || job.vector.source === "vai-trace" || job.vector.source === "corel-import") && job.vector_svg) {
+  // Prefer keeping on-disk vector_svg when layers lack real path `d` (vai-trace / invent-warp).
+  // Never rebuild via svgFromLayers([]) — that emits empty d="" and nukes geometry.
+  if (job.vector_svg && !vectorHasRealPaths(job.vector)) {
     const abs = path.join(UPLOADS, path.basename(job.vector_svg));
     if (fs.existsSync(abs)) {
-      let svg = fs.readFileSync(abs, "utf8");
-      const layers = job.vector.layers;
-      // best-effort: replace each prior fill hex once with current layer hex
-      layers.forEach(function (L) {
-        if (!L || !L.hex) return;
-        const hex = String(L.hex).toLowerCase();
-        // no prior map — recolor UI already mutated L.hex; skip opaque rewrite without old hex
-      });
+      const svg = fs.readFileSync(abs, "utf8");
       const name = Date.now() + "-" + uid() + "-vector.svg";
       fs.writeFileSync(path.join(UPLOADS, name), svg);
       job.vector_svg = "/uploads/" + name;
       return;
     }
   }
+  if (vectorHasRealPaths(job.vector)) {
+    const svg = svgFromLayers(job.vector.layers, job.vector.widthIn || job.width_in, job.vector.heightIn || job.height_in);
+    const name = Date.now() + "-" + uid() + "-vector.svg";
+    fs.writeFileSync(path.join(UPLOADS, name), svg);
+    job.vector_svg = "/uploads/" + name;
+    delete job.vector_eps;
+    return;
+  }
+  // File missing and no path data — last resort (may be empty)
   const svg = svgFromLayers(job.vector.layers, job.vector.widthIn || job.width_in, job.vector.heightIn || job.height_in);
   const name = Date.now() + "-" + uid() + "-vector.svg";
   fs.writeFileSync(path.join(UPLOADS, name), svg);
@@ -1055,7 +1060,13 @@ async function handleApi(req, res, url) {
       }
     }
     if (isSvg) return json(res, 400, { error: "SVG is not CorelDRAW — use engine corel-import only for Corel exports, or upload PNG to Vectorize" });
-    if (buf[0] === 0xff && buf[1] === 0xd8) return json(res, 400, { error: "Still a JPEG — click Vectorize again so Studio can convert it" });
+    if (buf[0] !== 0x89 || buf[1] !== 0x50) {
+      try {
+        buf = vaiTrace.decodeRasterToPng(buf);
+      } catch (err) {
+        return json(res, 400, { error: "Need PNG, JPG, or WebP artwork" });
+      }
+    }
     if (buf[0] !== 0x89 || buf[1] !== 0x50) return json(res, 400, { error: "Need PNG, JPG, or WebP artwork" });
     const wantApi = body.engine === "vectorizer.ai";
     const wantVtracer = body.engine === "vtracer";
@@ -1260,7 +1271,8 @@ async function handleApi(req, res, url) {
     }
     if (body.name) job.vector.layers[idx].nameGuess = String(body.name);
     job.vector.layers[idx].palette = body.palette || job.vector.layers[idx].palette;
-    if ((job.vector.source === "vectorizer.ai" || job.vector.source === "vtracer" || job.vector.source === "corel-import") && job.vector_svg && body.hex && prevHex) {
+    // Hex-replace SVG text whenever vector_svg is on disk (vai-trace / invent-warp store empty paths[]).
+    if (job.vector_svg && body.hex && prevHex) {
       const abs = path.join(UPLOADS, path.basename(job.vector_svg));
       if (fs.existsSync(abs)) {
         let svg = fs.readFileSync(abs, "utf8");
@@ -1271,6 +1283,7 @@ async function handleApi(req, res, url) {
         const name = Date.now() + "-" + uid() + "-vector.svg";
         fs.writeFileSync(path.join(UPLOADS, name), svg);
         job.vector_svg = "/uploads/" + name;
+        delete job.vector_eps;
       } else {
         rewriteVectorSvg(job);
       }
