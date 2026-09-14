@@ -92,6 +92,13 @@ def chroma_of_lab(lab) -> float:
     return float(math.hypot(float(lab[1]) - 128.0, float(lab[2]) - 128.0))
 
 
+def _is_keyline_ink(c) -> bool:
+    """True-black outline, not a chromatic dark fill (Imagine purple stripes)."""
+    if lum(c) >= 42:
+        return False
+    return chroma_of_lab(lab_of_rgb([c])[0]) < 20
+
+
 def hue_of_lab(lab) -> float:
     return math.atan2(float(lab[2]) - 128.0, float(lab[1]) - 128.0)
 
@@ -666,7 +673,7 @@ def regularize_assign(assign, palette, *, win=5, min_fill=70):
     k = len(palette)
     if k < 1:
         return assign
-    is_dark = np.array([lum(c) < 50 for c in palette], dtype=bool)
+    is_dark = np.array([_is_keyline_ink(c) for c in palette], dtype=bool)
     shifted = (assign + 1).clip(0, 255).astype(np.uint8)
     med = cv2.medianBlur(shifted, win if win % 2 == 1 else win + 1)
     out = med.astype(np.int16) - 1
@@ -814,12 +821,12 @@ def absorb_internal_shadows(assign, palette):
                 continue
             largest = max(int(stats[li, cv2.CC_STAT_AREA]) for li in range(1, n))
             # No large shadow plate → gradient shading, not a stripe. Fold into fill.
-            if largest < 0.08 * fill_n:
+            if largest < 0.12 * fill_n:
                 out[out == sh] = fill_i
                 continue
             for li in range(1, n):
                 area = int(stats[li, cv2.CC_STAT_AREA])
-                if area > 0.22 * fill_n:
+                if area > 0.30 * fill_n:
                     continue
                 ys, xs = np.where(labels == li)
                 # absorb if the island sits on/next to the fill (paw pad shadows)
@@ -849,6 +856,1493 @@ def punch_border_strips(assign, *, thick_frac=0.03):
             if float((out[:, neigh] >= 0).mean()) < 0.35:
                 out[:, sl] = -1
     return out
+
+
+def region_adjacency(assign, *, connectivity=4):
+    """Build undirected adjacency set of ink labels that share an edge (not paper=-1)."""
+    h, w = assign.shape
+    pairs = set()
+    a = assign
+    # right neighbors
+    left = a[:, :-1]
+    right = a[:, 1:]
+    mask = (left >= 0) & (right >= 0) & (left != right)
+    if mask.any():
+        for u, v in zip(left[mask].tolist(), right[mask].tolist()):
+            pairs.add((u, v) if u < v else (v, u))
+    # down neighbors
+    top = a[:-1, :]
+    bot = a[1:, :]
+    mask = (top >= 0) & (bot >= 0) & (top != bot)
+    if mask.any():
+        for u, v in zip(top[mask].tolist(), bot[mask].tolist()):
+            pairs.add((u, v) if u < v else (v, u))
+    if connectivity == 8:
+        # diagonals
+        for dy, dx in ((1, 1), (1, -1)):
+            y0 = slice(0, h - 1) if dy > 0 else slice(1, h)
+            y1 = slice(1, h) if dy > 0 else slice(0, h - 1)
+            x0 = slice(0, w - 1) if dx > 0 else slice(1, w)
+            x1 = slice(1, w) if dx > 0 else slice(0, w - 1)
+            A = a[y0, x0]
+            B = a[y1, x1]
+            mask = (A >= 0) & (B >= 0) & (A != B)
+            if mask.any():
+                for u, v in zip(A[mask].tolist(), B[mask].tolist()):
+                    pairs.add((u, v) if u < v else (v, u))
+    return pairs
+
+
+def enforce_shared_edges(assign, palette, *, iters: int = 3):
+    """
+    Vector Graph lite — force neighboring fills onto a single crisp shared boundary.
+
+    Independent per-color tracers invent slightly different edges along the same
+    raster seam (fringe / double outline). After palette flatten we own the
+    label map: majority-vote every boundary pixel among its 4-neighbors
+    (darker wins ties) so both sides share one polyline when traced.
+    """
+    if assign is None or not len(palette):
+        return assign
+    out = np.asarray(assign, dtype=np.int32).copy()
+    h, w = out.shape
+    if h < 3 or w < 3:
+        return out
+    n_ink = len(palette)
+    lums = np.array([float(lum(c)) for c in palette], dtype=np.float32)
+    # Rank: higher = better winner. majority first, then darker (lower luma).
+    # Encode as score = count * 1000 - luma
+    for _ in range(max(1, int(iters))):
+        pad = np.pad(out, 1, mode="edge")
+        c = pad[1:-1, 1:-1]
+        nbs = (
+            pad[0:-2, 1:-1],
+            pad[2:, 1:-1],
+            pad[1:-1, 0:-2],
+            pad[1:-1, 2:],
+        )
+        differ = np.zeros((h, w), dtype=bool)
+        for nb in nbs:
+            differ |= nb != c
+        if not differ.any():
+            break
+        # Vote among center + 4-neighbors for ink labels only.
+        # For each label id, count occurrences in the 5-cell window at boundary pixels.
+        best_score = np.full((h, w), -1e18, dtype=np.float64)
+        best_lab = c.copy()
+        stack = [c] + list(nbs)
+        # Unique labels that appear — bound work to palette size
+        for lab in range(n_ink):
+            cnt = np.zeros((h, w), dtype=np.float32)
+            for plane in stack:
+                cnt += (plane == lab).astype(np.float32)
+            # Only consider where this label appears at least once in window
+            present = cnt > 0
+            if not present.any():
+                continue
+            score = cnt * 1000.0 - float(lums[lab])
+            better = differ & present & (score > best_score)
+            best_score[better] = score[better]
+            best_lab[better] = lab
+        # Paper pixels at ink/paper fringe: if neighborhood ink majority exists, pull into that ink
+        # (closes 1px hairlines). Only when >=3 of 5 votes are the same ink.
+        paper = c < 0
+        fringe = differ & paper
+        if fringe.any():
+            for lab in range(n_ink):
+                cnt = np.zeros((h, w), dtype=np.float32)
+                for plane in stack:
+                    cnt += (plane == lab).astype(np.float32)
+                strong = fringe & (cnt >= 3)
+                if strong.any():
+                    best_lab[strong] = lab
+        changed = int((best_lab != c).sum())
+        out = best_lab.astype(np.int32)
+        if changed == 0:
+            break
+    return out
+
+
+def _exterior_paper_mask(assign):
+    """Paper reachable from the image border (true background, not counters)."""
+    a = np.asarray(assign, dtype=np.int32)
+    h, w = a.shape
+    paper = (a < 0).astype(np.uint8)
+    if h < 2 or w < 2 or not paper.any():
+        return np.zeros((h, w), dtype=bool)
+    lab = paper.copy()
+    mask = np.zeros((h + 2, w + 2), np.uint8)
+    for x in range(w):
+        if lab[0, x] == 1:
+            cv2.floodFill(lab, mask, (x, 0), 2)
+        if lab[h - 1, x] == 1:
+            cv2.floodFill(lab, mask, (x, h - 1), 2)
+    for y in range(h):
+        if lab[y, 0] == 1:
+            cv2.floodFill(lab, mask, (0, y), 2)
+        if lab[y, w - 1] == 1:
+            cv2.floodFill(lab, mask, (w - 1, y), 2)
+    return lab == 2
+
+
+def collapse_aa_rim(assign, palette, *, max_width=1.7):
+    """Fold light-ink sandwiches between exterior paper and a darker ink.
+
+    JPEG gold-black silhouettes grow an AA halo of the lighter ink. After
+    upsample a 1px original halo is several working pixels, so 4-neighbor
+    is not enough. Distance sandwich up to max_width, but only against
+    BORDER-connected paper so interior counters (whiskers, eye whites) stay.
+    """
+    if assign is None or not len(palette):
+        return assign
+    a = np.asarray(assign, dtype=np.int32).copy()
+    h, w = a.shape
+    if h < 4 or w < 4:
+        return a
+    mw = float(max(0.75, max_width))
+    lums = np.array([float(lum(c)) for c in palette], dtype=np.float32)
+    dark_ids = [j for j in range(len(palette)) if lums[j] < 72]
+    if not dark_ids:
+        return a
+    k = int(max(3, 2 * int(math.ceil(mw)) + 1))
+    if k % 2 == 0:
+        k += 1
+    ker = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (k, k))
+    # Peel twice: upsample turns a 1px JPEG halo into several working pixels.
+    for _pass in range(2):
+        ext = _exterior_paper_mask(a)
+        if not ext.any():
+            break
+        dist_paper = cv2.distanceTransform((~ext).astype(np.uint8), cv2.DIST_L2, 3)
+        dark_m = np.zeros((h, w), np.uint8)
+        for j in dark_ids:
+            dark_m[a == j] = 1
+        if int(dark_m.sum()) == 0:
+            break
+        dist_dark = cv2.distanceTransform(1 - dark_m, cv2.DIST_L2, 3)
+        nearest_dark = np.full((h, w), -1, np.int32)
+        for j in sorted(dark_ids, key=lambda t: -int((a == t).sum())):
+            dil = cv2.dilate((a == j).astype(np.uint8), ker)
+            nearest_dark[(dil > 0) & (nearest_dark < 0)] = j
+        moved = False
+        for i in range(len(palette)):
+            if lums[i] < 72:
+                continue
+            if int((a == i).sum()) < 12:
+                continue
+            darker = [j for j in dark_ids if lums[j] + 28.0 < lums[i]]
+            if not darker:
+                continue
+            rim = (
+                (a == i)
+                & (dist_paper <= mw)
+                & (dist_dark <= mw)
+                & np.isin(nearest_dark, np.array(darker, dtype=np.int32))
+            )
+            if rim.any():
+                a[rim] = nearest_dark[rim]
+                moved = True
+        if not moved:
+            break
+    return a
+
+
+def split_dark_necks(assign, palette, *, max_bridge=18):
+    """Break short dark bridges between bulky dark blobs (pupil glued to eye ring).
+
+    Long thin strokes (antennae, whiskers) are left alone — only compact
+    necks that touch two different bulky components are folded away.
+    """
+    if assign is None or not len(palette):
+        return assign
+    a = np.asarray(assign, dtype=np.int32).copy()
+    k3 = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (3, 3))
+    for i, c in enumerate(palette):
+        if lum(c) >= 50:
+            continue
+        mask = (a == i).astype(np.uint8)
+        if int(mask.sum()) < 40:
+            continue
+        dist = cv2.distanceTransform(mask, cv2.DIST_L2, 3)
+        bulky = ((mask > 0) & (dist > 1.35)).astype(np.uint8)
+        thin = (mask > 0) & (dist <= 1.35)
+        if int(bulky.sum()) < 20 or not thin.any():
+            continue
+        n_b, labels_b = cv2.connectedComponents(bulky, connectivity=8)
+        if n_b <= 2:
+            continue
+        n_t, lab_t, stats, _ = cv2.connectedComponentsWithStats(
+            thin.astype(np.uint8), connectivity=8
+        )
+        for t in range(1, n_t):
+            area = int(stats[t, cv2.CC_STAT_AREA])
+            bw = int(stats[t, cv2.CC_STAT_WIDTH])
+            bh = int(stats[t, cv2.CC_STAT_HEIGHT])
+            aspect = max(bw, bh) / float(max(1, min(bw, bh)))
+            if aspect >= 4.0 or area > max_bridge or area < 2:
+                continue
+            comp = lab_t == t
+            dil = cv2.dilate(comp.astype(np.uint8), k3) > 0
+            touch = labels_b[dil & (bulky > 0)]
+            touch = touch[touch > 0]
+            if touch.size == 0:
+                continue
+            if np.unique(touch).size < 2:
+                continue
+            ring = dil & ~comp
+            votes = a[ring]
+            votes = votes[votes != i]
+            if votes.size:
+                inks = votes[votes >= 0]
+                if inks.size:
+                    a[comp] = int(np.bincount(inks.astype(np.int32)).argmax())
+                else:
+                    a[comp] = -1
+            else:
+                a[comp] = -1
+    return a
+
+
+def close_large_plates(assign, palette, *, ksize=5, min_area=None):
+    """Morph-close large chromatic plates, filling only interior paper holes.
+
+    Imagine-art shading leaves paper speckles inside a shirt/body. Do not
+    grow into exterior paper or into another ink.
+    """
+    if assign is None or not len(palette):
+        return assign
+    a = np.asarray(assign, dtype=np.int32).copy()
+    h, w = a.shape
+    min_area = int(min_area if min_area is not None else max(200, 0.002 * h * w))
+    k = int(max(3, ksize))
+    if k % 2 == 0:
+        k += 1
+    ker = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (k, k))
+    ext = _exterior_paper_mask(a)
+    for i, c in enumerate(palette):
+        if lum(c) < 50:
+            continue
+        mask = (a == i).astype(np.uint8)
+        if int(mask.sum()) < min_area:
+            continue
+        ncc, labels, stats, _ = cv2.connectedComponentsWithStats(mask, connectivity=4)
+        large = sum(
+            1
+            for li in range(1, ncc)
+            if int(stats[li, cv2.CC_STAT_AREA]) >= max(80, min_area // 4)
+        )
+        # Several large islands (paw pads) — hole-fill per CC, do not bridge.
+        if large >= 3:
+            for li in range(1, ncc):
+                if int(stats[li, cv2.CC_STAT_AREA]) < 40:
+                    continue
+                comp = (labels == li).astype(np.uint8)
+                filled = _fill_mask_holes(comp)
+                hole = (filled > 0) & (comp == 0) & (a < 0) & (~ext)
+                if hole.any():
+                    a[hole] = i
+            continue
+        closed = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, ker)
+        fill = (closed > 0) & (mask == 0) & (a < 0) & (~ext)
+        if fill.any():
+            a[fill] = i
+    return a
+
+
+def tuck_dark_over_light(assign, palette, *, radius=1):
+    """Dilate dark plates into lighter inks so AA gold rims sit under the keyline.
+
+    Does not grow into paper (whisker holes stay holes).
+    """
+    if assign is None or not len(palette) or radius < 1:
+        return assign
+    a = np.asarray(assign, dtype=np.int32).copy()
+    dark_ids = [i for i, c in enumerate(palette) if lum(c) < 55]
+    light_ids = [i for i, c in enumerate(palette) if lum(c) >= 80]
+    if not dark_ids or not light_ids:
+        return a
+    light_m = np.zeros(a.shape[:2], np.uint8)
+    for i in light_ids:
+        light_m[a == i] = 1
+    k = 2 * int(radius) + 1
+    ker = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (k, k))
+    # Larger dark plates first so small pupils don't get overwritten wrongly.
+    dark_ids.sort(key=lambda i: -int((a == i).sum()))
+    for i in dark_ids:
+        m = (a == i).astype(np.uint8)
+        dil = cv2.dilate(m, ker, iterations=1)
+        grow = (dil > 0) & (light_m > 0)
+        a[grow] = i
+        light_m[grow] = 0
+    return a
+
+
+def merge_small_islands(assign, palette, *, min_size=48, protect_thin_dark=True):
+    """Reassign tiny 4-connected blobs to the majority neighbor (Imagine shards)."""
+    if assign is None or not len(palette):
+        return assign
+    a = np.asarray(assign, dtype=np.int32).copy()
+    h, w = a.shape
+    k = len(palette)
+    is_dark = [_is_keyline_ink(c) for c in palette]
+    thin_protect = np.zeros((h, w), dtype=bool)
+    if protect_thin_dark:
+        dark = np.zeros((h, w), np.uint8)
+        for i, d in enumerate(is_dark):
+            if d:
+                dark[a == i] = 1
+        if int(dark.sum()) > 0:
+            dist = cv2.distanceTransform(dark, cv2.DIST_L2, 3)
+            thin_protect = (dark > 0) & (dist <= 3.0)
+    ker = np.ones((3, 3), np.uint8)
+    for lab in range(k):
+        mask = (a == lab).astype(np.uint8)
+        if int(mask.sum()) == 0:
+            continue
+        n, labels, stats, _ = cv2.connectedComponentsWithStats(mask, connectivity=4)
+        for i in range(1, n):
+            area = int(stats[i, cv2.CC_STAT_AREA])
+            if area >= min_size:
+                continue
+            comp = labels == i
+            if protect_thin_dark and is_dark[lab] and float(thin_protect[comp].mean()) > 0.4:
+                continue
+            bw = int(stats[i, cv2.CC_STAT_WIDTH])
+            bh = int(stats[i, cv2.CC_STAT_HEIGHT])
+            aspect = max(bw, bh) / max(1, min(bw, bh))
+            if is_dark[lab] and aspect >= 3.5 and area >= 6:
+                continue
+            dil = cv2.dilate(comp.astype(np.uint8), ker) > 0
+            border = dil & ~comp
+            neigh = a[border]
+            if neigh.size == 0:
+                a[comp] = -1
+                continue
+            u, cnt = np.unique(neigh, return_counts=True)
+            keep = u != lab
+            if not np.any(keep):
+                a[comp] = -1
+                continue
+            u, cnt = u[keep], cnt[keep]
+            a[comp] = int(u[int(np.argmax(cnt))])
+    return a
+
+
+def seal_inks_into_paper(assign, *, radius: int = 1):
+    """Dilate each ink only into paper so neighboring fills meet with no hairline gap.
+
+    Never eats another ink — shared ownership stays with enforce_shared_edges.
+    """
+    if assign is None or radius < 1:
+        return assign
+    out = np.asarray(assign, dtype=np.int32).copy()
+    paper = out < 0
+    if not paper.any():
+        return out
+    k = 2 * int(radius) + 1
+    kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (k, k))
+    labels = [int(x) for x in np.unique(out) if int(x) >= 0]
+    # Paint larger regions first so small accents keep their seats.
+    labels.sort(key=lambda i: -int((out == i).sum()))
+    for lab in labels:
+        mask = (out == lab).astype(np.uint8)
+        dil = cv2.dilate(mask, kernel, iterations=1)
+        grow = (dil > 0) & (out < 0)
+        out[grow] = lab
+    return out
+
+
+# ---------------------------------------------------------------------------
+# Vector Graph — path-level shared seams (one cubic per crack)
+# ---------------------------------------------------------------------------
+
+def _vg_geom():
+    try:
+        from geom import (
+            fit_cubic_open,
+            reverse_open_path_d,
+            reverse_closed_path_d,
+            fit_cubic_path,
+            try_circle,
+            try_ellipse,
+            try_rect,
+            try_triangle,
+            destaircase,
+            clean_ring,
+            circularity,
+            ring_area,
+            prepare_contour,
+            path_from_ring,
+            fair_open_polyline,
+        )
+    except Exception:
+        from lib.geom import (
+            fit_cubic_open,
+            reverse_open_path_d,
+            reverse_closed_path_d,
+            fit_cubic_path,
+            try_circle,
+            try_ellipse,
+            try_rect,
+            try_triangle,
+            destaircase,
+            clean_ring,
+            circularity,
+            ring_area,
+            prepare_contour,
+            path_from_ring,
+            fair_open_polyline,
+        )
+    return {
+        "fit_cubic_open": fit_cubic_open,
+        "reverse_open_path_d": reverse_open_path_d,
+        "reverse_closed_path_d": reverse_closed_path_d,
+        "fit_cubic_path": fit_cubic_path,
+        "try_circle": try_circle,
+        "try_ellipse": try_ellipse,
+        "try_rect": try_rect,
+        "try_triangle": try_triangle,
+        "destaircase": destaircase,
+        "clean_ring": clean_ring,
+        "circularity": circularity,
+        "ring_area": ring_area,
+        "prepare_contour": prepare_contour,
+        "path_from_ring": path_from_ring,
+        "fair_open_polyline": fair_open_polyline,
+    }
+
+
+def _vg_unit_edges(assign):
+    """Oriented unit crack edges on the pixel-corner grid (x right, y down)."""
+    a = np.asarray(assign, dtype=np.int32)
+    h, w = a.shape
+    edges = []  # (x0,y0,x1,y1,left,right)
+    # Vertical cracks between left/right pixels
+    if w >= 2:
+        left = a[:, :-1]
+        right = a[:, 1:]
+        mask = left != right
+        ys, xs = np.where(mask)
+        for r, c in zip(ys.tolist(), xs.tolist()):
+            la = int(left[r, c])
+            lb = int(right[r, c])
+            # edge x=c+1 from y=r → y=r+1; walking down, left=+x = east = lb
+            edges.append((c + 1, r, c + 1, r + 1, lb, la))
+    # Horizontal cracks between up/down pixels
+    if h >= 2:
+        top = a[:-1, :]
+        bot = a[1:, :]
+        mask = top != bot
+        ys, xs = np.where(mask)
+        for r, c in zip(ys.tolist(), xs.tolist()):
+            la = int(top[r, c])
+            lb = int(bot[r, c])
+            # edge y=r+1 from x=c → x=c+1; walking right, left=+y = south = lb
+            edges.append((c, r + 1, c + 1, r + 1, lb, la))
+    return edges
+
+
+
+def _crack_sides_from_pts(assign, pts):
+    """Re-derive left/right labels for pts[0]→pts[1] using the label map."""
+    a = np.asarray(assign, dtype=np.int32)
+    h, w = a.shape
+    if len(pts) < 2:
+        return -1, -1
+    x0, y0 = pts[0]
+    x1, y1 = pts[1]
+    mx = 0.5 * (x0 + x1)
+    my = 0.5 * (y0 + y1)
+    tx, ty = x1 - x0, y1 - y0
+    L = math.hypot(tx, ty) or 1.0
+    # Interior-on-left in y-down (x right, y down): (tx, ty) → (ty, -tx).
+    # Walking +x, left is -y (up the screen).
+    nx, ny = ty / L, -tx / L
+    def sample(px, py):
+        ix = int(max(0, min(w - 1, math.floor(px))))
+        iy = int(max(0, min(h - 1, math.floor(py))))
+        return int(a[iy, ix])
+    left = sample(mx + nx * 0.45, my + ny * 0.45)
+    right = sample(mx - nx * 0.45, my - ny * 0.45)
+    return left, right
+
+def label_cracks(assign, *, min_len: int = 2):
+    """
+    Crack-follow the label map into open polylines split at T-junctions.
+
+    Each crack: {a, b, pts, left, right} where walking pts keeps `left` on the
+    left (image y-down). a/b are the two labels (may include paper=-1).
+    Neighboring fills reuse the same pts (reversed) — path-level shared seam.
+    """
+    edges = _vg_unit_edges(assign)
+    if not edges:
+        return []
+    # Undirected adjacency at integer corners: key -> list of outgoing oriented edges
+    # Store oriented: from key along (dx,dy) with (left,right)
+    from collections import defaultdict
+
+    adj = defaultdict(list)  # (x,y) -> [(nx,ny,left,right)]
+    for x0, y0, x1, y1, left, right in edges:
+        adj[(x0, y0)].append((x1, y1, left, right))
+        # reverse orientation swaps left/right
+        adj[(x1, y1)].append((x0, y0, right, left))
+
+    # Degree of undirected graph
+    und = defaultdict(set)
+    for x0, y0, x1, y1, left, right in edges:
+        und[(x0, y0)].add((x1, y1))
+        und[(x1, y1)].add((x0, y0))
+    degree = {k: len(v) for k, v in und.items()}
+
+    visited = set()  # frozenset of undirected unit edge
+
+    def uedge(p, q):
+        return (p, q) if p <= q else (q, p)
+
+    def is_junction(p):
+        return degree.get(p, 0) != 2
+
+    cracks = []
+    # Start walks from junctions and degree-1 ends; also cover pure loops
+    starts = [p for p, d in degree.items() if d != 2]
+    # Pure loops: pick any unused edge endpoint
+    for p0, outs in list(adj.items()):
+        for nx, ny, left, right in outs:
+            e = uedge(p0, (nx, ny))
+            if e in visited:
+                continue
+            # Prefer starting at junction
+            start = p0
+            if not is_junction(p0) and not is_junction((nx, ny)):
+                # Will be picked up as loop later unless we start here
+                if starts:
+                    continue
+            # Walk forward
+            pts = [start]
+            cur = start
+            prev = None
+            cur_left = None
+            cur_right = None
+            # Choose first unused outgoing
+            chosen = None
+            for nx, ny, L, R in adj[cur]:
+                if prev is not None and (nx, ny) == prev:
+                    continue
+                if uedge(cur, (nx, ny)) in visited:
+                    continue
+                chosen = (nx, ny, L, R)
+                break
+            if chosen is None:
+                continue
+            nx, ny, L, R = chosen
+            visited.add(uedge(cur, (nx, ny)))
+            cur_left, cur_right = L, R
+            prev, cur = cur, (nx, ny)
+            pts.append(cur)
+            guard = 0
+            while guard < 200000:
+                guard += 1
+                if is_junction(cur) and len(pts) > 1:
+                    break
+                # Continue unique unused forward with same left/right labels
+                nxts = []
+                for qx, qy, qL, qR in adj[cur]:
+                    if prev is not None and (qx, qy) == prev:
+                        continue
+                    if uedge(cur, (qx, qy)) in visited:
+                        continue
+                    # Keep seam identity: same unordered label pair
+                    if {qL, qR} != {cur_left, cur_right}:
+                        continue
+                    # Prefer matching orientation (same left)
+                    nxts.append((qx, qy, qL, qR, 0 if qL == cur_left else 1))
+                if not nxts:
+                    break
+                nxts.sort(key=lambda t: t[4])
+                qx, qy, qL, qR, _ = nxts[0]
+                # If orientation flipped, swap bookkeeping
+                if qL != cur_left:
+                    # walking reverse of original edge orientation
+                    cur_left, cur_right = qL, qR
+                visited.add(uedge(cur, (qx, qy)))
+                prev, cur = cur, (qx, qy)
+                pts.append(cur)
+                if is_junction(cur):
+                    break
+                # Closed pure loop
+                if cur == start and len(pts) > 3:
+                    break
+            if len(pts) < min_len:
+                continue
+            fpts = [(float(x), float(y)) for x, y in pts]
+            Llab, Rlab = _crack_sides_from_pts(assign, fpts)
+            cracks.append(
+                {
+                    "a": Llab,
+                    "b": Rlab,
+                    "left": Llab,
+                    "right": Rlab,
+                    "pts": fpts,
+                }
+            )
+
+    # Sweep remaining unused edges (closed loops with all degree-2)
+    for p0, outs in list(adj.items()):
+        for nx, ny, L, R in outs:
+            e0 = uedge(p0, (nx, ny))
+            if e0 in visited:
+                continue
+            start = p0
+            pts = [start]
+            visited.add(e0)
+            prev, cur = start, (nx, ny)
+            cur_left, cur_right = L, R
+            pts.append(cur)
+            guard = 0
+            while guard < 200000:
+                guard += 1
+                nxts = []
+                for qx, qy, qL, qR in adj[cur]:
+                    if (qx, qy) == prev:
+                        continue
+                    if uedge(cur, (qx, qy)) in visited:
+                        continue
+                    if {qL, qR} != {cur_left, cur_right}:
+                        continue
+                    nxts.append((qx, qy, qL, qR, 0 if qL == cur_left else 1))
+                if not nxts:
+                    break
+                nxts.sort(key=lambda t: t[4])
+                qx, qy, qL, qR, _ = nxts[0]
+                if qL != cur_left:
+                    cur_left, cur_right = qL, qR
+                visited.add(uedge(cur, (qx, qy)))
+                prev, cur = cur, (qx, qy)
+                pts.append(cur)
+                if cur == start:
+                    break
+            if len(pts) >= max(min_len, 4):
+                fpts = [(float(x), float(y)) for x, y in pts]
+                Llab, Rlab = _crack_sides_from_pts(assign, fpts)
+                cracks.append(
+                    {
+                        "a": Llab,
+                        "b": Rlab,
+                        "left": Llab,
+                        "right": Rlab,
+                        "pts": fpts,
+                    }
+                )
+    return cracks
+
+
+def subpixel_snap_crack(pts, rgb, pal, ink_a, ink_b, *, max_shift: float = 0.65):
+    """Push crack vertices to coverage≈0.5 between ink_a and ink_b in original RGB."""
+    if rgb is None or pts is None or len(pts) < 2:
+        return pts
+    h, w = rgb.shape[:2]
+    labs = to_lab(rgb)
+    out = []
+    # Palette labs; paper=-1 uses local mean of near-paper if needed
+    def lab_of(idx):
+        if idx is None or idx < 0:
+            return None
+        if idx >= len(pal):
+            return None
+        return lab_of_rgb([pal[idx]])[0]
+
+    la = lab_of(ink_a)
+    lb = lab_of(ink_b)
+    for i, (x, y) in enumerate(pts):
+        # Tangent from neighbors
+        if i == 0:
+            tx, ty = pts[1][0] - x, pts[1][1] - y
+        elif i == len(pts) - 1:
+            tx, ty = x - pts[i - 1][0], y - pts[i - 1][1]
+        else:
+            tx = pts[i + 1][0] - pts[i - 1][0]
+            ty = pts[i + 1][1] - pts[i - 1][1]
+        L = math.hypot(tx, ty) or 1.0
+        # Normal (left of tangent in y-down = rotate tangent by +90° in y-down?
+        # rotate (tx,ty) → (-ty, tx) is CCW in y-down? In math y-up CCW is (-ty,tx).
+        # Use (-ty, tx) consistently.
+        nx, ny = (-ty / L), (tx / L)
+        best_t = 0.0
+        best_score = 1e18
+        # If both inks known, find 0.5 membership crossing
+        if la is not None and lb is not None:
+            for k in range(-4, 5):
+                t = (k / 4.0) * max_shift
+                px = x + nx * t
+                py = y + ny * t
+                ix = int(max(0, min(w - 1, round(px - 0.5))))
+                iy = int(max(0, min(h - 1, round(py - 0.5))))
+                pl = labs[iy, ix]
+                da = float(np.sum((pl - la) ** 2))
+                db = float(np.sum((pl - lb) ** 2))
+                # Softmax membership to a: want ≈0.5 → da≈db
+                score = abs(da - db)
+                if score < best_score:
+                    best_score = score
+                    best_t = t
+        else:
+            # Ink vs paper: place near stronger gradient / mid coverage
+            for k in range(-4, 5):
+                t = (k / 4.0) * max_shift
+                px = x + nx * t
+                py = y + ny * t
+                ix = int(max(0, min(w - 1, round(px - 0.5))))
+                iy = int(max(0, min(h - 1, round(py - 0.5))))
+                # Prefer positions closer to the ink side slightly inside ink
+                if ink_a >= 0 and la is not None:
+                    pl = labs[iy, ix]
+                    score = float(np.sum((pl - la) ** 2))
+                elif ink_b >= 0 and lb is not None:
+                    pl = labs[iy, ix]
+                    score = float(np.sum((pl - lb) ** 2))
+                else:
+                    score = 0.0
+                if score < best_score:
+                    best_score = score
+                    best_t = t * 0.35
+        out.append((x + nx * best_t, y + ny * best_t))
+    return out
+
+
+def _crack_mean_grad(pts, grad):
+    if grad is None or pts is None or len(pts) < 2:
+        return 40.0
+    h, w = grad.shape[:2]
+    acc = 0.0
+    n = 0
+    for x, y in pts:
+        ix = int(max(0, min(w - 1, int(round(x - 0.5)))))
+        iy = int(max(0, min(h - 1, int(round(y - 0.5)))))
+        acc += float(grad[iy, ix])
+        n += 1
+    return acc / max(1, n)
+
+
+def _strip_z(d: str) -> str:
+    s = (d or "").strip()
+    if s.endswith("Z") or s.endswith("z"):
+        s = s[:-1].strip()
+    return s
+
+
+def _ensure_crack_fit(c, sx, sy, *, logo=False, grad=None, try_primitives=True):
+    """Fit each crack exactly once. Neighbors reuse d_fwd / d_rev (single-owner Béziers)."""
+    if c.get("d_fwd"):
+        return
+    G = _vg_geom()
+    pts = list(c.get("pts") or [])
+    if len(pts) < 2:
+        c["d_fwd"] = ""
+        c["d_rev"] = ""
+        c["closed_d"] = False
+        return
+    closed = len(pts) >= 4 and _qkey_pt(pts[0]) == _qkey_pt(pts[-1])
+    work = G["fair_open_polyline"](pts, closed=closed, logo=logo)
+    if len(work) < 2:
+        work = pts
+    # ~1px Schneider error: tight enough to hold the edge, loose enough that
+    # leftover 0.5px raster stairs get absorbed into one cubic, not split.
+    err = 1.15 if logo else 1.35
+    ccos = 0.42 if logo else 0.28
+    gm = _crack_mean_grad(work, grad)
+    if gm < 12:
+        err *= 1.75
+    elif gm < 20:
+        err *= 1.30
+    if closed:
+        ring = G["clean_ring"](work, 0.2)
+        prim = None
+        if try_primitives and len(ring) >= 8:
+            area = abs(G["ring_area"](ring))
+            peri = 0.0
+            for i in range(len(ring)):
+                j = (i + 1) % len(ring)
+                peri += math.hypot(ring[j][0] - ring[i][0], ring[j][1] - ring[i][1])
+            thin = peri > 1e-6 and (4.0 * area / (peri + 1e-6)) < 2.8
+            if not thin and area >= 36:
+                both_ink = c["left"] >= 0 and c["right"] >= 0
+                # Circles are safe at any size (bee head/wings/eyes). Bars and
+                # triangles on ink-ink punch bounding-boxes out of curved bodies.
+                prim = G["try_circle"](ring, sx, sy, min_r=4.0)
+                if not prim:
+                    circ = G["circularity"](ring)
+                    if both_ink:
+                        if circ >= 0.84:
+                            prim = G["try_ellipse"](ring, sx, sy)
+                    else:
+                        prim = (
+                            G["try_ellipse"](ring, sx, sy)
+                            or G["try_rect"](ring, sx, sy)
+                            or (G["try_triangle"](ring, sx, sy) if logo else None)
+                        )
+        if prim:
+            c["d_fwd"] = prim if prim.rstrip().endswith(("Z", "z")) else prim + " Z"
+            c["d_rev"] = G["reverse_closed_path_d"](c["d_fwd"])
+            c["closed_d"] = True
+            c["primitive"] = True
+            return
+        d = G["fit_cubic_path"](ring, sx, sy, error=err, corner_cos=ccos)
+        if not d:
+            d = G["fit_cubic_open"](work, sx, sy, error=err, corner_cos=ccos)
+        if d and not d.rstrip().endswith(("Z", "z")):
+            d = d + " Z"
+        c["d_fwd"] = d or ""
+        c["d_rev"] = G["reverse_closed_path_d"](c["d_fwd"]) if c["d_fwd"] else ""
+        c["closed_d"] = True
+        c["primitive"] = False
+        return
+    c["d_fwd"] = G["fit_cubic_open"](work, sx, sy, error=err, corner_cos=ccos)
+    c["d_rev"] = G["reverse_open_path_d"](c["d_fwd"]) if c["d_fwd"] else ""
+    c["closed_d"] = False
+    c["primitive"] = False
+
+
+def _fit_crack_fragment(pts, sx, sy, *, logo=False):
+    """Back-compat wrapper: open-crack Schneider fit."""
+    c = {"pts": list(pts)}
+    _ensure_crack_fit(c, sx, sy, logo=logo, try_primitives=False)
+    return _strip_z(c.get("d_fwd") or "")
+
+
+def _ring_points_from_cracks(chain, cracks):
+    """chain: list of (crack_idx, forward:bool) → closed point ring."""
+    pts = []
+    for ci, fwd in chain:
+        cpts = cracks[ci]["pts"]
+        seq = cpts if fwd else list(reversed(cpts))
+        if not pts:
+            pts.extend(seq)
+        else:
+            # skip duplicate joint
+            pts.extend(seq[1:])
+    return pts
+
+
+def _qkey_pt(p, q=100.0):
+    return (int(round(float(p[0]) * q)), int(round(float(p[1]) * q)))
+
+
+def _walk_faces(cracks):
+    """Planar-map face walk: one cycle per face, interior on the left (y-down).
+
+    At each vertex, outgoing half-edges are sorted by atan2 (y-down, so
+    increasing angle is clockwise on screen). The next *counter-clockwise*
+    turn is the previous entry in that list — that keeps ink on the left.
+    Each face is a list of (crack_idx, forward).
+    """
+    from collections import defaultdict
+
+    adj = defaultdict(list)  # vertex -> [{ang, ci, fwd, dest}]
+    loop_faces = []
+    for i, c in enumerate(cracks):
+        pts = c["pts"]
+        if len(pts) < 2:
+            continue
+        a, b = pts[0], pts[-1]
+        ka, kb = _qkey_pt(a), _qkey_pt(b)
+        # Closed crack (no T-junction): the loop is already a face.
+        if ka == kb and len(pts) >= 4:
+            loop_faces.append([(i, True)])
+            loop_faces.append([(i, False)])
+            continue
+        # Angle of the outgoing *first step*, not the endpoint chord.
+        # U-shaped cracks share T-junction endpoints with the shared seam;
+        # using the chord makes every outgoing look identical.
+        s1 = pts[1]
+        e1 = pts[-2]
+        ang_f = math.atan2(s1[1] - a[1], s1[0] - a[0])
+        ang_r = math.atan2(e1[1] - b[1], e1[0] - b[0])
+        adj[ka].append({"ang": ang_f, "ci": i, "fwd": True, "dest": kb})
+        adj[kb].append({"ang": ang_r, "ci": i, "fwd": False, "dest": ka})
+    for k in adj:
+        adj[k].sort(key=lambda t: t["ang"])
+
+    used = set()
+    faces = []
+    for k, outs in adj.items():
+        for out in outs:
+            start_sig = (out["ci"], out["fwd"])
+            if start_sig in used:
+                continue
+            chain = []
+            cur = out
+            closed = False
+            guard = 0
+            while guard < 200000:
+                guard += 1
+                sig = (cur["ci"], cur["fwd"])
+                if sig in used:
+                    break
+                used.add(sig)
+                chain.append((cur["ci"], cur["fwd"]))
+                dest = cur["dest"]
+                dest_outs = adj.get(dest) or []
+                rev_idx = None
+                rev_fwd = not cur["fwd"]
+                rev_ci = cur["ci"]
+                for j, t in enumerate(dest_outs):
+                    if t["ci"] == rev_ci and t["fwd"] == rev_fwd:
+                        rev_idx = j
+                        break
+                if rev_idx is None or not dest_outs:
+                    break
+                # Next in atan2-sorted order. atan2(y-down) increases clockwise
+                # on screen; taking +1 from the reverse half-edge walks the
+                # face with interior on the left (CCW on screen).
+                nxt = dest_outs[(rev_idx + 1) % len(dest_outs)]
+                if (nxt["ci"], nxt["fwd"]) == start_sig:
+                    closed = True
+                    break
+                cur = nxt
+            if closed and len(chain) >= 1:
+                faces.append(chain)
+    return loop_faces + faces
+
+
+def _assemble_ink_chains(cracks, ink):
+    """Closed cycles whose interior label is `ink` (paper = -1 allowed)."""
+    faces = _walk_faces(cracks)
+    out = []
+    for chain in faces:
+        ci, fwd = chain[0]
+        c = cracks[ci]
+        lab = c["left"] if fwd else c["right"]
+        if lab == ink:
+            out.append(chain)
+    return out
+
+
+def _face_poly(chain, cracks):
+    """Shapely polygon for a closed crack chain, or None."""
+    try:
+        from shapely.geometry import Polygon
+    except Exception:
+        return None
+    ring = _ring_points_from_cracks(chain, cracks)
+    if len(ring) < 4:
+        return None
+    if ring[0] != ring[-1]:
+        ring = list(ring) + [ring[0]]
+    try:
+        poly = Polygon(ring)
+        if not poly.is_valid:
+            poly = poly.buffer(0)
+        if poly.is_empty or poly.area < 4.0:
+            return None
+        return poly
+    except Exception:
+        return None
+
+
+def _poly_ink_fraction(poly, assign, ink, n=10):
+    """Fraction of interior sample points whose label is `ink`.
+
+    Wrapping hulls (a shirt cycle that walked the outer silhouette) sample
+    mostly gold/paper and must not be emitted as a fill over the figure.
+    """
+    try:
+        minx, miny, maxx, maxy = poly.bounds
+    except Exception:
+        return 1.0
+    if maxx - minx < 1.5 or maxy - miny < 1.5:
+        return 1.0
+    from shapely.geometry import Point
+
+    a = np.asarray(assign, dtype=np.int32)
+    h, w = a.shape
+    xs = np.linspace(minx + 0.4, maxx - 0.4, int(n))
+    ys = np.linspace(miny + 0.4, maxy - 0.4, int(n))
+    hit = tot = 0
+    for y in ys:
+        for x in xs:
+            try:
+                if not poly.contains(Point(float(x), float(y))):
+                    continue
+            except Exception:
+                continue
+            tot += 1
+            ix = int(min(w - 1, max(0, math.floor(x))))
+            iy = int(min(h - 1, max(0, math.floor(y))))
+            if int(a[iy, ix]) == int(ink):
+                hit += 1
+    if tot < 5:
+        return 1.0
+    return hit / float(tot)
+
+
+def _poly_ink(poly, assign):
+    """Label under a polygon's representative point (corner-grid → pixel)."""
+    a = np.asarray(assign, dtype=np.int32)
+    h, w = a.shape
+    try:
+        pt = poly.representative_point()
+        ix = int(max(0, min(w - 1, math.floor(pt.x))))
+        iy = int(max(0, min(h - 1, math.floor(pt.y))))
+        return int(a[iy, ix])
+    except Exception:
+        return -1
+
+
+def _chain_left_ink(chain, cracks):
+    """Interior ink from walk orientation (left side). Mixed → None."""
+    labs = []
+    for ci, fwd in chain:
+        c = cracks[ci]
+        labs.append(c["left"] if fwd else c["right"])
+    if not labs:
+        return None
+    # Require a dominant label so the outer combined cycle (paper-on-left
+    # around two inks) cannot be emitted as a fill.
+    from collections import Counter
+    cnt = Counter(labs)
+    lab, n = cnt.most_common(1)[0]
+    if n < max(1, int(0.8 * len(labs))):
+        return None
+    return int(lab)
+
+
+def _path_d_from_shared_chain(
+    chain, cracks, sx, sy, *, logo=False, try_primitives=True, grad=None
+):
+    """Build closed path d by concatenating per-crack fitted fragments (shared).
+
+    Never independently refits a loop: ink-ink cubics stay single-owner.
+    Primitive swap is allowed only on paper-bounded chains (no neighbor fill)
+    or on a closed crack whose reverse is reused by the other face.
+    """
+    G = _vg_geom()
+    for ci, _fwd in chain:
+        _ensure_crack_fit(
+            cracks[ci], sx, sy, logo=logo, grad=grad, try_primitives=try_primitives
+        )
+    if len(chain) == 1:
+        c = cracks[chain[0][0]]
+        if c.get("closed_d") and c.get("d_fwd"):
+            return c["d_fwd"] if chain[0][1] else c["d_rev"]
+    parts = []
+    start_m = None
+    for ci, fwd in chain:
+        c = cracks[ci]
+        frag = c.get("d_fwd") if fwd else c.get("d_rev")
+        if not frag:
+            continue
+        frag = _strip_z(frag)
+        if start_m is None:
+            parts.append(frag)
+            start_m = True
+        else:
+            m = re.match(
+                r"M\s*([-+]?(?:\d+\.?\d*|\.\d+)(?:[eE][-+]?\d+)?)\s+([-+]?(?:\d+\.?\d*|\.\d+)(?:[eE][-+]?\d+)?)\s*(.*)$",
+                frag.strip(),
+            )
+            if m:
+                rest = m.group(3).strip()
+                if rest:
+                    parts.append(rest)
+            else:
+                parts.append(frag)
+    if not parts:
+        return None
+    d = " ".join(parts)
+    if not d.rstrip().endswith("Z") and not d.rstrip().endswith("z"):
+        d = d + " Z"
+
+    # Primitive swap only when every crack is ink-vs-paper (no neighbor to desync).
+    if try_primitives:
+        vs_paper = True
+        for ci, _ in chain:
+            c = cracks[ci]
+            if c["left"] >= 0 and c["right"] >= 0:
+                vs_paper = False
+                break
+        if vs_paper:
+            ring = G["clean_ring"](_ring_points_from_cracks(chain, cracks), 0.2)
+            if len(ring) >= 8:
+                area = abs(G["ring_area"](ring))
+                peri = 0.0
+                for i in range(len(ring)):
+                    j = (i + 1) % len(ring)
+                    peri += math.hypot(ring[j][0] - ring[i][0], ring[j][1] - ring[i][1])
+                thin = peri > 1e-6 and (4.0 * area / (peri + 1e-6)) < 2.8
+                if not thin and area >= 40:
+                    prim = (
+                        G["try_circle"](ring, sx, sy, min_r=4.5)
+                        or G["try_ellipse"](ring, sx, sy)
+                        or G["try_rect"](ring, sx, sy)
+                        or (G["try_triangle"](ring, sx, sy) if logo else None)
+                    )
+                    if prim:
+                        return prim
+    return d
+
+
+def vector_graph_layers(
+    assign,
+    palette,
+    sx,
+    sy,
+    *,
+    rgb=None,
+    logo=False,
+    try_primitives=True,
+    min_area_px=12,
+    gap_fill=True,
+):
+    """
+    Path-level Vector Graph: one Schneider fit per shared crack, loops reuse it.
+
+    Faces are walked with interior-on-left. Paper cycles contained in an ink
+    become evenodd holes (eyes, counters). Neighboring inks stay stacked so
+    a darker plate tucks over a lighter one along the same cubic.
+    Returns (layers, aux) where aux has crack counts / gap-filler strokes.
+    """
+    a = np.asarray(assign, dtype=np.int32)
+    cracks = label_cracks(a, min_len=2)
+    if not cracks:
+        return [], {"cracks": 0, "vector_graph": "empty"}
+
+    # Destaircase on the integer pixel-corner grid BEFORE sub-pixel snap.
+    # Snap knocks vertices off-axis and used to freeze 1px stairs into cubics.
+    Gpre = _vg_geom()
+    destaired = []
+    for c in cracks:
+        pts = list(c.get("pts") or [])
+        closed0 = len(pts) >= 4 and _qkey_pt(pts[0]) == _qkey_pt(pts[-1])
+        if len(pts) >= 4:
+            pts = Gpre["destaircase"](pts, max_leg=6.0, closed=closed0)
+            if closed0:
+                if len(pts) >= 3 and _qkey_pt(pts[0]) != _qkey_pt(pts[-1]):
+                    pts = list(pts) + [pts[0]]
+            elif len(pts) >= 2:
+                pts[0] = c["pts"][0]
+                pts[-1] = c["pts"][-1]
+        c = dict(c)
+        c["pts"] = pts
+        destaired.append(c)
+    cracks = destaired
+
+    # Sub-pixel snap using original RGB when available
+    if rgb is not None:
+        snapped = []
+        for c in cracks:
+            pts = subpixel_snap_crack(
+                c["pts"], rgb, palette, c["left"], c["right"], max_shift=0.65
+            )
+            # Keep endpoints pinned to junctions (less T-junction drift)
+            if len(pts) >= 2:
+                pts[0] = c["pts"][0]
+                pts[-1] = c["pts"][-1]
+            # Closed loops must stay closed after snap.
+            if len(c["pts"]) >= 4 and _qkey_pt(c["pts"][0]) == _qkey_pt(c["pts"][-1]):
+                if _qkey_pt(pts[0]) != _qkey_pt(pts[-1]):
+                    pts[-1] = pts[0]
+            c = dict(c)
+            c["pts"] = pts
+            snapped.append(c)
+        cracks = snapped
+
+    grad = None
+    if rgb is not None:
+        try:
+            grad = gradient_mag(rgb)
+        except Exception:
+            grad = None
+
+    faces = _walk_faces(cracks)
+    ink_faces = {i: [] for i in range(len(palette))}  # list of (chain, poly)
+    for chain in faces:
+        poly = _face_poly(chain, cracks)
+        if poly is None:
+            continue
+        ink = _chain_left_ink(chain, cracks)
+        if ink is None:
+            ink = _poly_ink(poly, a)
+        if ink is None or ink < 0 or ink >= len(palette):
+            continue
+        ink_faces[ink].append((chain, poly))
+
+    layers = []
+    gap_strokes = []
+    order = list(range(len(palette)))
+    order.sort(key=lambda i: (-lum(palette[i]), -int((a == i).sum())))
+
+    n_loops = 0
+    graph_area = 0.0
+    n_prim = 0
+    for ink in order:
+        area = int((a == ink).sum())
+        if area < min_area_px:
+            continue
+        recs = ink_faces.get(ink) or []
+        if not recs:
+            continue
+        ds = []
+        acc = None
+        for chain, poly in recs:
+            if poly.area < max(8.0, min_area_px * 0.5):
+                continue
+            # Light-ink AA ribbons around a dark keyline (puma gold halo).
+            # Keep thin DARK (whiskers). 4*area/peri ≈ twice the width.
+            try:
+                peri = float(poly.length)
+                width = 4.0 * float(poly.area) / (peri + 1e-6)
+            except Exception:
+                width = 99.0
+            if lum(palette[ink]) >= 55 and width < 2.6 and float(poly.area) < 0.015 * a.size:
+                continue
+            if not logo:
+                ink_px = float(int((a == ink).sum()) or 1)
+                if float(poly.area) > 1.85 * ink_px:
+                    continue
+                if _poly_ink_fraction(poly, a, ink) < 0.55:
+                    continue
+            d = _path_d_from_shared_chain(
+                chain,
+                cracks,
+                sx,
+                sy,
+                logo=logo,
+                try_primitives=try_primitives,
+                grad=grad,
+            )
+            if not d or "M" not in d:
+                continue
+            ds.append(d)
+            n_loops += 1
+            try:
+                acc = poly if acc is None else acc.symmetric_difference(poly)
+            except Exception:
+                acc = poly if acc is None else acc
+        if not ds and logo:
+            continue
+        if acc is not None:
+            graph_area += float(acc.area)
+        this_cov = float(acc.area) / max(1.0, float(area)) if acc is not None else 0.0
+        # Logos: one evenodd compound so eyes/whisker holes punch.
+        # Soft-flat Imagine: emit faces separately. A wrapping cycle in a
+        # joined evenodd d punches the whole gold/purple plate to paper.
+        # If the walk missed a chunk (legs/tail), potrace that ink's mask.
+        if logo:
+            if not ds:
+                continue
+            paths = [" ".join(ds)]
+        elif ds and this_cov >= 0.85:
+            paths = list(ds)
+        else:
+            mask = (a == ink).astype(np.uint8)
+            is_dark = lum(palette[ink]) < 50
+            ptr = potrace_paths(
+                mask,
+                sx,
+                sy,
+                scale=1,
+                alphamax=1.2 if is_dark else 1.0,
+                opttol=0.14 if is_dark else 0.20,
+                turdsize=1 if is_dark else 3,
+                smooth=0.12 if is_dark else 0.18,
+            )
+            paths = ptr if ptr else list(ds)
+            if not paths:
+                continue
+            if acc is None or this_cov < 0.85:
+                graph_area += max(0.0, float(area) - (float(acc.area) if acc is not None else 0.0))
+        rec = {
+            "hex": to_hex(palette[ink]),
+            "name": layer_name(palette[ink]),
+            "paths": paths,
+            "lum": lum(palette[ink]),
+            "n": area,
+        }
+        # Stacked dark plates: a hairline same-color stroke covers lighter-ink
+        # overshoot at the silhouette (puma gold fringe) without a gold gap-fill.
+        if lum(palette[ink]) < 50:
+            rec["stroke"] = True
+            rec["sw"] = 1.25 * 0.5 * (sx + sy)
+        layers.append(rec)
+
+    if gap_fill and cracks:
+        ext = _exterior_paper_mask(a)
+        dist_ext = None
+        if ext.any():
+            dist_ext = cv2.distanceTransform((~ext).astype(np.uint8), cv2.DIST_L2, 3)
+        hh, ww = a.shape
+        for c in cracks:
+            if c["left"] < 0 or c["right"] < 0:
+                continue
+            if c["left"] >= len(palette) or c["right"] >= len(palette):
+                continue
+            pts = c.get("pts") or []
+            if len(pts) < 2:
+                continue
+            plen = 0.0
+            for i in range(len(pts) - 1):
+                plen += math.hypot(pts[i + 1][0] - pts[i][0], pts[i + 1][1] - pts[i][1])
+            if plen < 3.0:
+                continue
+            # Outer-silhouette sandwiches must not get an avg-color stroke —
+            # that is the gold halo around a black keyline.
+            if dist_ext is not None:
+                near = 0
+                n_s = 0
+                for x, y in pts[:: max(1, len(pts) // 24)]:
+                    ix = int(max(0, min(ww - 1, round(x - 0.5))))
+                    iy = int(max(0, min(hh - 1, round(y - 0.5))))
+                    n_s += 1
+                    if float(dist_ext[iy, ix]) <= 2.8:
+                        near += 1
+                if n_s and near / n_s >= 0.45:
+                    continue
+            _ensure_crack_fit(
+                c, sx, sy, logo=logo, grad=grad, try_primitives=try_primitives
+            )
+            dstroke = _strip_z(c.get("d_fwd") or "")
+            if not dstroke:
+                continue
+            rgb_a = np.asarray(palette[c["left"]], dtype=np.float32)
+            rgb_b = np.asarray(palette[c["right"]], dtype=np.float32)
+            la, lb = lum(rgb_a), lum(rgb_b)
+            # High-contrast keyline: stroke in the darker ink so it tucks under
+            # the outline instead of painting a gold/olive halo.
+            if abs(la - lb) >= 45:
+                avg = rgb_a if la <= lb else rgb_b
+            else:
+                avg = (rgb_a + rgb_b) * 0.5
+            sw = 1.5 * 0.5 * (sx + sy)
+            gap_strokes.append(
+                {
+                    "d": dstroke,
+                    "hex": to_hex(avg),
+                    "sw": sw,
+                }
+            )
+
+    ink_px = float(sum(int((a == i).sum()) for i in range(len(palette))))
+    coverage = (graph_area / ink_px) if ink_px > 0 else 0.0
+    n_ink = sum(1 for i in range(len(palette)) if int((a == i).sum()) >= min_area_px)
+    # Evenodd compounds hide loop count in Corel; still reject wild Imagine shards.
+    # A striped mascot with solid coverage is not 1000-shard mush — vtracer
+    # fallback on that case is worse (stairs + melted pads).
+    cap = 96 if logo else 180
+    cap = max(cap, 16 * max(1, n_ink))
+    too_sharded = n_loops > cap and (coverage < 0.88 or n_loops > int(cap * 1.6))
+    n_prim = sum(1 for c in cracks if c.get("primitive"))
+    seam_ds = [
+        {"d_fwd": c.get("d_fwd") or "", "d_rev": c.get("d_rev") or ""}
+        for c in cracks
+        if c.get("d_fwd") and c["left"] >= 0 and c["right"] >= 0
+    ]
+    aux = {
+        "cracks": len(cracks),
+        "loops": n_loops,
+        "faces": len(faces),
+        "gap_strokes": gap_strokes,
+        "vector_graph": "shared-seams",
+        "coverage": round(float(coverage), 3),
+        "too_sharded": bool(too_sharded),
+        "primitives": n_prim,
+        "shared_seams": len(seam_ds),
+        "seam_ds": seam_ds,
+    }
+    if coverage < 0.62 or too_sharded:
+        aux["vector_graph"] = "shared-seams-reject"
+        sys.stderr.write(
+            f"vector_graph reject coverage={coverage:.3f} loops={n_loops} "
+            f"sharded={too_sharded} cracks={len(cracks)}\n"
+        )
+        return [], aux
+    return layers, aux
+
+
+def svg_from_layers_with_gaps(
+    layers, width_in, height_in, paper_hex=None, gap_strokes=None, overlay_strokes=None
+):
+    """Like svg_from_layers but draws gap-filler strokes under fills.
+
+    overlay_strokes sit on top (whiskers that must not be faired off the sil).
+    """
+    w = fmt(width_in, 4)
+    h = fmt(height_in, 4)
+    parts = [
+        '<?xml version="1.0" encoding="UTF-8"?>',
+        f'<svg xmlns="http://www.w3.org/2000/svg" width="{w}in" height="{h}in" viewBox="0 0 {w} {h}">',
+    ]
+    if paper_hex:
+        parts.append(
+            f'  <rect x="0" y="0" width="{w}" height="{h}" fill="{paper_hex}" data-name="paper-underlay"/>'
+        )
+    if gap_strokes:
+        parts.append('  <g fill="none" stroke-linejoin="round" stroke-linecap="round" data-name="gap-filler">')
+        for g in gap_strokes:
+            parts.append(
+                f'    <path d="{g["d"]}" stroke="{g["hex"]}" stroke-width="{fmt(g["sw"], 4)}"/>'
+            )
+        parts.append("  </g>")
+    for L in layers:
+        hex_ = L["hex"]
+        name = L.get("name") or ""
+        paths = L.get("paths") or []
+        if not paths:
+            continue
+        extra = ""
+        op = L.get("opacity")
+        if op is not None and 0.05 < float(op) < 0.999:
+            extra = f' fill-opacity="{fmt(float(op), 3)}"'
+        if L.get("stroke") and L.get("sw"):
+            extra += (
+                f' stroke="{hex_}" stroke-width="{fmt(float(L["sw"]), 4)}"'
+                f' stroke-linejoin="round"'
+            )
+        parts.append(f'  <g fill="{hex_}" fill-rule="evenodd" data-name="{_esc(name)}"{extra}>')
+        for d in paths:
+            parts.append(f'    <path d="{d}"/>')
+        parts.append("  </g>")
+    if overlay_strokes:
+        parts.append(
+            '  <g fill="none" stroke-linejoin="round" stroke-linecap="round" data-name="overlay-strokes">'
+        )
+        for g in overlay_strokes:
+            parts.append(
+                f'    <path d="{g["d"]}" stroke="{g["hex"]}" stroke-width="{fmt(g["sw"], 4)}"/>'
+            )
+        parts.append("  </g>")
+    parts.append("</svg>")
+    return "\n".join(parts) + "\n"
+
+
+def _overlay_strokes_from_polylines(polylines, sx, sy, hex_, thick_px):
+    """Open cubics for thin overlay strokes (whiskers) that graph fairing would eat."""
+    G = _vg_geom()
+    strokes = []
+    sw = 0.5 * (float(sx) + float(sy)) * float(max(1.8, thick_px))
+    for chain in polylines or []:
+        if len(chain) < 3:
+            continue
+        pts = [(float(p[0]), float(p[1])) for p in chain]
+        work = G["fair_open_polyline"](pts, closed=False, logo=True)
+        if len(work) < 2:
+            work = pts
+        d = G["fit_cubic_open"](work, sx, sy, error=1.15, corner_cos=0.42)
+        if not d:
+            continue
+        strokes.append({"d": _strip_z(d), "hex": hex_, "sw": sw})
+    return strokes
+
+
+def polish_traced_svg(svg_text: str, *, kind: str = "fair", try_primitives: bool = True):
+    """Post-trace corner cleanup + curve fairing (+ confident primitives)."""
+    try:
+        from geom import polish_svg_paths
+    except Exception:
+        try:
+            from lib.geom import polish_svg_paths
+        except Exception:
+            return svg_text, {}
+    return polish_svg_paths(svg_text, kind=kind, try_primitives=try_primitives)
 
 
 def remap_svg_fills_to_palette(svg_text: str, palette, paper_rgb) -> str:
@@ -1389,7 +2883,7 @@ def _junk_mascot_whiskers(
     """
     h, w = luma.shape
     if int(muz_f.sum()) < 40:
-        return np.zeros((h, w), np.uint8)
+        return np.zeros((h, w), np.uint8), []
     k5 = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5, 5))
     k7 = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (7, 7))
     muz = _fill_mask_holes(muz_f)
@@ -1414,7 +2908,7 @@ def _junk_mascot_whiskers(
     gate = (ell & (thick_dark == 0) & (red_d == 0) & (muz == 0)).astype(np.uint8)
     pos = hn[gate > 0]
     if pos.size < 40:
-        return np.zeros((h, w), np.uint8)
+        return np.zeros((h, w), np.uint8), []
     t_lo = float(np.percentile(pos, 90))
     cand = ((hn >= t_lo) & (gate > 0)).astype(np.uint8)
     dist = cv2.distanceTransform(cand, cv2.DIST_L2, 3)
@@ -1422,7 +2916,7 @@ def _junk_mascot_whiskers(
     sk = _morph_skeleton(cand)
     py, px = np.where(sk > 0)
     if px.size < 24:
-        return np.zeros((h, w), np.uint8)
+        return np.zeros((h, w), np.uint8), []
     dx = px.astype(np.float32) - xmid
     dy = py.astype(np.float32) - ymid
     rad = np.hypot(dx, dy)
@@ -1430,9 +2924,9 @@ def _junk_mascot_whiskers(
     # Whisker cones: sideways, not ears/chin. Right can tilt up toward an arm.
     right_cone = (ang >= -0.95) & (ang <= 0.45)
     left_cone = (ang >= 2.82) | (ang <= -2.82)
-    ok = (right_cone | left_cone) & (rad > 0.10 * mw) & (rad < 1.40 * mw)
+    ok = (right_cone | left_cone) & (rad > 0.10 * mw) & (rad < 1.70 * mw)
     if int(ok.sum()) < 16:
-        return np.zeros((h, w), np.uint8)
+        return np.zeros((h, w), np.uint8), []
 
     nbins = 144
     edges = np.linspace(-math.pi, math.pi, nbins + 1)
@@ -1494,7 +2988,12 @@ def _junk_mascot_whiskers(
                 break
             if dark_m[iy, ix] and r > 0.70 * mw:
                 break
-            if sil[iy, ix] and r > 1.18 * mw:
+            # Paper hairs may leave the sil; only clip on-figure rays that
+            # have already cleared the muzzle.
+            if sil[iy, ix]:
+                if r > 1.50 * mw:
+                    break
+            elif r > 1.90 * mw:
                 break
             out.append((x, y))
         return out
@@ -1519,7 +3018,7 @@ def _junk_mascot_whiskers(
         da = np.minimum(da, 2.0 * math.pi - da)
         sel = ok & (da < 0.072)
         chain, occ = _ray_chain(sel, 10.0)
-        if chain is None or occ < 0.34:
+        if chain is None or occ < 0.28:
             continue
         chain = _clip(chain)
         if len(chain) < 6:
@@ -1540,7 +3039,7 @@ def _junk_mascot_whiskers(
                 )
             )
         )
-        if span < 0.24 * mw or rms > 16.0:
+        if span < 0.18 * mw or rms > 18.0:
             continue
         side_r = math.cos(a0) > 0.0
         paths.append((span, chain, a0, side_r))
@@ -1549,9 +3048,9 @@ def _junk_mascot_whiskers(
     kept = []
     n_left = n_right = 0
     for span, chain, a0, side_r in paths:
-        if side_r and n_right >= 4:
+        if side_r and n_right >= 5:
             continue
-        if (not side_r) and n_left >= 4:
+        if (not side_r) and n_left >= 5:
             continue
         twin = False
         for _sp, _ch, kang, _sr in kept:
@@ -1588,7 +3087,7 @@ def _junk_mascot_whiskers(
         _sv("w-sk2.png", out)
         hn8 = (np.clip(hn, 0, 1) * 255).astype(np.uint8)
         Image.fromarray(hn8).save(os.path.join(dbg, "w-score.png"))
-    return out
+    return out, int_paths
 
 
 def _fold_unkept_dark(assign, di, keep):
@@ -1810,7 +3309,7 @@ def apply_junk_mascot_keyline(rgb_edge, assign, palette):
                 red_i = i
 
     # --- Whiskers: long thin muzzle-flank hairs (paper halo + orange fur) ---
-    whisk_raw = _junk_mascot_whiskers(
+    whisk_raw, whisk_polylines = _junk_mascot_whiskers(
         luma, ch, muz_f, sil, assign, red_i, dark_m, inner, maxe, sil_h
     )
 
@@ -1854,10 +3353,13 @@ def apply_junk_mascot_keyline(rgb_edge, assign, palette):
 
     outer = cv2.morphologyEx(outer, cv2.MORPH_CLOSE, k5)
     # Clip bulky key to the silhouette; whiskers may extend into paper.
+    # Keep whisker pixels OUT of bulky so Schneider cannot fair hairs off the sil.
     bulky = (dark_clean | outer | inner | script).astype(np.uint8)
+    if int(whisk_raw.sum()) > 8:
+        bulky[whisk_raw > 0] = 0
     near = cv2.dilate(sil, cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (13, 13)))
     bulky[near == 0] = 0
-    key = (bulky | whisk_raw).astype(np.uint8)
+    key = bulky.astype(np.uint8)
 
     n, labels, stats, _ = cv2.connectedComponentsWithStats(key, connectivity=8)
     key2 = np.zeros_like(key)
@@ -1876,9 +3378,17 @@ def apply_junk_mascot_keyline(rgb_edge, assign, palette):
     pal[di] = np.array([0.0, 0.0, 0.0])
     for extra in dark_i[1:]:
         out[out == extra] = di
-    keep_dark = ((dark_clean > 0) | (key2 > 0)).astype(np.uint8)
+    keep_dark = ((dark_clean > 0) | (key2 > 0) | (whisk_raw > 0)).astype(np.uint8)
     out = _fold_unkept_dark(out, di, keep_dark)
     out[key2 > 0] = di
+    # Isolate whisker strokes: 1px paper gap at 4-connect to bulky dark so
+    # they are their own graph faces instead of silhouette spikes.
+    if int(whisk_raw.sum()) > 8:
+        other = ((out == di) & (whisk_raw == 0)).astype(np.uint8)
+        ker4 = np.array([[0, 1, 0], [1, 1, 1], [0, 1, 0]], np.uint8)
+        root = (whisk_raw > 0) & (cv2.dilate(other, ker4) > 0)
+        out[root] = -1
+        out[(whisk_raw > 0) & ~root] = di
     # Small paper bites inside the silhouette (JPEG stairs on a thin finger)
     # become body fill so the keyline isn't a dashed line on white.
     if chrom_i:
@@ -1946,6 +3456,8 @@ def apply_junk_mascot_keyline(rgb_edge, assign, palette):
         "dark_i": di,
         "script": bool(int(script.sum()) > 0),
         "whisk": whisk_raw,
+        "whisk_polylines": whisk_polylines or [],
+        "whisk_thick": max(2, int(round(0.0017 * maxe))),
     }
 
 
@@ -2920,6 +4432,11 @@ def vectorize_vtracer(
         except Exception:
             pass
     svg, n_paths, pal = wrap_vtracer_svg(raw, width_in, height_in)
+    polish_kind = "fair" if soft_flat else ("logo" if kind == "logo" else "fair")
+    svg, polish_stats = polish_traced_svg(
+        svg, kind=polish_kind, try_primitives=(kind == "logo" or soft_flat)
+    )
+    n_paths = len(re.findall(r"<path\b", svg, re.I)) or n_paths
     meta = {
         "engine": "decoclub-vector",
         "backend": "vtracer",
@@ -2937,8 +4454,101 @@ def vectorize_vtracer(
         "rec_err": round(float(rec_err), 2),
         "vtracer": settings,
         "soft_flat": bool(soft_flat),
+        "polish": polish_stats,
     }
     return svg, meta
+
+
+def slic_merge_assign(work, assign, pal, *, n_segments=400):
+    """Majority-vote SLIC cells onto the ink map so Imagine parts stay islands.
+
+    Protects thin dark (lum<50, width≤3) — whiskers / keylines must not vote away.
+    """
+    try:
+        from skimage.segmentation import slic as _slic
+    except Exception:
+        return assign
+    a = np.asarray(assign, dtype=np.int32)
+    h, w = a.shape
+    if h < 24 or w < 24 or not len(pal):
+        return a
+    dark = np.zeros((h, w), dtype=np.uint8)
+    for i, c in enumerate(pal):
+        if _is_keyline_ink(c):
+            dark[a == i] = 1
+    thin = np.zeros((h, w), dtype=bool)
+    if int(dark.sum()) > 0:
+        dist = cv2.distanceTransform(dark, cv2.DIST_L2, 3)
+        thin = (dark > 0) & (dist <= 3.0)
+    chroma_light = np.zeros((h, w), dtype=bool)
+    for i, c in enumerate(pal):
+        if lum(c) >= 80 and chroma_of_lab(lab_of_rgb([c])[0]) >= 20:
+            chroma_light[a == i] = True
+    nseg = int(max(80, min(int(n_segments), max(80, (h * w) // 400))))
+    try:
+        img = work.astype(np.float32) / 255.0
+        if img.ndim == 2:
+            img = np.stack([img, img, img], axis=-1)
+        elif img.shape[-1] > 3:
+            img = img[..., :3]
+        seg = _slic(
+            img,
+            n_segments=nseg,
+            compactness=12.0,
+            start_label=1,
+            channel_axis=-1,
+            enforce_connectivity=True,
+        )
+    except Exception:
+        return a
+    out = a.copy()
+    for lab in np.unique(seg):
+        m = seg == lab
+        if thin[m].mean() > 0.35:
+            continue
+        vals = a[m]
+        ink_vals = vals[vals >= 0]
+        if ink_vals.size < 8:
+            continue
+        # Superpixel is mostly paper — do not grow a halo around the figure.
+        if ink_vals.size < 0.55 * vals.size:
+            continue
+        u, counts = np.unique(ink_vals, return_counts=True)
+        maj = int(u[int(np.argmax(counts))])
+        write = m & ~thin & (a >= 0)
+        # Dark majority must not swallow gold cheeks / paw pads.
+        if lum(pal[maj]) < 55:
+            write = write & ~chroma_light
+        out[write] = maj
+    return out
+
+
+def recast_miscolored_islands(work, assign, pal):
+    """Recast a CC whose mean RGB is clearly closer to another ink (Imagine cheek blobs)."""
+    if assign is None or not len(pal) or work is None:
+        return assign
+    a = np.asarray(assign, dtype=np.int32).copy()
+    pal_f = [np.asarray(c, dtype=np.float32) for c in pal]
+    rgb = np.asarray(work, dtype=np.float32)
+    k = len(pal_f)
+    for i in range(k):
+        m = (a == i).astype(np.uint8)
+        if int(m.sum()) < 40:
+            continue
+        n, labels, stats, _ = cv2.connectedComponentsWithStats(m, connectivity=4)
+        for li in range(1, n):
+            area = int(stats[li, cv2.CC_STAT_AREA])
+            if area < 40:
+                continue
+            ys, xs = np.where(labels == li)
+            mean = rgb[ys, xs].mean(axis=0)
+            dists = [float(np.linalg.norm(mean - c)) for c in pal_f]
+            best = int(np.argmin(dists))
+            if best == i:
+                continue
+            if dists[best] < 0.72 * max(dists[i], 1.0):
+                a[labels == li] = best
+    return a
 
 
 def _soft_flat_assign(work, paper_w, pal, paper_rgb):
@@ -2947,11 +4557,26 @@ def _soft_flat_assign(work, paper_w, pal, paper_rgb):
     assign = fill_small_assign_holes(
         assign, pal, max_hole=max(40, int(0.00012 * assign.size))
     )
-    min_fill = max(36, int(0.00008 * assign.size))
+    min_fill = max(48, int(0.00014 * assign.size))
     assign = regularize_assign(assign, pal, win=3, min_fill=min_fill)
     assign = absorb_internal_shadows(assign, pal)
     assign = punch_border_strips(assign, thick_frac=0.028)
-    assign = despeckle(assign, pal, min_size=max(8, int(0.00003 * assign.size)))
+    assign = despeckle(assign, pal, min_size=max(10, int(0.00004 * assign.size)))
+    # Shared-boundary vote, then SLIC so paw/muzzle/shirt stay islands.
+    # Do not seal inks into paper — that grew a dark halo around Imagine art.
+    assign = enforce_shared_edges(assign, pal, iters=3)
+    assign = slic_merge_assign(work, assign, pal, n_segments=280)
+    assign = merge_small_islands(
+        assign, pal, min_size=max(80, int(0.00030 * assign.size))
+    )
+    assign = close_large_plates(assign, pal, ksize=3)
+    assign = fill_small_assign_holes(
+        assign, pal, max_hole=max(100, int(0.00028 * assign.size))
+    )
+    # Tight sandwiches only — a wide exterior-paper peel eats Imagine
+    # muzzles/foreheads that sit near the sheet edge.
+    assign = collapse_aa_rim(assign, pal, max_width=1.8)
+    assign = despeckle(assign, pal, min_size=max(12, int(0.00005 * assign.size)))
     return assign
 
 
@@ -2985,7 +4610,7 @@ def _soft_flat_raster(assign, pal, paper_rgb):
 
 
 def vectorize_soft_flat(rgb, paper, paper_rgb, inches, kind, t0, h0, w0, rec_err):
-    """Snap smooth AI/illustration art to screenprint inks, then trace the snapped raster."""
+    """Snap smooth AI/illustration art to screenprint inks, then Vector-Graph trace."""
     work = flatten_soft_interiors(rgb, paper)
     h, w = work.shape[:2]
     cap = 900
@@ -3013,6 +4638,7 @@ def vectorize_soft_flat(rgb, paper, paper_rgb, inches, kind, t0, h0, w0, rec_err
     assign = _soft_flat_assign(work, paper_w, pal, paper_rgb)
     assign, pal = compact_assign_palette(assign, pal)
     snapped = _soft_flat_raster(assign, pal, paper_rgb)
+    adj = region_adjacency(assign)
 
     if w0 >= h0:
         width_in = float(inches)
@@ -3021,7 +4647,141 @@ def vectorize_soft_flat(rgb, paper, paper_rgb, inches, kind, t0, h0, w0, rec_err
         height_in = float(inches)
         width_in = float(inches) * (w0 / float(h0))
 
-    # Prefer spline trace of the *snapped* raster (not raw gradients).
+    up = 2 if max(h, w) < 1100 else 1
+    if up > 1:
+        assign_u = cv2.resize(
+            assign.astype(np.int16),
+            (w * up, h * up),
+            interpolation=cv2.INTER_NEAREST,
+        ).astype(np.int32)
+        work_u = cv2.resize(work, (w * up, h * up), interpolation=cv2.INTER_LINEAR)
+    else:
+        assign_u = assign.astype(np.int32)
+        work_u = work
+    sx = width_in / assign_u.shape[1]
+    sy = height_in / assign_u.shape[0]
+
+    # PRIMARY: path-level Vector Graph (shared Béziers / knockout seams).
+    try:
+        layers, aux = vector_graph_layers(
+            assign_u,
+            pal,
+            sx,
+            sy,
+            rgb=work_u,
+            logo=False,
+            try_primitives=True,
+            min_area_px=16,
+            gap_fill=True,
+        )
+        n_paths = sum(len(L["paths"]) for L in layers)
+        cov = float(aux.get("coverage") or 0.0)
+        if layers and n_paths >= 3 and cov >= 0.62 and not aux.get("too_sharded"):
+            svg = svg_from_layers_with_gaps(
+                layers,
+                width_in,
+                height_in,
+                to_hex(paper_rgb),
+                gap_strokes=aux.get("gap_strokes") or [],
+            )
+            # Do not polish: independent fairing would break shared-seam cubics.
+            n_paths = len(re.findall(r"<path\b", svg, re.I))
+            meta = {
+                "engine": "decoclub-vector",
+                "backend": "vector-graph",
+                "mode": kind,
+                "paths": n_paths,
+                "colors": len(layers),
+                "palette": [to_hex(c) for c in pal],
+                "pixel": [w0, h0],
+                "work": [w, h],
+                "up": up,
+                "inches": [width_in, height_in],
+                "ms": int((time.time() - t0) * 1000),
+                "paper": to_hex(paper_rgb),
+                "overlay": False,
+                "rec_err": round(float(rec_err), 2),
+                "soft_flat": True,
+                "keyline": False,
+                "shared_edge": True,
+                "adjacency": len(adj),
+                "cracks": aux.get("cracks"),
+                "loops": aux.get("loops"),
+                "coverage": aux.get("coverage"),
+                "vector_graph": "shared-seams",
+                "primitives": aux.get("primitives"),
+                "shared_seams": aux.get("shared_seams"),
+                "polish": {},
+            }
+            return svg, meta
+    except Exception as e:
+        sys.stderr.write(f"vector_graph soft_flat failed: {e}\n")
+        pass
+
+    plates_svg = None
+    plates_meta = None
+    try:
+        layers = []
+        order = list(range(len(pal)))
+        order.sort(key=lambda i: (-lum(pal[i]), -int((assign_u == i).sum())))
+        for i in order:
+            mask = (assign_u == i).astype(np.uint8)
+            if int(mask.sum()) < 16:
+                continue
+            is_dark = lum(pal[i]) < 50
+            paths = potrace_paths(
+                mask,
+                sx,
+                sy,
+                scale=1,
+                alphamax=1.333 if is_dark else 1.0,
+                opttol=0.14 if is_dark else 0.20,
+                turdsize=1 if is_dark else 3,
+                smooth=0.12 if is_dark else 0.18,
+            )
+            if not paths:
+                continue
+            layers.append(
+                {
+                    "hex": to_hex(pal[i]),
+                    "name": layer_name(pal[i]),
+                    "paths": paths,
+                    "lum": lum(pal[i]),
+                    "n": int(mask.sum()),
+                }
+            )
+        if layers and sum(len(L["paths"]) for L in layers) >= 4:
+            psvg = svg_from_layers(layers, width_in, height_in, to_hex(paper_rgb))
+            psvg, polish_stats = polish_traced_svg(psvg, kind="logo", try_primitives=True)
+            n_paths = len(re.findall(r"<path\b", psvg, re.I))
+            plates_svg = psvg
+            plates_meta = {
+                "engine": "decoclub-vector",
+                "backend": "potrace",
+                "mode": kind,
+                "paths": n_paths,
+                "colors": len(layers),
+                "palette": [to_hex(c) for c in pal],
+                "pixel": [w0, h0],
+                "work": [w, h],
+                "up": up,
+                "inches": [width_in, height_in],
+                "ms": int((time.time() - t0) * 1000),
+                "paper": to_hex(paper_rgb),
+                "overlay": False,
+                "rec_err": round(float(rec_err), 2),
+                "soft_flat": True,
+                "keyline": False,
+                "shared_edge": True,
+                "adjacency": len(adj),
+                "vector_graph": "lite-plates",
+                "polish": polish_stats,
+            }
+    except Exception:
+        plates_svg = None
+        plates_meta = None
+
+    # Fallback: spline trace of the *snapped* shared-edge raster.
     try:
         settings = {
             "mode": "spline",
@@ -3048,6 +4808,7 @@ def vectorize_soft_flat(rgb, paper, paper_rgb, inches, kind, t0, h0, w0, rec_err
                 pass
         svg, n_paths, vpal = wrap_vtracer_svg(raw, width_in, height_in)
         svg = remap_svg_fills_to_palette(svg, pal, paper_rgb)
+        svg, polish_stats = polish_traced_svg(svg, kind="fair", try_primitives=True)
         fills = re.findall(r'fill="(#[0-9A-Fa-f]{3,8})"', svg)
         n_paths = len(re.findall(r"<path\b", svg, re.I))
         pal_out = []
@@ -3073,25 +4834,22 @@ def vectorize_soft_flat(rgb, paper, paper_rgb, inches, kind, t0, h0, w0, rec_err
             "overlay": False,
             "rec_err": round(float(rec_err), 2),
             "vtracer": settings,
-            "soft_flat": True,
+                        "soft_flat": True,
             "keyline": False,
+            "shared_edge": True,
+            "adjacency": len(adj),
+            "vector_graph": "lite-snap",
+            "polish": polish_stats,
         }
         return svg, meta
     except Exception:
         pass
 
-    # Potrace plates on nearest-upsampled hard cells.
-    up = 2 if max(h, w) < 1100 else 1
-    if up > 1:
-        assign_u = cv2.resize(
-            assign.astype(np.int16),
-            (w * up, h * up),
-            interpolation=cv2.INTER_NEAREST,
-        )
-    else:
-        assign_u = assign
-    sx = width_in / assign_u.shape[1]
-    sy = height_in / assign_u.shape[0]
+    if plates_svg is not None and plates_meta is not None:
+        plates_meta["ms"] = int((time.time() - t0) * 1000)
+        return plates_svg, plates_meta
+
+    # Last-resort potrace plates on hard cells (up / assign_u already set above).
     layers = []
     order = list(range(len(pal)))
     order.sort(key=lambda i: (-lum(pal[i]), -int((assign_u == i).sum())))
@@ -3122,7 +4880,9 @@ def vectorize_soft_flat(rgb, paper, paper_rgb, inches, kind, t0, h0, w0, rec_err
             }
         )
     svg = svg_from_layers(layers, width_in, height_in, to_hex(paper_rgb))
+    svg, polish_stats = polish_traced_svg(svg, kind="fair", try_primitives=True)
     n_paths = sum(len(L["paths"]) for L in layers)
+    n_paths = len(re.findall(r"<path\b", svg, re.I)) or n_paths
     meta = {
         "engine": "decoclub-vector",
         "backend": "potrace",
@@ -3140,6 +4900,9 @@ def vectorize_soft_flat(rgb, paper, paper_rgb, inches, kind, t0, h0, w0, rec_err
         "rec_err": round(float(rec_err), 2),
         "soft_flat": True,
         "keyline": False,
+        "shared_edge": True,
+        "vector_graph": "fallback-plates",
+        "polish": polish_stats,
     }
     return svg, meta
 
@@ -3440,6 +5203,7 @@ def vectorize(path: str, inches: float = 10.0, colors=None, mode: str = "auto"):
     speckle = max(6 if kind == "logo" else 10, int(0.00012 * assign.size))
     keylined = False
     whisk_m = None
+    kmeta = None
     if is_junk_mascot(noisy, kind, paper_rgb, palette):
         assign, palette, kmeta = apply_junk_mascot_keyline(rgb_edge_up, assign, palette)
         keylined = bool(kmeta)
@@ -3447,6 +5211,23 @@ def vectorize(path: str, inches: float = 10.0, colors=None, mode: str = "auto"):
             whisk_m = kmeta.get("whisk")
     if not keylined:
         assign = despeckle(assign, palette, min_size=speckle)
+    # Shared-edge cleanup after flats settle. Keyline owns dark topology —
+    # still peel light AA rims (gold halo) and merge tiny non-dark islands.
+    mw = max(3.2, 0.008 * max(assign.shape))
+    if not keylined:
+        assign = enforce_shared_edges(assign, palette, iters=2 if kind == "logo" else 3)
+        assign = collapse_aa_rim(assign, palette, max_width=mw)
+        if kind == "logo":
+            assign = split_dark_necks(assign, palette)
+            assign = tuck_dark_over_light(assign, palette, radius=1)
+            assign = merge_small_islands(
+                assign, palette, min_size=max(14, int(0.00004 * assign.size))
+            )
+    else:
+        assign = collapse_aa_rim(assign, palette, max_width=mw)
+        assign = merge_small_islands(
+            assign, palette, min_size=max(28, int(0.00008 * assign.size))
+        )
     if kind != "logo":
         assign, palette = collapse_aa_inks(assign, palette, grad_up, min_keep=4 if kind == "art" else 8)
     # Junk soft-JPEG logos: keep intentional screenprint inks. Recolor averages
@@ -3506,6 +5287,82 @@ def vectorize(path: str, inches: float = 10.0, colors=None, mode: str = "auto"):
         width_in = float(inches) * (w0 / float(h0))
     sx = width_in / assign.shape[1]
     sy = height_in / assign.shape[0]
+
+    # Path-level Vector Graph (shared seams / knockout).
+    # Keylined junk mascots: keyline is already unioned into the dark ink;
+    # try the graph first (no primitive swap on whiskers). Fall through to
+    # potrace plates if coverage fails so finger/whiskers survive.
+    if kind == "logo" and glyph is None and ov_mask is None:
+        try:
+            glayers, gaux = vector_graph_layers(
+                assign.astype(np.int32),
+                palette,
+                sx,
+                sy,
+                rgb=rgb_edge_up if rgb_edge_up is not None else up,
+                logo=True,
+                try_primitives=(not keylined),
+                min_area_px=max(4 if keylined else 10, int(0.00003 * assign.size)),
+                gap_fill=True,
+            )
+            gpaths = sum(len(L["paths"]) for L in glayers)
+            cov = float(gaux.get("coverage") or 0.0)
+            if (
+                glayers
+                and gpaths >= 2
+                and cov >= (0.55 if keylined else 0.62)
+                and not gaux.get("too_sharded")
+            ):
+                paper_hex = to_hex(paper_rgb)
+                overlay = []
+                if keylined and kmeta:
+                    di = kmeta.get("dark_i")
+                    dark_hex = to_hex(palette[di]) if di is not None else "#000000"
+                    overlay = _overlay_strokes_from_polylines(
+                        kmeta.get("whisk_polylines") or [],
+                        sx,
+                        sy,
+                        dark_hex,
+                        kmeta.get("whisk_thick") or 2,
+                    )
+                svg = svg_from_layers_with_gaps(
+                    glayers,
+                    width_in,
+                    height_in,
+                    paper_hex,
+                    gap_strokes=gaux.get("gap_strokes") or [],
+                    overlay_strokes=overlay,
+                )
+                n_paths = len(re.findall(r"<path\b", svg, re.I)) or gpaths
+                meta = {
+                    "engine": "decoclub-vector",
+                    "backend": "vector-graph",
+                    "mode": kind,
+                    "paths": n_paths,
+                    "colors": len(glayers),
+                    "palette": [to_hex(c) for c in palette],
+                    "pixel": [w0, h0],
+                    "work": [w, h],
+                    "up": up_scale,
+                    "inches": [width_in, height_in],
+                    "ms": int((time.time() - t0) * 1000),
+                    "paper": paper_hex,
+                    "overlay": bool(overlay is not None),
+                    "rec_err": round(rec_err, 2),
+                    "keyline": bool(keylined),
+                    "shared_edge": True,
+                    "cracks": gaux.get("cracks"),
+                    "loops": gaux.get("loops"),
+                    "coverage": gaux.get("coverage"),
+                    "vector_graph": "shared-seams",
+                    "primitives": gaux.get("primitives"),
+                    "shared_seams": gaux.get("shared_seams"),
+                    "polish": {},
+                }
+                return svg, meta
+        except Exception as e:
+            sys.stderr.write(f"vector_graph logo failed: {e}\n")
+            pass
 
     def emit(mask, rgb_c, *, alphamax=1.0, opttol=0.2, turdsize=2, smooth=0.55, opacity=None, suffix=""):
         m = (mask > 0).astype(np.uint8)
@@ -3650,7 +5507,14 @@ def vectorize(path: str, inches: float = 10.0, colors=None, mode: str = "auto"):
     paper_hex = to_hex(paper_rgb)
     # Dark full-bleed: still paint the underlay so holes aren't transparent.
     svg = svg_from_layers(layers, width_in, height_in, paper_hex)
-    n_paths = sum(len(L["paths"]) for L in layers)
+    # Keylined mascots: skip SVG fairing — compound whisker/keyline paths melt.
+    polish_stats = {}
+    if not keylined:
+        polish_kind = "logo" if kind == "logo" else "fair"
+        svg, polish_stats = polish_traced_svg(
+            svg, kind=polish_kind, try_primitives=(kind == "logo")
+        )
+    n_paths = len(re.findall(r"<path\b", svg, re.I)) or sum(len(L["paths"]) for L in layers)
     meta = {
         "engine": "decoclub-vector",
         "backend": "potrace",
@@ -3667,6 +5531,8 @@ def vectorize(path: str, inches: float = 10.0, colors=None, mode: str = "auto"):
         "overlay": bool(overlay is not None),
         "rec_err": round(rec_err, 2),
         "keyline": bool(keylined),
+        "shared_edge": (not keylined),
+        "polish": polish_stats,
     }
     return svg, meta
 
