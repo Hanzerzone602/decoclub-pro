@@ -20,6 +20,7 @@ const inventVectorize = require("./lib/inventVectorize");
 const rasterCorel = require("./lib/rasterCorel");
 const inventWarp = require("./lib/inventWarp");
 const vaiTrace = require("./lib/vaiTrace");
+const vectorizeGuard = require("./lib/vectorizeGuard");
 const colorspec = require("./lib/colorspec");
 const { hasRealPaths: vectorHasRealPaths } = require("./lib/stitch/svgLayers");
 const corelImport = require("./lib/corelImport");
@@ -310,7 +311,7 @@ async function runProVectorize(job, buf, body) {
   }
   applyProVectorFiles(job, svgRes.buf, epsBuf, { imageToken: svgRes.imageToken, credits: svgRes.credits });
 }
-function vectorizeInWorker(buf, widthIn, heightIn, opts, timeoutMs) {
+function vectorizeInWorker(buf, widthIn, heightIn, opts, timeoutMs, engine) {
   return new Promise(function (resolve, reject) {
     const worker = new Worker(path.resolve(__dirname, "lib", "vectorize-worker.js"), {
       workerData: {
@@ -318,6 +319,7 @@ function vectorizeInWorker(buf, widthIn, heightIn, opts, timeoutMs) {
         widthIn: widthIn,
         heightIn: heightIn,
         opts: opts || {},
+        engine: engine || "bezier",
       },
     });
     let done = false;
@@ -342,6 +344,38 @@ function vectorizeInWorker(buf, widthIn, heightIn, opts, timeoutMs) {
       reject(err);
     });
   });
+}
+
+/** vai-trace without blocking the event loop. Large jobs prefer worker; else async spawn. */
+async function runVaiTraceSafe(buf, job, body, sizeMeta) {
+  const timeoutMs = 180000;
+  const opts = {
+    colors: body && body.colors,
+    mode: (body && body.mode) || "auto",
+    timeoutMs: timeoutMs,
+  };
+  const info = vectorizeGuard.inspect(buf);
+  const useWorker = !!(sizeMeta && sizeMeta.sizeGuard && sizeMeta.sizeGuard.downscaled) || info.needsDownscale || info.bytes > 6 * 1024 * 1024;
+  let result;
+  if (useWorker) {
+    const msg = await vectorizeInWorker(buf, job.width_in, job.height_in, opts, timeoutMs + 5000, "vai-trace");
+    result = { svg: msg.svg, vec: msg.vec, meta: msg.meta || (msg.vec && msg.vec.meta) || {} };
+  } else {
+    result = await vaiTrace.vectorizeBufferAsync(buf, {
+      widthIn: job.width_in,
+      heightIn: job.height_in,
+      colors: opts.colors,
+      mode: opts.mode,
+      timeoutMs: timeoutMs,
+    });
+  }
+  if (sizeMeta && sizeMeta.sizeGuard) {
+    result.meta = Object.assign({}, result.meta || {}, { sizeGuard: sizeMeta.sizeGuard });
+    if (result.vec) {
+      result.vec.meta = Object.assign({}, result.vec.meta || {}, { sizeGuard: sizeMeta.sizeGuard });
+    }
+  }
+  return result;
 }
 function tryVectorizeJob(job) {
   /* sync path kept only for tests — production upload never calls this for big art */
@@ -1041,7 +1075,7 @@ async function handleApi(req, res, url) {
     if (!job.file_path) return json(res, 400, { error: "Artwork required to vectorize" });
     const abs = path.join(UPLOADS, path.basename(job.file_path));
     if (!fs.existsSync(abs)) return json(res, 404, { error: "Artwork missing" });
-    const buf = fs.readFileSync(abs);
+    let buf = fs.readFileSync(abs);
     const wantCorel = body.engine === "corel-import" || body.engine === "corel";
     const isSvg = corelImport.looksLikeSvg(buf);
     const svgText = isSvg ? buf.toString("utf8") : "";
@@ -1068,6 +1102,17 @@ async function handleApi(req, res, url) {
       }
     }
     if (buf[0] !== 0x89 || buf[1] !== 0x50) return json(res, 400, { error: "Need PNG, JPG, or WebP artwork" });
+    /* Keep full-res for invent-warp twin match; downscale only the buffer fed to heavy tracers. */
+    const srcBuf = buf;
+    let sizeMeta = { sizeGuard: { downscaled: false } };
+    try {
+      const guarded = vectorizeGuard.downscaleIfNeeded(buf);
+      buf = guarded.buf;
+      sizeMeta = guarded.meta || sizeMeta;
+    } catch (guardErr) {
+      const info = vectorizeGuard.inspect(srcBuf);
+      return json(res, 413, vectorizeGuard.rejectPayload(info));
+    }
     const wantApi = body.engine === "vectorizer.ai";
     const wantVtracer = body.engine === "vtracer";
     const wantVai = body.engine === "vai-trace" || body.engine === "vai" || body.engine === "local-trace";
@@ -1076,7 +1121,7 @@ async function handleApi(req, res, url) {
     const wantInvent = body.engine === "invent" || body.engine === "invent-transfer" || body.engine === "invent-trace" || body.engine === "invent-hybrid";
     try {
       if (wantHallucinate) {
-        const packed = rasterCorel.vectorizeToSvg(buf, job.width_in, job.height_in, Object.assign({}, body, {
+        const packed = rasterCorel.vectorizeToSvg(srcBuf, job.width_in, job.height_in, Object.assign({}, body, {
           fuse: body.fuse || "hallucinate",
           sizeIn: job.width_in,
         }));
@@ -1094,7 +1139,7 @@ async function handleApi(req, res, url) {
           body.engine === "invent-trace" ? "trace" :
           body.engine === "invent-hybrid" ? "hybrid" :
           (body.inventMode || body.mode || "auto");
-        const packed = inventVectorize.vectorizeToSvg(buf, job.width_in, job.height_in, Object.assign({}, body, {
+        const packed = inventVectorize.vectorizeToSvg(srcBuf, job.width_in, job.height_in, Object.assign({}, body, {
           mode: inventMode,
           sizeIn: job.width_in,
           corelSvg: body.corelSvg,
@@ -1118,13 +1163,7 @@ async function handleApi(req, res, url) {
       }
       if (wantVai) {
         if (!vaiTrace.available()) return json(res, 501, { error: vaiTrace.unavailableReason() || "vai-trace unavailable" });
-        const result = vaiTrace.vectorizeBuffer(buf, {
-          widthIn: job.width_in,
-          heightIn: job.height_in,
-          colors: body.colors,
-          mode: body.mode || "auto",
-          timeoutMs: 180000,
-        });
+        const result = await runVaiTraceSafe(buf, job, body, sizeMeta);
         applyVectorResult(job, result.vec, result.svg);
         if (body.apply_mockup) applyMockup(job);
         event(db, job, "Vectorized · vai-trace · " + (job.vector.layers || []).length + " colors");
@@ -1171,13 +1210,13 @@ async function handleApi(req, res, url) {
         try {
           const priorPng = rasterCorel.resolvePriorPng(opts);
           if (priorPng && fs.existsSync(priorPng) && typeof rasterCorel.srcMatchesPrior === "function") {
-            twin = rasterCorel.srcMatchesPrior(buf, fs.readFileSync(priorPng));
+            twin = rasterCorel.srcMatchesPrior(srcBuf, fs.readFileSync(priorPng));
           }
         } catch (matchErr) {
           twin = false;
         }
         if (twin) {
-          const packed = rasterCorel.vectorizeToSvg(buf, job.width_in, job.height_in, Object.assign({}, opts, { fuse: "auto" }));
+          const packed = rasterCorel.vectorizeToSvg(srcBuf, job.width_in, job.height_in, Object.assign({}, opts, { fuse: "auto" }));
           applyVectorResult(job, packed.vec, packed.svg);
           if (body.apply_mockup) applyMockup(job);
           const recipe = (packed.meta && packed.meta.recipe) || (packed.vec && packed.vec.meta && packed.vec.meta.recipe) || "invent-warp";
@@ -1187,14 +1226,9 @@ async function handleApi(req, res, url) {
           return json(res, 200, { job: presentJob(job, req), vector: job.vector, meta: packed.meta || (packed.vec && packed.vec.meta) });
         }
         // Non-twin: vai-trace first (general Lab+cubic). VTracer if missing. Bezier only in worker last.
+        // Large art is downscaled (sizeMeta) and run via worker / async spawn so the event loop cannot wedge.
         if (vaiTrace.available()) {
-          const result = vaiTrace.vectorizeBuffer(buf, {
-            widthIn: job.width_in,
-            heightIn: job.height_in,
-            colors: opts.colors,
-            mode: "auto",
-            timeoutMs: 180000,
-          });
+          const result = await runVaiTraceSafe(buf, job, Object.assign({}, body, { colors: opts.colors, mode: "auto" }), sizeMeta);
           applyVectorResult(job, result.vec, result.svg);
           if (body.apply_mockup) applyMockup(job);
           event(db, job, "Vectorized · vai-trace · " + (job.vector.layers || []).length + " colors");
@@ -1228,13 +1262,7 @@ async function handleApi(req, res, url) {
       } catch (bezErr) {
         if (vaiTrace.available()) {
           try {
-            const result = vaiTrace.vectorizeBuffer(buf, {
-              widthIn: job.width_in,
-              heightIn: job.height_in,
-              colors: body.colors,
-              mode: "auto",
-              timeoutMs: 180000,
-            });
+            const result = await runVaiTraceSafe(buf, job, Object.assign({}, body, { mode: "auto" }), sizeMeta);
             applyVectorResult(job, result.vec, result.svg);
             if (body.apply_mockup) applyMockup(job);
             event(db, job, "Vectorized · vai-trace fallback · " + (job.vector.layers || []).length + " colors");
