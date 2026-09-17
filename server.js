@@ -828,13 +828,39 @@ function applyQuote(job) {
   job.total = q.total;
   return q;
 }
+function artPathForMockup(job) {
+  // Prefer a raster the mockup compositor can load (PNG/JPEG). SVG alone used to yield a blank shirt.
+  if (job.vector_png && fs.existsSync(path.join(UPLOADS, path.basename(job.vector_png)))) return job.vector_png;
+  if (job.file_path) {
+    const abs = path.join(UPLOADS, path.basename(job.file_path));
+    const ext = path.extname(abs).toLowerCase();
+    if (fs.existsSync(abs) && (ext === ".png" || ext === ".jpg" || ext === ".jpeg" || ext === ".webp")) return job.file_path;
+  }
+  if (job.vector_svg) {
+    const svgAbs = path.join(UPLOADS, path.basename(job.vector_svg));
+    if (fs.existsSync(svgAbs)) {
+      const outName = "mockart-" + job.id.slice(0, 12) + ".png";
+      const outAbs = path.join(UPLOADS, outName);
+      try {
+        const { spawnSync } = require("child_process");
+        const r = spawnSync("rsvg-convert", ["-w", "1200", "-h", "1200", "--keep-aspect-ratio", "-f", "png", "-o", outAbs, svgAbs], { encoding: "utf8" });
+        if (r.status === 0 && fs.existsSync(outAbs)) {
+          job.vector_png = "/uploads/" + outName;
+          return job.vector_png;
+        }
+      } catch (e) { /* fall through */ }
+    }
+  }
+  return job.file_path || null;
+}
 function applyMockup(job) {
   const sku = findSku(job.catalog_code);
   if (sku) {
     if (!job.blank) job.blank = sku.kind;
     if (!job.garment_color) job.garment_color = sku.hex;
   }
-  const m = writeMockups(job, UPLOADS, job.file_path, sku);
+  const art = artPathForMockup(job);
+  const m = writeMockups(job, UPLOADS, art, sku);
   job.mockup_path = m.mockup_path;
   job.mockup_svg = m.mockup_svg;
 }
