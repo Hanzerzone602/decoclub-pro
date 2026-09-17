@@ -386,3 +386,33 @@ th { color: var(--muted); font-weight: 600; font-size: 11px; letter-spacing: .06
 .run-risk.risk-review { border-color: #b8860b; background: rgba(184,134,11,0.1); color: #7a5a08; }
 .run-risk.risk-hold { border-color: var(--danger); background: rgba(180,40,40,0.08); color: var(--danger); }
 .recipe-row { display: flex; flex-wrap: wrap; align-items: center; gap: 6px; margin: 0 0 10px; }
+
+
+/* Vectorize live options — sellable shop controls */
+.vz-options { display: flex; flex-direction: column; gap: 12px; margin: 12px 0 8px; padding: 12px; border: 1px solid var(--line); background: var(--panel); border-radius: 10px; }
+.vz-control-head { display: flex; flex-wrap: wrap; align-items: baseline; justify-content: space-between; gap: 6px; margin-bottom: 6px; }
+.vz-control-label { font-size: 12px; font-weight: 700; letter-spacing: 0.04em; text-transform: uppercase; color: var(--ink); }
+.vz-control-tip { font-size: 11px; max-width: 220px; text-align: right; line-height: 1.3; }
+.vz-seg-row { display: flex; gap: 6px; }
+.vz-seg { flex: 1; padding: 8px 6px; border: 1px solid var(--line); background: #fff; cursor: pointer; font-size: 12px; font-weight: 600; border-radius: 8px; color: var(--ink); }
+.vz-seg.on, .vz-seg:hover { border-color: var(--gold); color: var(--gold); background: rgba(196,149,58,0.06); }
+.vz-used { margin: 4px 0 10px; font-size: 12px; }
+.color-mode-row { display: flex; align-items: center; justify-content: space-between; gap: 10px; margin: 12px 0 6px; }
+.color-mode-seg { max-width: 160px; }
+.layer-color-edit { display: none; gap: 4px; flex-wrap: wrap; margin-top: 4px; }
+.layer-list.color-mode-rgb .layer-edit-rgb { display: flex; }
+.layer-list.color-mode-cmyk .layer-edit-cmyk { display: flex; }
+.layer-color-edit label { display: flex; align-items: center; gap: 3px; font-size: 10px; color: var(--muted); text-transform: uppercase; letter-spacing: 0.04em; }
+.layer-color-edit input[type=number] { width: 46px; padding: 3px 4px; font-size: 12px; border: 1px solid var(--line); background: #fff; color: var(--ink); border-radius: 4px; }
+.layer-row select.layer-pal { font-size: 11px; padding: 4px 6px; max-width: 150px; }
+
+.digitize-station { align-items: start; }
+.dig-stage { min-width: 0; }
+.dig-canvas { width: 100%; height: min(72vh, 640px); display: block; background: #12161e; border: 1px solid var(--line); }
+.dig-tools label { display: block; font-size: 11px; letter-spacing: .06em; text-transform: uppercase; color: var(--muted); margin: 12px 0 4px; }
+.dig-tools input[type=range] { width: 100%; }
+.dig-thread { width: 100%; min-height: 140px; background: var(--panel); border: 1px solid var(--line); }
+.dig-tools .stat, #digCount { font-size: 22px; font-weight: 700; margin: 0 0 6px; }
+@media (max-width: 960px) {
+  .dig-canvas { height: 48vh; }
+}

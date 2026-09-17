@@ -203,11 +203,22 @@ function tryAutoCorelImport(job, filePath, originalName) {
 function applyVectorResult(job, vec, svg) {
   if (!job || !vec) return;
   job.vector = vec;
+  if (job._pendingVzSettings) {
+    job.vector.meta = Object.assign({}, job.vector.meta || {}, { settings: job._pendingVzSettings });
+  }
   const name = Date.now() + "-" + uid() + "-vector.svg";
   fs.writeFileSync(path.join(UPLOADS, name), svg);
   job.vector_svg = "/uploads/" + name;
   delete job.vector_eps;
 }
+function stampVzSettings(job, body) {
+  if (!job || !body || !body._vzSettings) return;
+  job._pendingVzSettings = body._vzSettings;
+  if (job.vector) {
+    job.vector.meta = Object.assign({}, job.vector.meta || {}, { settings: body._vzSettings });
+  }
+}
+
 function layersFromSvgFills(svgText, widthIn, heightIn) {
   const fills = [];
   const seen = new Set();
@@ -263,6 +274,9 @@ function applyVtracerResult(job, result) {
     delete job.vector_eps;
   }
   job.vector = result.vec;
+  if (job._pendingVzSettings && job.vector) {
+    job.vector.meta = Object.assign({}, job.vector.meta || {}, { settings: job._pendingVzSettings });
+  }
 }
 
 function runVtracerVectorize(job, buf, body) {
@@ -271,13 +285,20 @@ function runVtracerVectorize(job, buf, body) {
     err.code = "NO_VTRACER";
     throw err;
   }
+  const norm = body && body._vzSettings ? body : normalizeVectorizeBody(body || {});
   const result = vtracer.vectorizeBuffer(buf, {
     widthIn: job.width_in,
     heightIn: job.height_in,
-    colors: body && body.colors,
+    colors: norm.colors,
+    cornerThreshold: norm.cornerThreshold,
+    filterSpeckle: norm.filterSpeckle,
+    segmentLength: norm.segmentLength,
     timeoutMs: 120000,
   });
   applyVtracerResult(job, result);
+  if (job.vector) {
+    job.vector.meta = Object.assign({}, job.vector.meta || {}, { settings: norm._vzSettings });
+  }
   return result;
 }
 
@@ -346,13 +367,105 @@ function vectorizeInWorker(buf, widthIn, heightIn, opts, timeoutMs, engine) {
   });
 }
 
+
+/** Map sellable Vectorize UI labels → engine clamps. */
+function normalizeVectorizeBody(body) {
+  body = body || {};
+  const DETAIL = {
+    low: 4, simple: 4,
+    medium: 8, balanced: 8,
+    high: 12, fine: 12,
+  };
+  const SMOOTH = {
+    low: { epsilon: 0.55, filterSpeckle: 2, segmentLength: 3.2 },
+    medium: { epsilon: 0.95, filterSpeckle: 4, segmentLength: 4 },
+    high: { epsilon: 1.4, filterSpeckle: 8, segmentLength: 5.5 },
+  };
+  const CORNER = {
+    sharp: { fitError: 0.55, cornerCos: -0.55, cornerThreshold: 40 },
+    balanced: { fitError: 1.1, cornerCos: -0.28, cornerThreshold: 60 },
+    smooth: { fitError: 1.85, cornerCos: 0.15, cornerThreshold: 90 },
+  };
+  function clamp(n, lo, hi, fallback) {
+    const v = Number(n);
+    if (!Number.isFinite(v)) return fallback;
+    return Math.max(lo, Math.min(hi, v));
+  }
+  let detailKey = String(body.detail || body.detailLevel || "").toLowerCase();
+  if (!detailKey && body.colors != null) {
+    const c = Number(body.colors);
+    detailKey = c <= 5 ? "low" : (c >= 11 ? "high" : "medium");
+  }
+  if (!DETAIL[detailKey]) detailKey = "medium";
+  const colors = clamp(body.colors != null ? body.colors : DETAIL[detailKey], 2, 24, DETAIL[detailKey]);
+
+  let smoothKey = String(body.smoothing || body.smooth || "").toLowerCase();
+  if (!SMOOTH[smoothKey]) smoothKey = "medium";
+  const smooth = SMOOTH[smoothKey];
+
+  let cornerKey = String(body.cornerSmooth || body.corners || body.corner || "").toLowerCase();
+  if (!CORNER[cornerKey]) cornerKey = "balanced";
+  const corner = CORNER[cornerKey];
+
+  const epsilon = clamp(body.epsilon != null ? body.epsilon : smooth.epsilon, 0.2, 3, smooth.epsilon);
+  const fitError = clamp(body.fitError != null ? body.fitError : corner.fitError, 0.2, 4, corner.fitError);
+  const cornerCos = clamp(body.cornerCos != null ? body.cornerCos : corner.cornerCos, -1, 1, corner.cornerCos);
+  const cornerThreshold = clamp(body.cornerThreshold != null ? body.cornerThreshold : corner.cornerThreshold, 20, 120, corner.cornerThreshold);
+  const filterSpeckle = clamp(body.filterSpeckle != null ? body.filterSpeckle : smooth.filterSpeckle, 0, 16, smooth.filterSpeckle);
+  const segmentLength = clamp(body.segmentLength != null ? body.segmentLength : smooth.segmentLength, 1, 12, smooth.segmentLength);
+
+  const detailCanon = detailKey === "simple" || detailKey === "low" ? "low"
+    : (detailKey === "fine" || detailKey === "high" ? "high" : "medium");
+  const settings = {
+    detail: detailCanon,
+    smoothing: smoothKey,
+    cornerSmooth: cornerKey,
+    colors: colors,
+    epsilon: epsilon,
+    fitError: fitError,
+    cornerCos: cornerCos,
+  };
+
+  return Object.assign({}, body, {
+    colors: colors,
+    epsilon: epsilon,
+    fitError: fitError,
+    cornerCos: cornerCos,
+    cornerThreshold: cornerThreshold,
+    filterSpeckle: filterSpeckle,
+    segmentLength: segmentLength,
+    detail: settings.detail,
+    smoothing: settings.smoothing,
+    cornerSmooth: settings.cornerSmooth,
+    _vzSettings: settings,
+  });
+}
+
+function attachVzSettings(resultOrJob, body) {
+  const settings = body && body._vzSettings;
+  if (!settings) return;
+  if (resultOrJob && resultOrJob.meta) {
+    resultOrJob.meta = Object.assign({}, resultOrJob.meta, { settings: settings });
+  }
+  if (resultOrJob && resultOrJob.vec) {
+    resultOrJob.vec.meta = Object.assign({}, resultOrJob.vec.meta || {}, { settings: settings });
+  }
+  if (resultOrJob && resultOrJob.vector) {
+    resultOrJob.vector.meta = Object.assign({}, resultOrJob.vector.meta || {}, { settings: settings });
+  }
+}
+
 /** vai-trace without blocking the event loop. Large jobs prefer worker; else async spawn. */
 async function runVaiTraceSafe(buf, job, body, sizeMeta) {
   const timeoutMs = 180000;
+  const norm = body && body._vzSettings ? body : normalizeVectorizeBody(body || {});
   const opts = {
-    colors: body && body.colors,
-    mode: (body && body.mode) || "auto",
+    colors: norm.colors,
+    mode: (norm && norm.mode) || "auto",
     timeoutMs: timeoutMs,
+    epsilon: norm.epsilon,
+    fitError: norm.fitError,
+    cornerCos: norm.cornerCos,
   };
   const info = vectorizeGuard.inspect(buf);
   const useWorker = !!(sizeMeta && sizeMeta.sizeGuard && sizeMeta.sizeGuard.downscaled) || info.needsDownscale || info.bytes > 6 * 1024 * 1024;
@@ -367,6 +480,9 @@ async function runVaiTraceSafe(buf, job, body, sizeMeta) {
       colors: opts.colors,
       mode: opts.mode,
       timeoutMs: timeoutMs,
+      epsilon: opts.epsilon,
+      fitError: opts.fitError,
+      cornerCos: opts.cornerCos,
     });
   }
   if (sizeMeta && sizeMeta.sizeGuard) {
@@ -375,6 +491,7 @@ async function runVaiTraceSafe(buf, job, body, sizeMeta) {
       result.vec.meta = Object.assign({}, result.vec.meta || {}, { sizeGuard: sizeMeta.sizeGuard });
     }
   }
+  attachVzSettings(result, norm);
   return result;
 }
 function tryVectorizeJob(job) {
@@ -1071,7 +1188,8 @@ async function handleApi(req, res, url) {
     if (!requireProduce(user, res)) return;
     const job = db.jobs.find(function (j) { return j.id === vecPath[1] && j.shop_id === user.shop_id; });
     if (!job) return json(res, 404, { error: "Job not found" });
-    const body = parseJsonBody(await readBody(req));
+    const body = normalizeVectorizeBody(parseJsonBody(await readBody(req)));
+    stampVzSettings(job, body);
     if (!job.file_path) return json(res, 400, { error: "Artwork required to vectorize" });
     const abs = path.join(UPLOADS, path.basename(job.file_path));
     if (!fs.existsSync(abs)) return json(res, 404, { error: "Artwork missing" });
@@ -1183,6 +1301,7 @@ async function handleApi(req, res, url) {
           maxEdge: Math.min(Number(body.maxEdge) || 720, 800),
           epsilon: body.epsilon,
           fitError: body.fitError,
+          cornerCos: body.cornerCos,
         };
         const msg = await vectorizeInWorker(buf, job.width_in, job.height_in, opts, 90000);
         applyVectorResult(job, msg.vec, msg.svg);
@@ -1198,7 +1317,9 @@ async function handleApi(req, res, url) {
       const opts = {
         colors: body.colors == null ? 8 : body.colors,
         maxEdge: Math.min(Number(body.maxEdge) || 720, 900),
+        epsilon: body.epsilon,
         fitError: body.fitError,
+        cornerCos: body.cornerCos,
         overlapPx: body.overlapPx,
         fuse: body.fuse || "auto",
         priorSvg: body.priorSvg,
@@ -1245,7 +1366,9 @@ async function handleApi(req, res, url) {
         const wopts = {
           colors: opts.colors,
           maxEdge: Math.min(opts.maxEdge, 640),
+          epsilon: body.epsilon,
           fitError: body.fitError,
+          cornerCos: body.cornerCos,
           overlapPx: body.overlapPx,
         };
         const msg = await vectorizeInWorker(buf, job.width_in, job.height_in, wopts, 120000);
@@ -1292,6 +1415,18 @@ async function handleApi(req, res, url) {
     const idx = Number(body.layer);
     if (!job.vector.layers[idx]) return json(res, 400, { error: "Unknown layer" });
     const prevHex = job.vector.layers[idx].hex;
+    if (body.cmyk && (body.cmyk.c != null || body.cmyk.C != null)) {
+      const c = body.cmyk.c != null ? body.cmyk.c : body.cmyk.C;
+      const m = body.cmyk.m != null ? body.cmyk.m : body.cmyk.M;
+      const y = body.cmyk.y != null ? body.cmyk.y : body.cmyk.Y;
+      const k = body.cmyk.k != null ? body.cmyk.k : body.cmyk.K;
+      body.hex = colorspec.cmykToHex(c, m, y, k);
+    } else if (body.rgb && (body.rgb.r != null || body.rgb.R != null)) {
+      const r = body.rgb.r != null ? body.rgb.r : body.rgb.R;
+      const g = body.rgb.g != null ? body.rgb.g : body.rgb.G;
+      const b = body.rgb.b != null ? body.rgb.b : body.rgb.B;
+      body.hex = colorspec.rgbToHex(r, g, b);
+    }
     if (body.hex) job.vector.layers[idx].hex = String(body.hex);
     if (body.hex) {
       const ann = colorspec.annotateLayer({ hex: job.vector.layers[idx].hex, paths: job.vector.layers[idx].paths || [] });

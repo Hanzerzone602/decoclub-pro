@@ -514,39 +514,93 @@ function palSelect(kind, palettes, currentHex) {
 async function fillArt(el, job, shopControls) {
   const pals = shopControls ? await loadPalettes() : { pantone: [], vinyl: [], thread: [], stone: [], madeiraRayon: [], madeiraPolyneon: [] };
   const pantones = pals.pantone || [];
-  const madeira = (pals.madeiraRayon && pals.madeiraRayon.length) ? pals.madeiraRayon : (pals.thread || []);
   const layers = (job.vector && job.vector.layers) || [];
   const vzMeta = (job.vector && job.vector.meta) || {};
-  const vzRecipe = vzMeta.recipe || vzMeta.engine || (job.vector && job.vector.source) || "";
-  const vzRecipeHtml = vzRecipe
-    ? `<p class="muted" id="vzRecipe"><strong>Vectorize recipe:</strong> ${escapeHtml(String(vzRecipe))}${vzMeta.bundled ? " (bundled)" : ""}</p>`
-    : `<p class="muted" id="vzRecipe">Vectorize recipe: <em>not run yet</em></p>`;
+  const lastSet = vzMeta.settings || {};
+  function loadVzPref(key, fallback) {
+    try {
+      const v = localStorage.getItem("dc_vz_" + key);
+      return v != null && v !== "" ? v : fallback;
+    } catch (e) { return fallback; }
+  }
+  function saveVzPref(key, val) {
+    try { localStorage.setItem("dc_vz_" + key, String(val)); } catch (e) { /* ignore */ }
+  }
+  const initDetail = lastSet.detail || loadVzPref("detail", "medium");
+  const initSmooth = lastSet.smoothing || loadVzPref("smoothing", "medium");
+  const initCorner = lastSet.cornerSmooth || loadVzPref("corner", "balanced");
+  const initColorMode = loadVzPref("colorMode", "rgb");
   const hasArt = !!(job.vector_svg || job.file_path);
   const preview = job.vector_svg
     ? `<div id="artZoomSvg" class="art-svg-host" data-src="${escapeHtml(job.vector_svg)}"></div>`
     : (job.file_path ? `<img id="artZoomImg" src="${job.file_path}" alt="Art" draggable="false" />` : `<div class="drop-hint"><strong>Drop art here</strong><span>PNG, JPG, or WebP</span></div>`);
-  function layerLabel(L) {
-    if (L.rgb && L.cmyk) {
-      const rgb = "R" + L.rgb.r + " G" + L.rgb.g + " B" + L.rgb.b;
-      const cmyk = "C" + L.cmyk.c + " M" + L.cmyk.m + " Y" + L.cmyk.y + " K" + L.cmyk.k;
-      return rgb + " · " + cmyk + (L.pantone ? " · " + L.pantone : "");
-    }
-    return L.nameGuess || (L.hex || "").toUpperCase();
+  function layerRgb(L) {
+    if (L.rgb) return L.rgb;
+    const h = String(L.hex || "#111111").replace("#", "");
+    const full = h.length === 3 ? h[0]+h[0]+h[1]+h[1]+h[2]+h[2] : h;
+    return {
+      r: parseInt(full.slice(0, 2), 16) || 0,
+      g: parseInt(full.slice(2, 4), 16) || 0,
+      b: parseInt(full.slice(4, 6), 16) || 0,
+    };
   }
-  const layerRows = layers.map((L, i) => `
+  function layerCmyk(L) {
+    if (L.cmyk) return L.cmyk;
+    return { c: 0, m: 0, y: 0, k: 0 };
+  }
+  function layerLabel(L) {
+    const rgb = layerRgb(L);
+    const cmyk = layerCmyk(L);
+    const rgbS = "R" + rgb.r + " G" + rgb.g + " B" + rgb.b;
+    const cmykS = "C" + cmyk.c + " M" + cmyk.m + " Y" + cmyk.y + " K" + cmyk.k;
+    return rgbS + " · " + cmykS + (L.pantone ? " · " + L.pantone : "");
+  }
+  const layerRows = layers.map((L, i) => {
+    const rgb = layerRgb(L);
+    const cmyk = layerCmyk(L);
+    return `
     <div class="layer-row" data-layer="${i}">
       <svg class="layer-ico" viewBox="0 0 20 20" aria-hidden="true"><circle cx="10" cy="10" r="7" fill="${escapeHtml(L.hex)}" stroke="#1a2330" stroke-width="1"/></svg>
       <div class="layer-meta">
         <span class="layer-name">${escapeHtml(layerLabel(L))}</span>
         <span class="layer-sub muted">${escapeHtml((L.hex || "").toUpperCase())}</span>
+        <div class="layer-color-edit layer-edit-rgb">
+          <label>R <input type="number" class="layer-rgb" data-ch="r" min="0" max="255" value="${rgb.r}" /></label>
+          <label>G <input type="number" class="layer-rgb" data-ch="g" min="0" max="255" value="${rgb.g}" /></label>
+          <label>B <input type="number" class="layer-rgb" data-ch="b" min="0" max="255" value="${rgb.b}" /></label>
+        </div>
+        <div class="layer-color-edit layer-edit-cmyk">
+          <label>C <input type="number" class="layer-cmyk" data-ch="c" min="0" max="100" value="${cmyk.c}" /></label>
+          <label>M <input type="number" class="layer-cmyk" data-ch="m" min="0" max="100" value="${cmyk.m}" /></label>
+          <label>Y <input type="number" class="layer-cmyk" data-ch="y" min="0" max="100" value="${cmyk.y}" /></label>
+          <label>K <input type="number" class="layer-cmyk" data-ch="k" min="0" max="100" value="${cmyk.k}" /></label>
+        </div>
       </div>
-      <input type="color" class="layer-pick" value="${escapeHtml((L.hex || "#111111").slice(0, 7))}" title="Recolor" />
-      <select class="layer-pal" data-layer="${i}" title="Thread / Pantone">
-        <option value="">Thread / Pantone…</option>
-        <optgroup label="Madeira Rayon">${madeira.map((c) => `<option value="${escapeHtml(c.hex)}" data-name="${escapeHtml(c.name)}" ${String(L.pantone||L.thread||"")===String(c.name)?"selected":""}>${escapeHtml(c.code ? (c.code + " · " + c.name) : c.name)}</option>`).join("")}</optgroup>
-        <optgroup label="Pantone">${pantones.map((c) => `<option value="${escapeHtml(c.hex)}" data-name="${escapeHtml(c.name)}" ${String(L.pantone||"")===String(c.name)?"selected":""}>${escapeHtml(c.name)}</option>`).join("")}</optgroup>
-      </select>
-    </div>`).join("") || `<p class="muted">Click Vectorize after you drop art.</p>`;
+      <input type="color" class="layer-pick" value="${escapeHtml((L.hex || "#111111").slice(0, 7))}" title="Pick print color" />
+      ${pantones.length ? `<select class="layer-pal" data-layer="${i}" title="Optional Pantone match">
+        <option value="">Pantone (optional)</option>
+        ${pantones.map((c) => `<option value="${escapeHtml(c.hex)}" data-name="${escapeHtml(c.name)}" ${String(L.pantone||"")===String(c.name)?"selected":""}>${escapeHtml(c.name)}</option>`).join("")}
+      </select>` : ""}
+    </div>`;
+  }).join("") || `<p class="muted">Click Vectorize after you drop art.</p>`;
+
+  function segRow(id, label, tip, options, current) {
+    const btns = options.map((o) =>
+      `<button type="button" class="vz-seg${o.value === current ? " on" : ""}" data-val="${o.value}" title="${escapeHtml(o.tip || "")}">${escapeHtml(o.label)}</button>`
+    ).join("");
+    return `<div class="vz-control" id="${id}">
+      <div class="vz-control-head">
+        <span class="vz-control-label">${escapeHtml(label)}</span>
+        <span class="vz-control-tip muted" title="${escapeHtml(tip)}">${escapeHtml(tip)}</span>
+      </div>
+      <div class="vz-seg-row">${btns}</div>
+    </div>`;
+  }
+
+  const usedLine = lastSet.detail
+    ? `<p class="muted vz-used" id="vzUsed">Last run · Detail ${escapeHtml(String(lastSet.detail))} · Smoothing ${escapeHtml(String(lastSet.smoothing || "medium"))} · Corners ${escapeHtml(String(lastSet.cornerSmooth || "balanced"))}</p>`
+    : `<p class="muted vz-used" id="vzUsed" hidden></p>`;
+
   el.innerHTML = `
     <div class="split art-simple">
       <div class="art-stage">
@@ -565,33 +619,37 @@ async function fillArt(el, job, shopControls) {
       <div class="art-tools">
         ${shopControls ? `
         ${runRiskHtml(job)}
-        <div class="recipe-row" id="recipeRow">
-          <span class="muted" style="margin-right:8px">Recipe</span>
-          ${["apparel","dtf","screen","embroidery","laser","uv","vinyl"].map((m) =>
-            `<button type="button" class="process-chip${job.method===m?" on":""}" data-recipe="${m}">${METHOD_LABELS[m]||m}</button>`
-          ).join("")}
-        </div>
         <div class="art-actions">
           <button class="btn primary" id="vectorizeBtn" type="button">Vectorize</button>
           <button class="btn ghost" id="greyBtn" type="button">Hi-res greyscale</button>
         </div>
-        <p class="muted">Same art, switch recipe anytime — no re-upload. Vectorize builds production paths when the mark matches.</p>
-        ${vzRecipeHtml}
-        <div class="detail-row" id="detailRow">
-          <button type="button" class="detail-btn" data-colors="4" title="Few colors">
-            <svg viewBox="0 0 24 24" aria-hidden="true"><rect x="4" y="6" width="16" height="12" rx="2"/></svg>
-            Simple
-          </button>
-          <button type="button" class="detail-btn on" data-colors="8" title="Balanced">
-            <svg viewBox="0 0 24 24" aria-hidden="true"><rect x="3" y="5" width="8" height="14" rx="1"/><rect x="13" y="5" width="8" height="14" rx="1"/></svg>
-            Balanced
-          </button>
-          <button type="button" class="detail-btn" data-colors="12" title="Fine detail">
-            <svg viewBox="0 0 24 24" aria-hidden="true"><rect x="3" y="4" width="5" height="16"/><rect x="10" y="4" width="5" height="16"/><rect x="17" y="4" width="4" height="16"/></svg>
-            Fine
-          </button>
+        <p class="muted">Turn your mark into smooth production paths — SVG and EPS ready for Corel and Illustrator.</p>
+        <div class="vz-options" id="vzOptions">
+          ${segRow("detailRow", "Detail", "How many colors to keep — Low for simple logos, High for fine art", [
+            { value: "low", label: "Low", tip: "Few colors · clean logos" },
+            { value: "medium", label: "Medium", tip: "Balanced for most shop art" },
+            { value: "high", label: "High", tip: "More colors · fine detail" },
+          ], initDetail)}
+          ${segRow("smoothRow", "Smoothing", "Round out jagged edges from photos and screenshots", [
+            { value: "low", label: "Low", tip: "Keep sharper edges" },
+            { value: "medium", label: "Medium", tip: "Shop default" },
+            { value: "high", label: "High", tip: "Softer, cleaner curves" },
+          ], initSmooth)}
+          ${segRow("cornerRow", "Corner smoothness", "Sharp corners for type and badges, Smooth for organic shapes", [
+            { value: "sharp", label: "Sharp", tip: "Crisp corners and points" },
+            { value: "balanced", label: "Balanced", tip: "Shop default" },
+            { value: "smooth", label: "Smooth", tip: "Rounded corners" },
+          ], initCorner)}
+        </div>
+        ${usedLine}` : ""}
+        ${shopControls && layers.length ? `<div class="color-mode-row" id="colorModeRow">
+          <span class="muted">Layer colors</span>
+          <div class="vz-seg-row color-mode-seg">
+            <button type="button" class="vz-seg${initColorMode==="rgb"?" on":""}" data-mode="rgb" title="Edit as screen RGB">RGB</button>
+            <button type="button" class="vz-seg${initColorMode==="cmyk"?" on":""}" data-mode="cmyk" title="Edit as print CMYK">CMYK</button>
+          </div>
         </div>` : ""}
-        <div class="layer-list">${layerRows}</div>
+        <div class="layer-list${shopControls ? " color-mode-" + initColorMode : ""}">${layerRows}</div>
         ${shopControls && layers.length ? `<div class="export-grid export-hero art-dl">
           <a href="/api/export/${job.id}/art.svg">Download SVG</a>
           <a href="/api/export/${job.id}/art.eps">Download EPS</a>
@@ -619,13 +677,44 @@ async function fillArt(el, job, shopControls) {
       </div>
     </div>`;
   if (!shopControls) return;
-  let vzColors = 8;
-  el.querySelectorAll(".detail-btn").forEach((b) => {
-    b.onclick = () => {
-      vzColors = Number(b.dataset.colors) || 8;
-      el.querySelectorAll(".detail-btn").forEach((x) => x.classList.toggle("on", x === b));
-    };
+
+  let vzDetail = initDetail === "simple" ? "low" : (initDetail === "fine" ? "high" : (initDetail === "balanced" ? "medium" : initDetail));
+  let vzSmooth = initSmooth;
+  let vzCorner = initCorner;
+  let colorMode = initColorMode === "cmyk" ? "cmyk" : "rgb";
+  const DETAIL_COLORS = { low: 4, medium: 8, high: 12 };
+
+  function bindSeg(rowId, onPick) {
+    const row = el.querySelector("#" + rowId);
+    if (!row) return;
+    row.querySelectorAll(".vz-seg").forEach((b) => {
+      b.onclick = () => {
+        row.querySelectorAll(".vz-seg").forEach((x) => x.classList.toggle("on", x === b));
+        onPick(b.getAttribute("data-val"));
+      };
+    });
+  }
+  bindSeg("detailRow", (v) => { vzDetail = v; saveVzPref("detail", v); });
+  bindSeg("smoothRow", (v) => { vzSmooth = v; saveVzPref("smoothing", v); });
+  bindSeg("cornerRow", (v) => { vzCorner = v; saveVzPref("corner", v); });
+
+  function applyColorMode(mode) {
+    colorMode = mode === "cmyk" ? "cmyk" : "rgb";
+    saveVzPref("colorMode", colorMode);
+    const list = el.querySelector(".layer-list");
+    if (list) {
+      list.classList.toggle("color-mode-rgb", colorMode === "rgb");
+      list.classList.toggle("color-mode-cmyk", colorMode === "cmyk");
+    }
+    el.querySelectorAll("#colorModeRow .vz-seg").forEach((b) => {
+      b.classList.toggle("on", b.getAttribute("data-mode") === colorMode);
+    });
+  }
+  el.querySelectorAll("#colorModeRow .vz-seg").forEach((b) => {
+    b.onclick = () => applyColorMode(b.getAttribute("data-mode"));
   });
+  applyColorMode(colorMode);
+
   async function uploadArtwork(file) {
     if (!file) return;
     try {
@@ -717,29 +806,32 @@ async function fillArt(el, job, shopControls) {
     if (errEl) errEl.textContent = "Vectorizing…";
     await ensurePngArtwork(job);
     const maxEdge = 1100;
-    const payload = { colors: vzColors, maxEdge: maxEdge, fuse: "auto" };
+    const colors = DETAIL_COLORS[vzDetail] || 8;
+    const payload = {
+      colors: colors,
+      detail: vzDetail,
+      smoothing: vzSmooth,
+      cornerSmooth: vzCorner,
+      maxEdge: maxEdge,
+      fuse: "auto",
+    };
     if (engine) payload.engine = engine;
+    saveVzPref("detail", vzDetail);
+    saveVzPref("smoothing", vzSmooth);
+    saveVzPref("corner", vzCorner);
     const res = await api("/api/jobs/" + job.id + "/vectorize", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify(payload),
     });
     const meta = (res && res.meta) || (res && res.vector && res.vector.meta) || {};
-    const recipe = meta.recipe || (res && res.vector && res.vector.source) || "unknown";
+    const used = meta.settings || { detail: vzDetail, smoothing: vzSmooth, cornerSmooth: vzCorner };
+    const label = (k) => String(k || "").replace(/^\w/, (c) => c.toUpperCase());
     if (errEl) {
-      errEl.textContent = "Vectorize recipe: " + recipe + (meta.bundled ? " (bundled)" : "");
+      errEl.textContent = "Used · Detail " + label(used.detail) + " · Smoothing " + label(used.smoothing) + " · Corners " + label(used.cornerSmooth);
     }
     renderJob(job.id);
   }
-  document.querySelectorAll("[data-recipe]").forEach((btn) => {
-    btn.onclick = async () => {
-      const method = btn.getAttribute("data-recipe");
-      try {
-        await api("/api/jobs/" + job.id, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ method: method }) });
-        renderJob(job.id);
-      } catch (err) { $("#err").textContent = err.message; }
-    };
-  });
   const vz = $("#vectorizeBtn");
   if (vz) vz.onclick = async () => {
     try { await runVectorize(); }
@@ -750,13 +842,19 @@ async function fillArt(el, job, shopControls) {
     try { await runVectorize("vtracer"); }
     catch (err) { $("#err").textContent = err.message; }
   };
+  async function recolorLayer(layer, body) {
+    await api("/api/jobs/" + job.id + "/recolor", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(Object.assign({ layer: layer }, body)),
+    });
+    renderJob(job.id);
+  }
   el.querySelectorAll(".layer-pick").forEach((inp) => {
     inp.onchange = async () => {
       const layer = Number(inp.closest(".layer-row").dataset.layer);
-      try {
-        await api("/api/jobs/" + job.id + "/recolor", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ layer: layer, hex: inp.value }) });
-        renderJob(job.id);
-      } catch (err) { $("#err").textContent = err.message; }
+      try { await recolorLayer(layer, { hex: inp.value }); }
+      catch (err) { $("#err").textContent = err.message; }
     };
   });
   el.querySelectorAll(".layer-pal").forEach((sel) => {
@@ -766,13 +864,33 @@ async function fillArt(el, job, shopControls) {
       const layer = Number(sel.dataset.layer);
       const opt = sel.selectedOptions && sel.selectedOptions[0];
       const name = opt ? opt.getAttribute("data-name") || opt.textContent : "";
-      try {
-        await api("/api/jobs/" + job.id + "/recolor", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ layer: layer, hex: hex, name: name }) });
-        renderJob(job.id);
-      } catch (err) { $("#err").textContent = err.message; }
+      try { await recolorLayer(layer, { hex: hex, name: name }); }
+      catch (err) { $("#err").textContent = err.message; }
     };
   });
+  function bindChannelCommit(sel, buildBody) {
+    el.querySelectorAll(sel).forEach((inp) => {
+      const commit = async () => {
+        const row = inp.closest(".layer-row");
+        if (!row) return;
+        const layer = Number(row.dataset.layer);
+        try { await recolorLayer(layer, buildBody(row)); }
+        catch (err) { $("#err").textContent = err.message; }
+      };
+      inp.onchange = commit;
+      inp.onkeydown = (e) => { if (e.key === "Enter") { e.preventDefault(); commit(); } };
+    });
+  }
+  bindChannelCommit(".layer-rgb", (row) => {
+    const get = (ch) => Number((row.querySelector('.layer-rgb[data-ch="' + ch + '"]') || {}).value) || 0;
+    return { rgb: { r: get("r"), g: get("g"), b: get("b") } };
+  });
+  bindChannelCommit(".layer-cmyk", (row) => {
+    const get = (ch) => Number((row.querySelector('.layer-cmyk[data-ch="' + ch + '"]') || {}).value) || 0;
+    return { cmyk: { c: get("c"), m: get("m"), y: get("y"), k: get("k") } };
+  });
 }
+
 function bindArtZoom(stage) {
   const inner = $("#artZoomInner", stage) || $("#artZoomInner");
   if (!inner) return;
