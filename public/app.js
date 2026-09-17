@@ -44,12 +44,11 @@ async function api(url, opts = {}) {
 function money(n) { return "$" + Number(n || 0).toFixed(2); }
 function escapeHtml(s) { return String(s || "").replace(/[&<>"']/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c])); }
 
-/** Press-floor run-risk from vector meta / layer count. Green / Review / Hold. */
+/** Press-floor run-risk from layer count / alignment. Shop language only — never engine ids. */
 function runRiskForJob(job) {
   const layers = (job && job.vector && job.vector.layers) || [];
   const meta = (job && job.vector && job.vector.meta) || {};
   const n = layers.length;
-  const recipe = String(meta.recipe || meta.engine || job.vector && job.vector.source || "");
   const mae = meta.mae_svg_vs_src != null ? Number(meta.mae_svg_vs_src) : (meta.mae_src != null ? Number(meta.mae_src) : null);
   let level = "review";
   let title = "Review";
@@ -57,15 +56,9 @@ function runRiskForJob(job) {
   if (!job || !job.vector) {
     return { level: "hold", title: "Hold", line: "No vector yet. Drop art and Vectorize before you queue a press run." };
   }
-  if (/bezier|hallucinate-after|src-bezier|vtracer/i.test(recipe) && !/invent-warp|bundled|ecc/i.test(recipe)) {
-    level = "hold"; title = "Hold";
-    line = "Vectorize did not hit invent-warp on this mark. Re-run Vectorize; do not press this art.";
-  } else if (/invent-warp|bundled|ecc-multiROI|corel-import/i.test(recipe)) {
+  if (n > 0 && n <= 8) {
     level = "go"; title = "Green";
-    line = "Invent-warp topology on this mark — good to run after a quick color check.";
-  } else if (n > 0 && n <= 8) {
-    level = "go"; title = "Green";
-    line = n + " clean layers — standard apparel/DTF run. Confirm underbase if needed.";
+    line = n + " clean layers — standard DTF run. Confirm underbase if needed.";
   } else if (n > 12) {
     level = "hold"; title = "Hold";
     line = n + " layers is a lot for one hit — merge colors or split screens before you go.";
@@ -75,9 +68,43 @@ function runRiskForJob(job) {
   }
   if (mae != null && mae > 40 && level === "go") {
     level = "review"; title = "Review";
-    line = "Alignment drift vs source (MAE " + mae.toFixed(0) + ") — zoom eyes/edges before you print.";
+    line = "Alignment looks off vs the source — zoom edges before you print.";
   }
-  return { level: level, title: title, line: line, recipe: recipe, layers: n };
+  return { level: level, title: title, line: line, layers: n };
+}
+
+/** Scrub engine/recipe tokens from timeline / status strings (covers old DB events). */
+function sanitizeEventMessage(message) {
+  let s = String(message == null ? "" : message);
+  const countMatch = s.match(/(\d+)\s+(layers?|colors?|paths?|stitches)\b/i);
+  const n = countMatch ? countMatch[1] : null;
+  const unitRaw = countMatch ? countMatch[2].toLowerCase() : "";
+  const unit = unitRaw.indexOf("color") === 0 ? "layers"
+    : (unitRaw.indexOf("layer") === 0 ? "layers"
+      : (unitRaw.indexOf("path") === 0 ? "paths"
+        : (unitRaw.indexOf("stitch") === 0 ? "stitches" : unitRaw)));
+  const countBit = n && unit ? (n + " " + unit) : "";
+  const INTERNAL = /\b(?:invent-warp(?:-forced-bundled)?|invent\/[\w-]+|ecc-multiROI-TPS-bundled|ecc-multiROI-TPS|ecc-multiROI|TPS-bundled|\bTPS\b|bundled|vai-trace(?:\s+fallback)?|vtracer|VTracer|raster-corel|hallucinate(?:-after)?|invent-hallucinate|src-bezier(?:-fallback)?|lab-hier|bezier|Vectorizer\.AI|legacy(?:\s+fallback)?|fallback|path-transfer|corel-import|auto\s+path-transfer)\b/gi;
+  if (/^Pro Vectorize/i.test(s) || /Vectorizer\.AI/i.test(s)) {
+    return countBit ? ("Pro Vectorize · " + countBit) : "Pro Vectorize";
+  }
+  if (/^Vectorized/i.test(s) || (/vectoriz/i.test(s) && INTERNAL.test(s))) {
+    INTERNAL.lastIndex = 0;
+    return countBit ? ("Vectorized · " + countBit) : "Vectorized";
+  }
+  INTERNAL.lastIndex = 0;
+  if (/Corel import/i.test(s)) {
+    return countBit ? ("Art imported · " + countBit) : "Art imported";
+  }
+  if (INTERNAL.test(s) || /invent-warp|ecc-multiROI|vai-trace|vtracer|lab-hier|hallucinate|src-bezier/i.test(s)) {
+    INTERNAL.lastIndex = 0;
+    s = s.replace(INTERNAL, "");
+    s = s.replace(/\s*·\s*·+/g, " · ").replace(/\s{2,}/g, " ").replace(/\s*·\s*$/g, "").replace(/^\s*·\s*/, "").trim();
+    if (!s || /^[·\s\/-]*$/.test(s)) return countBit ? ("Vectorized · " + countBit) : "Update";
+    if (countBit && s.indexOf(n) === -1) s = s + " · " + countBit;
+    return s;
+  }
+  return s;
 }
 function runRiskHtml(job) {
   const r = runRiskForJob(job);
@@ -353,14 +380,14 @@ async function renderBoard() {
           <div class="job-card" data-open="${j.id}">
             <b>${escapeHtml(j.title)}</b>
             <span>${j.method} · ${j.width_in}×${j.height_in} · qty ${j.qty}</span><br/>
-            <span>${money(j.total)}${j.due_at ? " · due " + escapeHtml(j.due_at) : ""}</span>
+            <span>${j.due_at ? "due " + escapeHtml(j.due_at) : "Open to vectorize"}</span>
           </div>`).join("");
       return `<div class="col"><h4>${STAT_LABEL[s]||s} · ${col.length}</h4>${cards}</div>`;
     }).join("");
     const rows = jobs.map((j) => `<tr>
           <td>${escapeHtml(j.title)}</td><td class="muted">${(j.client_id||"—").slice(0,8)}</td>
           <td>${j.method}</td><td><span class="status">${STAT_LABEL[j.status]||j.status}</span></td>
-          <td>${escapeHtml(j.due_at||"—")}</td><td class="mono">${money(j.total)}</td>
+          <td>${escapeHtml(j.due_at||"—")}</td>
           <td><button class="btn ghost small" data-open="${j.id}">Open</button></td>
         </tr>`).join("");
     boardJobs = `
@@ -373,7 +400,7 @@ async function renderBoard() {
     <div class="kanban">${kanban}</div>
     <h3 style="margin-top:28px">List</h3>
     <table>
-      <thead><tr><th>Title</th><th>Client</th><th>Method</th><th>Status</th><th>Due</th><th>Total</th><th></th></tr></thead>
+      <thead><tr><th>Title</th><th>Client</th><th>Method</th><th>Status</th><th>Due</th><th></th></tr></thead>
       <tbody>${rows}</tbody>
     </table>`;
   }
@@ -430,29 +457,32 @@ async function renderIntake() {
 async function renderJob(id) {
   const { job, events } = await api("/api/jobs/" + id);
   const shopControls = canFloor();
+  const PRICE_STATION_ENABLED = false; // apparel quote UI off until David turns it back on
   const tabs = [
-    ["art","Art"],["digitize","Digitize"],["export","Export"],["mockup","Mockup"],["price","Price"],
+    ["art","Art"],["digitize","Digitize"],["export","Export"],["mockup","Mockup"],
+    ...(PRICE_STATION_ENABLED ? [["price","Price"]] : []),
     ["proof","Proof"],["overview","Overview"],["comments","Comments"]
   ];
+  if (!PRICE_STATION_ENABLED && station === "price") station = "art";
   main.innerHTML = `
     <button class="btn ghost small" id="back">← Board</button>
     <div class="row" style="margin-top:12px">
       <h1 style="margin:0;font-size:26px">${escapeHtml(job.title)}</h1>
       <span class="status">${STAT_LABEL[job.status]||job.status}</span>
     </div>
-    <p class="muted">${job.method} · ${job.width_in}×${job.height_in} in · qty ${job.qty} · ${money(job.total)}${job.due_at ? " · due " + escapeHtml(job.due_at) : ""}</p>
+    <p class="muted">${job.method} · ${job.width_in}×${job.height_in} in · qty ${job.qty}${job.due_at ? " · due " + escapeHtml(job.due_at) : ""}</p>
     ${paywallNote()}
     <div class="tabs">${tabs.map(([k,l]) => `<button data-tab="${k}" class="${station===k?"on":""}">${l}</button>`).join("")}</div>
     <div id="station"></div>
     <h3>Timeline</h3>
-    <ul class="muted">${(events||[]).map((e) => `<li>${escapeHtml(e.message)} · ${new Date(e.created_at).toLocaleString()}</li>`).join("")}</ul>`;
+    <ul class="muted">${(events||[]).map((e) => `<li>${escapeHtml(sanitizeEventMessage(e.message))} · ${new Date(e.created_at).toLocaleString()}</li>`).join("")}</ul>`;
   $("#back").onclick = () => { currentJob = null; view = "board"; nav(); render(); };
   main.querySelectorAll("[data-tab]").forEach((b) => { b.onclick = () => { station = b.dataset.tab; renderJob(id); }; });
   const el = $("#station");
   if (station === "art") return fillArt(el, job, shopControls);
   if (station === "digitize") return fillDigitize(el, job, shopControls);
   if (station === "mockup") return fillMockup(el, job, shopControls);
-  if (station === "price") return fillPrice(el, job, shopControls);
+  if (station === "price" && PRICE_STATION_ENABLED) return fillPrice(el, job, shopControls);
   if (station === "proof") return fillProof(el, job, shopControls);
   if (station === "produce" || station === "export") return fillProduce(el, job, shopControls);
   if (station === "comments") return fillComments(el, job);
@@ -519,9 +549,21 @@ async function fillArt(el, job, shopControls) {
   function saveVzPref(key, val) {
     try { localStorage.setItem("dc_vz_" + key, String(val)); } catch (e) { /* ignore */ }
   }
-  const initDetail = lastSet.detail || loadVzPref("detail", "medium");
-  const initSmooth = lastSet.smoothing || loadVzPref("smoothing", "medium");
-  const initCorner = lastSet.cornerSmooth || loadVzPref("corner", "balanced");
+  function toPct(val, legacyMap, fallback) {
+    if (val == null || val === "") return fallback;
+    if (typeof val === "number" && Number.isFinite(val)) return Math.max(0, Math.min(100, Math.round(val)));
+    const s = String(val).toLowerCase();
+    if (legacyMap[s] != null) return legacyMap[s];
+    const n = Number(val);
+    if (Number.isFinite(n)) return Math.max(0, Math.min(100, Math.round(n)));
+    return fallback;
+  }
+  const DETAIL_LEGACY = { low: 15, simple: 15, medium: 50, balanced: 50, high: 85, fine: 85 };
+  const SMOOTH_LEGACY = { low: 15, medium: 50, high: 85 };
+  const CORNER_LEGACY = { sharp: 10, balanced: 50, smooth: 90 };
+  const initDetail = toPct(lastSet.detail != null ? lastSet.detail : loadVzPref("detail", "50"), DETAIL_LEGACY, 50);
+  const initSmooth = toPct(lastSet.smoothing != null ? lastSet.smoothing : loadVzPref("smoothing", "50"), SMOOTH_LEGACY, 50);
+  const initCorner = toPct(lastSet.cornerSmooth != null ? lastSet.cornerSmooth : loadVzPref("corner", "50"), CORNER_LEGACY, 50);
   const initColorMode = loadVzPref("colorMode", "rgb");
   const hasArt = !!(job.vector_svg || job.file_path);
   const preview = job.vector_svg
@@ -577,24 +619,30 @@ async function fillArt(el, job, shopControls) {
     </div>`;
   }).join("") || `<p class="muted">Click Vectorize after you drop art.</p>`;
 
-  function sliderIndex(values, current) {
-    const i = values.indexOf(current);
-    return i < 0 ? Math.floor(values.length / 2) : i;
+  function detailReadout(pct) {
+    const colors = Math.round(3 + (Number(pct) / 100) * 21);
+    return colors + " colors";
   }
-  function sliderRow(id, label, tip, values, labels, current) {
-    const idx = sliderIndex(values, current);
+  function smoothReadout(pct) {
+    return Math.round(Number(pct)) + "% smooth";
+  }
+  function cornerReadout(pct) {
+    return Math.round(Number(pct)) + "% soft";
+  }
+  function continuousSliderRow(id, label, tip, current, left, right, readout) {
+    const v = Math.max(0, Math.min(100, Math.round(Number(current) || 0)));
     return `<div class="vz-control" id="${id}">
       <div class="vz-control-head">
         <span class="vz-control-label">${escapeHtml(label)}</span>
-        <span class="vz-slider-val" id="${id}Val">${escapeHtml(labels[idx])}</span>
+        <span class="vz-slider-val" id="${id}Val">${escapeHtml(readout(v))}</span>
       </div>
-      <input type="range" class="vz-slider" id="${id}Slider" min="0" max="${values.length - 1}" step="1" value="${idx}" aria-label="${escapeHtml(label)}" title="${escapeHtml(tip)}" />
-      <div class="vz-slider-ends muted"><span>${escapeHtml(labels[0])}</span><span>${escapeHtml(labels[labels.length - 1])}</span></div>
+      <input type="range" class="vz-slider" id="${id}Slider" min="0" max="100" step="1" value="${v}" aria-label="${escapeHtml(label)}" title="${escapeHtml(tip)}" />
+      <div class="vz-slider-ends muted"><span>${escapeHtml(left)}</span><span>${escapeHtml(right)}</span></div>
     </div>`;
   }
 
-  const usedLine = lastSet.detail
-    ? `<p class="muted vz-used" id="vzUsed">Last run · Detail ${escapeHtml(String(lastSet.detail))} · Smoothing ${escapeHtml(String(lastSet.smoothing || "medium"))} · Corners ${escapeHtml(String(lastSet.cornerSmooth || "balanced"))}</p>`
+  const usedLine = lastSet.detail != null
+    ? `<p class="muted vz-used" id="vzUsed">Last run · Detail ${escapeHtml(detailReadout(toPct(lastSet.detail, DETAIL_LEGACY, 50)))} · Smoothing ${escapeHtml(smoothReadout(toPct(lastSet.smoothing, SMOOTH_LEGACY, 50)))} · Corners ${escapeHtml(cornerReadout(toPct(lastSet.cornerSmooth, CORNER_LEGACY, 50)))}</p>`
     : `<p class="muted vz-used" id="vzUsed" hidden></p>`;
 
   el.innerHTML = `
@@ -622,12 +670,12 @@ async function fillArt(el, job, shopControls) {
         </div>
         <p class="muted">Turn your mark into smooth production paths — SVG and EPS ready for Corel and Illustrator.</p>
         <div class="vz-options" id="vzOptions">
-          ${sliderRow("detailRow", "Detail", "How many colors to keep — Low for simple logos, High for fine art",
-            ["low","medium","high"], ["Low","Medium","High"], initDetail === "simple" ? "low" : (initDetail === "fine" ? "high" : (initDetail === "balanced" ? "medium" : initDetail)))}
-          ${sliderRow("smoothRow", "Smoothing", "Round out jagged edges from photos and screenshots",
-            ["low","medium","high"], ["Low","Medium","High"], initSmooth)}
-          ${sliderRow("cornerRow", "Corner smoothness", "Sharp corners for type and badges, Smooth for organic shapes",
-            ["sharp","balanced","smooth"], ["Sharp","Balanced","Smooth"], initCorner)}
+          ${continuousSliderRow("detailRow", "Detail", "How many colors to keep — drag for live preview",
+            initDetail, "Simple", "Fine art", detailReadout)}
+          ${continuousSliderRow("smoothRow", "Smoothing", "Round out jagged edges from photos and screenshots",
+            initSmooth, "Sharp", "Smooth", smoothReadout)}
+          ${continuousSliderRow("cornerRow", "Corner smoothness", "Sharp corners for type and badges, soft for organic shapes",
+            initCorner, "Sharp", "Soft", cornerReadout)}
           <p class="muted vz-live-hint" id="vzLiveHint">Drag sliders to update the preview live after Vectorize.</p>
         </div>
         ${usedLine}` : ""}
@@ -671,11 +719,10 @@ async function fillArt(el, job, shopControls) {
     </div>`;
   if (!shopControls) return;
 
-  let vzDetail = initDetail === "simple" ? "low" : (initDetail === "fine" ? "high" : (initDetail === "balanced" ? "medium" : initDetail));
+  let vzDetail = initDetail;
   let vzSmooth = initSmooth;
   let vzCorner = initCorner;
   let colorMode = initColorMode === "cmyk" ? "cmyk" : "rgb";
-  const DETAIL_COLORS = { low: 4, medium: 8, high: 12 };
 
   let vzLiveTimer = null;
   let vzLiveBusy = false;
@@ -704,24 +751,23 @@ async function fillArt(el, job, shopControls) {
       }
     }, 450);
   }
-  function bindSlider(rowId, values, labels, prefKey, getSet) {
+  function bindContinuousSlider(rowId, prefKey, readout, setVal) {
     const slider = el.querySelector("#" + rowId + "Slider");
     const valEl = el.querySelector("#" + rowId + "Val");
     if (!slider) return;
     const apply = (n, live) => {
-      const i = Math.max(0, Math.min(values.length - 1, Number(n) || 0));
-      const v = values[i];
-      getSet(v);
+      const v = Math.max(0, Math.min(100, Math.round(Number(n) || 0)));
+      setVal(v);
       saveVzPref(prefKey, v);
-      if (valEl) valEl.textContent = labels[i];
+      if (valEl) valEl.textContent = readout(v);
       if (live) scheduleLiveVectorize();
     };
     slider.oninput = () => apply(slider.value, true);
     slider.onchange = () => apply(slider.value, true);
   }
-  bindSlider("detailRow", ["low","medium","high"], ["Low","Medium","High"], "detail", (v) => { vzDetail = v; });
-  bindSlider("smoothRow", ["low","medium","high"], ["Low","Medium","High"], "smoothing", (v) => { vzSmooth = v; });
-  bindSlider("cornerRow", ["sharp","balanced","smooth"], ["Sharp","Balanced","Smooth"], "corner", (v) => { vzCorner = v; });
+  bindContinuousSlider("detailRow", "detail", detailReadout, (v) => { vzDetail = v; });
+  bindContinuousSlider("smoothRow", "smoothing", smoothReadout, (v) => { vzSmooth = v; });
+  bindContinuousSlider("cornerRow", "corner", cornerReadout, (v) => { vzCorner = v; });
 
   function applyColorMode(mode) {
     colorMode = mode === "cmyk" ? "cmyk" : "rgb";
@@ -863,14 +909,13 @@ async function fillArt(el, job, shopControls) {
     if (errEl) errEl.textContent = opts.live ? "Updating preview…" : "Vectorizing…";
     await ensurePngArtwork(job);
     const maxEdge = opts.live ? 900 : 1100;
-    const colors = DETAIL_COLORS[vzDetail] || 8;
     const payload = {
-      colors: colors,
       detail: vzDetail,
       smoothing: vzSmooth,
       cornerSmooth: vzCorner,
       maxEdge: maxEdge,
       fuse: "auto",
+      live: !!opts.live,
     };
     if (engine) payload.engine = engine;
     saveVzPref("detail", vzDetail);
@@ -883,9 +928,16 @@ async function fillArt(el, job, shopControls) {
     });
     const meta = (res && res.meta) || (res && res.vector && res.vector.meta) || {};
     const used = meta.settings || { detail: vzDetail, smoothing: vzSmooth, cornerSmooth: vzCorner };
-    const label = (k) => String(k || "").replace(/^\w/, (c) => c.toUpperCase());
+    const d = toPct(used.detail, DETAIL_LEGACY, vzDetail);
+    const sm = toPct(used.smoothing, SMOOTH_LEGACY, vzSmooth);
+    const c = toPct(used.cornerSmooth, CORNER_LEGACY, vzCorner);
     if (errEl) {
-      errEl.textContent = (opts.live ? "Live · " : "Used · ") + "Detail " + label(used.detail) + " · Smoothing " + label(used.smoothing) + " · Corners " + label(used.cornerSmooth);
+      errEl.textContent = (opts.live ? "Live · " : "Used · ") + "Detail " + d + " · Smoothing " + sm + " · Corners " + c;
+    }
+    const usedEl = $("#vzUsed");
+    if (usedEl) {
+      usedEl.hidden = false;
+      usedEl.textContent = "Last run · Detail " + detailReadout(d) + " · Smoothing " + smoothReadout(sm) + " · Corners " + cornerReadout(c);
     }
     if (hint) hint.textContent = "Drag sliders to update the preview live.";
     renderJob(job.id);

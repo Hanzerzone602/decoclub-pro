@@ -368,7 +368,7 @@ function vectorizeInWorker(buf, widthIn, heightIn, opts, timeoutMs, engine) {
 }
 
 
-/** Map sellable Vectorize UI labels → engine clamps. */
+/** Map sellable Vectorize UI (0–100 sliders or legacy labels) → engine clamps. */
 function normalizeVectorizeBody(body) {
   body = body || {};
   const DETAIL = {
@@ -391,35 +391,83 @@ function normalizeVectorizeBody(body) {
     if (!Number.isFinite(v)) return fallback;
     return Math.max(lo, Math.min(hi, v));
   }
-  let detailKey = String(body.detail || body.detailLevel || "").toLowerCase();
-  if (!detailKey && body.colors != null) {
-    const c = Number(body.colors);
-    detailKey = c <= 5 ? "low" : (c >= 11 ? "high" : "medium");
+  function lerp(a, b, t) { return a + (b - a) * t; }
+  function isPctLike(v) {
+    if (v == null || v === "") return false;
+    const s = String(v).toLowerCase();
+    if (DETAIL[s] || SMOOTH[s] || CORNER[s]) return false;
+    return Number.isFinite(Number(v));
   }
-  if (!DETAIL[detailKey]) detailKey = "medium";
-  const colors = clamp(body.colors != null ? body.colors : DETAIL[detailKey], 2, 24, DETAIL[detailKey]);
+  function pctFromColors(c) {
+    return Math.round(clamp(((Number(c) - 3) / 21) * 100, 0, 100, 50));
+  }
 
-  let smoothKey = String(body.smoothing || body.smooth || "").toLowerCase();
-  if (!SMOOTH[smoothKey]) smoothKey = "medium";
-  const smooth = SMOOTH[smoothKey];
+  let detailPct = null;
+  const detailRaw = body.detail != null ? body.detail : body.detailLevel;
+  if (isPctLike(detailRaw)) {
+    detailPct = clamp(detailRaw, 0, 100, 50);
+  } else {
+    let detailKey = String(detailRaw || "").toLowerCase();
+    if (!detailKey && body.colors != null) {
+      const c = Number(body.colors);
+      detailKey = c <= 5 ? "low" : (c >= 11 ? "high" : "medium");
+    }
+    if (!DETAIL[detailKey]) detailKey = "medium";
+    detailPct = detailKey === "simple" || detailKey === "low" ? 15
+      : (detailKey === "fine" || detailKey === "high" ? 85 : 50);
+  }
 
-  let cornerKey = String(body.cornerSmooth || body.corners || body.corner || "").toLowerCase();
-  if (!CORNER[cornerKey]) cornerKey = "balanced";
-  const corner = CORNER[cornerKey];
+  let colors;
+  if (body.colors != null && Number.isFinite(Number(body.colors))) {
+    colors = clamp(body.colors, 2, 24, 8);
+    if (!isPctLike(detailRaw)) detailPct = pctFromColors(colors);
+  } else {
+    colors = clamp(Math.round(lerp(3, 24, detailPct / 100)), 2, 24, 8);
+  }
 
-  const epsilon = clamp(body.epsilon != null ? body.epsilon : smooth.epsilon, 0.2, 3, smooth.epsilon);
-  const fitError = clamp(body.fitError != null ? body.fitError : corner.fitError, 0.2, 4, corner.fitError);
-  const cornerCos = clamp(body.cornerCos != null ? body.cornerCos : corner.cornerCos, -1, 1, corner.cornerCos);
-  const cornerThreshold = clamp(body.cornerThreshold != null ? body.cornerThreshold : corner.cornerThreshold, 20, 120, corner.cornerThreshold);
-  const filterSpeckle = clamp(body.filterSpeckle != null ? body.filterSpeckle : smooth.filterSpeckle, 0, 16, smooth.filterSpeckle);
-  const segmentLength = clamp(body.segmentLength != null ? body.segmentLength : smooth.segmentLength, 1, 12, smooth.segmentLength);
+  let smoothPct = null;
+  const smoothRaw = body.smoothing != null ? body.smoothing : body.smooth;
+  if (isPctLike(smoothRaw)) {
+    smoothPct = clamp(smoothRaw, 0, 100, 50);
+  } else {
+    let smoothKey = String(smoothRaw || "").toLowerCase();
+    if (!SMOOTH[smoothKey]) smoothKey = "medium";
+    smoothPct = smoothKey === "low" ? 15 : (smoothKey === "high" ? 85 : 50);
+  }
+  const smoothT = smoothPct / 100;
+  const smoothDefaults = {
+    epsilon: lerp(0.4, 1.6, smoothT),
+    filterSpeckle: Math.round(lerp(2, 10, smoothT)),
+    segmentLength: lerp(3.0, 6.0, smoothT),
+  };
 
-  const detailCanon = detailKey === "simple" || detailKey === "low" ? "low"
-    : (detailKey === "fine" || detailKey === "high" ? "high" : "medium");
+  let cornerPct = null;
+  const cornerRaw = body.cornerSmooth != null ? body.cornerSmooth : (body.corners != null ? body.corners : body.corner);
+  if (isPctLike(cornerRaw)) {
+    cornerPct = clamp(cornerRaw, 0, 100, 50);
+  } else {
+    let cornerKey = String(cornerRaw || "").toLowerCase();
+    if (!CORNER[cornerKey]) cornerKey = "balanced";
+    cornerPct = cornerKey === "sharp" ? 10 : (cornerKey === "smooth" ? 90 : 50);
+  }
+  const cornerT = cornerPct / 100;
+  const cornerDefaults = {
+    fitError: lerp(0.4, 2.0, cornerT),
+    cornerCos: lerp(-0.55, 0.15, cornerT),
+    cornerThreshold: Math.round(lerp(40, 90, cornerT)),
+  };
+
+  const epsilon = clamp(body.epsilon != null ? body.epsilon : smoothDefaults.epsilon, 0.2, 3, smoothDefaults.epsilon);
+  const fitError = clamp(body.fitError != null ? body.fitError : cornerDefaults.fitError, 0.2, 4, cornerDefaults.fitError);
+  const cornerCos = clamp(body.cornerCos != null ? body.cornerCos : cornerDefaults.cornerCos, -1, 1, cornerDefaults.cornerCos);
+  const cornerThreshold = clamp(body.cornerThreshold != null ? body.cornerThreshold : cornerDefaults.cornerThreshold, 20, 120, cornerDefaults.cornerThreshold);
+  const filterSpeckle = clamp(body.filterSpeckle != null ? body.filterSpeckle : smoothDefaults.filterSpeckle, 0, 16, smoothDefaults.filterSpeckle);
+  const segmentLength = clamp(body.segmentLength != null ? body.segmentLength : smoothDefaults.segmentLength, 1, 12, smoothDefaults.segmentLength);
+
   const settings = {
-    detail: detailCanon,
-    smoothing: smoothKey,
-    cornerSmooth: cornerKey,
+    detail: Math.round(detailPct),
+    smoothing: Math.round(smoothPct),
+    cornerSmooth: Math.round(cornerPct),
     colors: colors,
     epsilon: epsilon,
     fitError: fitError,
@@ -437,6 +485,7 @@ function normalizeVectorizeBody(body) {
     detail: settings.detail,
     smoothing: settings.smoothing,
     cornerSmooth: settings.cornerSmooth,
+    live: body.live === true || body.live === "true" || body.live === 1,
     _vzSettings: settings,
   });
 }
@@ -789,15 +838,80 @@ function applyMockup(job) {
   job.mockup_path = m.mockup_path;
   job.mockup_svg = m.mockup_svg;
 }
+/** Strip engine/recipe internals from user-visible timeline / status copy. */
+function sanitizePublicEventMessage(message) {
+  let s = String(message == null ? "" : message);
+  const countMatch = s.match(/(\d+)\s+(layers?|colors?|paths?|stitches)\b/i);
+  const n = countMatch ? countMatch[1] : null;
+  const unitRaw = countMatch ? countMatch[2].toLowerCase() : "";
+  const unit = unitRaw.indexOf("color") === 0 ? "layers"
+    : (unitRaw.indexOf("layer") === 0 ? "layers"
+      : (unitRaw.indexOf("path") === 0 ? "paths"
+        : (unitRaw.indexOf("stitch") === 0 ? "stitches" : unitRaw)));
+  const countBit = n && unit ? (n + " " + unit) : "";
+
+  const INTERNAL = /\b(?:invent-warp(?:-forced-bundled)?|invent\/[\w-]+|ecc-multiROI-TPS-bundled|ecc-multiROI-TPS|ecc-multiROI|TPS-bundled|\bTPS\b|bundled|vai-trace(?:\s+fallback)?|vtracer|VTracer|raster-corel|hallucinate(?:-after)?|invent-hallucinate|src-bezier(?:-fallback)?|lab-hier|bezier|Vectorizer\.AI|legacy(?:\s+fallback)?|fallback|path-transfer|corel-import|auto\s+path-transfer|invent-transfer|invent-trace|invent-hybrid|local-trace|local-js)\b/gi;
+
+  if (/^Pro Vectorize/i.test(s) || /Vectorizer\.AI/i.test(s)) {
+    return countBit ? ("Pro Vectorize · " + countBit) : "Pro Vectorize";
+  }
+  if (/^Vectorized/i.test(s) || (/vectoriz/i.test(s) && INTERNAL.test(s))) {
+    INTERNAL.lastIndex = 0;
+    return countBit ? ("Vectorized · " + countBit) : "Vectorized";
+  }
+  INTERNAL.lastIndex = 0;
+  if (/Corel import/i.test(s)) {
+    return countBit ? ("Art imported · " + countBit) : "Art imported";
+  }
+  if (INTERNAL.test(s) || /invent-warp|ecc-multiROI|vai-trace|vtracer|lab-hier|hallucinate|src-bezier/i.test(s)) {
+    INTERNAL.lastIndex = 0;
+    s = s.replace(INTERNAL, "");
+    s = s.replace(/\s*·\s*·+/g, " · ").replace(/\s{2,}/g, " ").replace(/\s*·\s*$/g, "").replace(/^\s*·\s*/, "").trim();
+    if (!s || /^[·\s\/-]*$/.test(s)) {
+      return countBit ? ("Vectorized · " + countBit) : "Update";
+    }
+    if (countBit && s.indexOf(n) === -1) s = s + " · " + countBit;
+    return s;
+  }
+  return s;
+}
+
+function presentEvents(events) {
+  return (events || []).map(function (e) {
+    return Object.assign({}, e, { message: sanitizePublicEventMessage(e.message) });
+  });
+}
+
+function presentVzMeta(meta) {
+  if (!meta || typeof meta !== "object") return meta;
+  const m = Object.assign({}, meta);
+  if (m.settings) m.settings = Object.assign({}, m.settings);
+  delete m.recipe;
+  delete m.engine;
+  delete m.winner;
+  delete m.pipeline;
+  return m;
+}
+function presentVector(vec) {
+  if (!vec || typeof vec !== "object") return vec;
+  const copy = Object.assign({}, vec);
+  if (copy.meta) copy.meta = presentVzMeta(copy.meta);
+  if (copy.source && /invent|warp|vtracer|vai-trace|bezier|raster-corel|hallucinate/i.test(String(copy.source))) {
+    copy.source = "vectorize";
+  }
+  return copy;
+}
 function presentJob(job, req) {
   const copy = Object.assign({}, job);
   copy.proof_url = originOf(req) + "/proof.html?t=" + job.proof_token;
   copy.intake_url = originOf(req) + "/intake.html?t=" + job.proof_token;
+  // Keep settings for shop knobs; never leak recipe/engine ids in API payloads clients render.
+  if (copy.vector) copy.vector = presentVector(copy.vector);
   return copy;
 }
 function event(db, job, message) {
   const now = new Date().toISOString();
-  db.events.push({ id: uid(), job_id: job.id, message: message, created_at: now });
+  db.events.push({ id: uid(), job_id: job.id, message: sanitizePublicEventMessage(message), created_at: now });
   job.updated_at = now;
 }
 function canSeeJob(user, job) {
@@ -817,7 +931,7 @@ async function handleApi(req, res, url) {
   const pth = url.pathname;
 
   if (pth === "/api/config" && method === "GET") {
-    return json(res, 200, { demo: allowDemo(), billing: billingConfigured(), imagine: imagineConfigured(), imagineModel: "latest", vectorizerAi: vectorizerAi.configured(), vtracer: vtracer.available(), vaiTrace: vaiTrace.available(), inventVectorize: true, inventWinner: "ecc-multiROI-TPS", rasterCorel: true, inventWarp: inventWarp.available(), inventWarpReason: inventWarp.available() ? null : (inventWarp.unavailableReason && inventWarp.unavailableReason()), corelImport: true, name: "DecoClub Pro", statuses: STATUSES, methods: METHODS, blanks: BLANKS, seed: allowDemo() ? { owner: "owner@anvil.local", client: "client@anvil.local", password: "anvil123" } : null });
+    return json(res, 200, { demo: allowDemo(), billing: billingConfigured(), imagine: imagineConfigured(), imagineModel: "latest", vectorizerAi: vectorizerAi.configured(), vtracer: vtracer.available(), vaiTrace: vaiTrace.available(), inventVectorize: true, inventWinner: null, rasterCorel: true, inventWarp: inventWarp.available(), inventWarpReason: inventWarp.available() ? null : (inventWarp.unavailableReason && inventWarp.unavailableReason()), corelImport: true, name: "DecoClub Pro", statuses: STATUSES, methods: METHODS, blanks: BLANKS, seed: allowDemo() ? { owner: "owner@anvil.local", client: "client@anvil.local", password: "anvil123" } : null });
   }
   if (pth === "/api/quote" && (method === "POST" || method === "GET")) {
     const body = method === "GET" ? { method: url.searchParams.get("method"), width_in: url.searchParams.get("width_in"), height_in: url.searchParams.get("height_in"), qty: url.searchParams.get("qty"), margin_pct: url.searchParams.get("margin_pct") } : parseJsonBody(await readBody(req));
@@ -1004,7 +1118,7 @@ async function handleApi(req, res, url) {
     if (job.file_path) {
       const orig = parsed.file && parsed.file.original;
       if (tryAutoCorelImport(job, job.file_path, orig)) {
-        event(db, job, "Corel import · auto path-transfer");
+        event(db, job, "Art imported");
         save(db);
       } else {
         scheduleVectorize(job.id);
@@ -1018,7 +1132,7 @@ async function handleApi(req, res, url) {
     if (!user) return json(res, 401, { error: "Sign in required" });
     const job = db.jobs.find(function (j) { return j.id === jobGet[1]; });
     if (!job || !canSeeJob(user, job)) return json(res, 404, { error: "Job not found" });
-    return json(res, 200, { job: presentJob(job, req), events: db.events.filter(function (e) { return e.job_id === job.id; }) });
+    return json(res, 200, { job: presentJob(job, req), events: presentEvents(db.events.filter(function (e) { return e.job_id === job.id; })) });
   }
   if (jobGet && method === "POST") {
     if (!canRunFloor(user)) return json(res, 403, { error: "Shop login required" });
@@ -1051,7 +1165,7 @@ async function handleApi(req, res, url) {
     event(db, job, "Artwork replaced"); save(db);
     const origArt = parsed.file && parsed.file.original;
     if (tryAutoCorelImport(job, job.file_path, origArt)) {
-      event(db, job, "Corel import · auto path-transfer");
+      event(db, job, "Art imported");
       save(db);
     } else {
       scheduleVectorize(job.id);
@@ -1261,9 +1375,9 @@ async function handleApi(req, res, url) {
     try {
       const result = runCorelImportOnJob(job, buf, body);
       if (body.apply_mockup !== false) applyMockup(job);
-      event(db, job, "Corel import · path-transfer · " + result.meta.paths + " paths");
+      event(db, job, "Art imported · " + (result.meta.paths || 0) + " paths");
       save(db);
-      return json(res, 200, { job: presentJob(job, req), vector: job.vector, meta: result.meta });
+      return json(res, 200, { job: presentJob(job, req), vector: presentVector(job.vector), meta: presentVzMeta(result.meta) });
     } catch (err) {
       return json(res, 400, { error: IS_PROD ? "Could not import Corel SVG" : err.message });
     }
@@ -1291,9 +1405,9 @@ async function handleApi(req, res, url) {
       try {
         const result = runCorelImportOnJob(job, buf, body);
         if (body.apply_mockup) applyMockup(job);
-        event(db, job, "Corel import · path-transfer · " + result.meta.paths + " paths · " + (job.vector.layers || []).length + " colors");
+        event(db, job, "Art imported · " + (job.vector.layers || []).length + " layers");
         save(db);
-        return json(res, 200, { job: presentJob(job, req), vector: job.vector, meta: result.meta });
+        return json(res, 200, { job: presentJob(job, req), vector: presentVector(job.vector), meta: presentVzMeta(result.meta) });
       } catch (err) {
         return json(res, 400, { error: IS_PROD ? "Could not import Corel SVG" : err.message });
       }
@@ -1334,9 +1448,9 @@ async function handleApi(req, res, url) {
         const vec = packed.vec || { widthIn: job.width_in, heightIn: job.height_in, layers: [], source: "raster-corel" };
         applyVectorResult(job, vec, svg);
         if (body.apply_mockup) applyMockup(job);
-        event(db, job, "Vectorized · raster-corel/hallucinate · " + (job.vector.layers || []).length + " layers");
+        event(db, job, "Vectorized · " + (job.vector.layers || []).length + " layers");
         save(db);
-        return json(res, 200, { job: presentJob(job, req), vector: job.vector, meta: packed.meta || (vec && vec.meta) });
+        return json(res, 200, { job: presentJob(job, req), vector: presentVector(job.vector), meta: presentVzMeta(packed.meta || (vec && vec.meta)) });
       }
       if (wantInvent) {
         const inventMode =
@@ -1353,9 +1467,9 @@ async function handleApi(req, res, url) {
         const vec = packed.vec || { widthIn: job.width_in, heightIn: job.height_in, layers: [], source: "invent" };
         applyVectorResult(job, vec, svg);
         if (body.apply_mockup) applyMockup(job);
-        event(db, job, "Vectorized · invent/" + inventMode + " · " + (job.vector.layers || []).length + " layers");
+        event(db, job, "Vectorized · " + (job.vector.layers || []).length + " layers");
         save(db);
-        return json(res, 200, { job: presentJob(job, req), vector: job.vector, meta: packed.meta || (vec && vec.meta) });
+        return json(res, 200, { job: presentJob(job, req), vector: presentVector(job.vector), meta: presentVzMeta(packed.meta || (vec && vec.meta)) });
       }
       if (wantApi) {
         if (!vectorizerAi.configured()) {
@@ -1363,24 +1477,24 @@ async function handleApi(req, res, url) {
         }
         await runProVectorize(job, buf, Object.assign({}, body, { engine: "vectorizer.ai", api: true }));
         if (body.apply_mockup) applyMockup(job);
-        event(db, job, "Pro Vectorize · Vectorizer.AI · " + (job.vector.layers || []).length + " colors"); save(db);
-        return json(res, 200, { job: presentJob(job, req), vector: job.vector });
+        event(db, job, "Pro Vectorize · " + (job.vector.layers || []).length + " layers"); save(db);
+        return json(res, 200, { job: presentJob(job, req), vector: presentVector(job.vector) });
       }
       if (wantVai) {
         if (!vaiTrace.available()) return json(res, 501, { error: vaiTrace.unavailableReason() || "vai-trace unavailable" });
         const result = await runVaiTraceSafe(buf, job, body, sizeMeta);
         applyVectorResult(job, result.vec, result.svg);
         if (body.apply_mockup) applyMockup(job);
-        event(db, job, "Vectorized · vai-trace · " + (job.vector.layers || []).length + " colors");
+        event(db, job, "Vectorized · " + (job.vector.layers || []).length + " layers");
         save(db);
-        return json(res, 200, { job: presentJob(job, req), vector: job.vector, meta: result.meta });
+        return json(res, 200, { job: presentJob(job, req), vector: presentVector(job.vector), meta: presentVzMeta(result.meta) });
       }
       if (wantVtracer) {
         if (!vtracer.available()) return json(res, 501, { error: "VTracer binary missing" });
         runVtracerVectorize(job, buf, body);
         if (body.apply_mockup) applyMockup(job);
-        event(db, job, "Vectorized · VTracer · " + (job.vector.layers || []).length + " colors"); save(db);
-        return json(res, 200, { job: presentJob(job, req), vector: job.vector });
+        event(db, job, "Vectorized · " + (job.vector.layers || []).length + " layers"); save(db);
+        return json(res, 200, { job: presentJob(job, req), vector: presentVector(job.vector) });
       }
       if (wantLegacy) {
         const opts = {
@@ -1393,8 +1507,8 @@ async function handleApi(req, res, url) {
         const msg = await vectorizeInWorker(buf, job.width_in, job.height_in, opts, 90000);
         applyVectorResult(job, msg.vec, msg.svg);
         if (body.apply_mockup) applyMockup(job);
-        event(db, job, "Vectorized · legacy · " + msg.vec.layers.length + " layers"); save(db);
-        return json(res, 200, { job: presentJob(job, req), vector: msg.vec });
+        event(db, job, "Vectorized · " + msg.vec.layers.length + " layers"); save(db);
+        return json(res, 200, { job: presentJob(job, req), vector: presentVector(msg.vec) });
       }
       /* Default PNG Vectorize:
        *  1) soft frontal tiger twin → invent-warp bundled (fast, Corel-class for that mark)
@@ -1423,15 +1537,15 @@ async function handleApi(req, res, url) {
         } catch (matchErr) {
           twin = false;
         }
-        if (twin) {
+        // Live slider preview must stay on the sellable tracer — invent-warp ignores Detail/Smoothing knobs.
+        const skipTwin = body.live === true || body.skipTwin === true;
+        if (twin && !skipTwin) {
           const packed = rasterCorel.vectorizeToSvg(srcBuf, job.width_in, job.height_in, Object.assign({}, opts, { fuse: "auto" }));
           applyVectorResult(job, packed.vec, packed.svg);
           if (body.apply_mockup) applyMockup(job);
-          const recipe = (packed.meta && packed.meta.recipe) || (packed.vec && packed.vec.meta && packed.vec.meta.recipe) || "invent-warp";
-          const eng = (packed.vec && packed.vec.source) || "invent-warp";
-          event(db, job, "Vectorized · " + eng + "/" + recipe + " · " + (job.vector.layers || []).length + " layers");
+          event(db, job, "Vectorized · " + (job.vector.layers || []).length + " layers");
           save(db);
-          return json(res, 200, { job: presentJob(job, req), vector: job.vector, meta: packed.meta || (packed.vec && packed.vec.meta) });
+          return json(res, 200, { job: presentJob(job, req), vector: presentVector(job.vector), meta: presentVzMeta(packed.meta || (packed.vec && packed.vec.meta)) });
         }
         // Non-twin: vai-trace first (general Lab+cubic). VTracer if missing. Bezier only in worker last.
         // Large art is downscaled (sizeMeta) and run via worker / async spawn so the event loop cannot wedge.
@@ -1439,16 +1553,16 @@ async function handleApi(req, res, url) {
           const result = await runVaiTraceSafe(buf, job, Object.assign({}, body, { colors: opts.colors, mode: "auto" }), sizeMeta);
           applyVectorResult(job, result.vec, result.svg);
           if (body.apply_mockup) applyMockup(job);
-          event(db, job, "Vectorized · vai-trace · " + (job.vector.layers || []).length + " colors");
+          event(db, job, "Vectorized · " + (job.vector.layers || []).length + " layers");
           save(db);
-          return json(res, 200, { job: presentJob(job, req), vector: job.vector, meta: result.meta });
+          return json(res, 200, { job: presentJob(job, req), vector: presentVector(job.vector), meta: presentVzMeta(result.meta) });
         }
         if (vtracer.available()) {
           runVtracerVectorize(job, buf, body);
           if (body.apply_mockup) applyMockup(job);
-          event(db, job, "Vectorized · VTracer · " + (job.vector.layers || []).length + " colors");
+          event(db, job, "Vectorized · " + (job.vector.layers || []).length + " layers");
           save(db);
-          return json(res, 200, { job: presentJob(job, req), vector: job.vector });
+          return json(res, 200, { job: presentJob(job, req), vector: presentVector(job.vector) });
         }
         const wopts = {
           colors: opts.colors,
@@ -1466,25 +1580,25 @@ async function handleApi(req, res, url) {
           job.vector.source = "raster-corel";
         }
         if (body.apply_mockup) applyMockup(job);
-        event(db, job, "Vectorized · raster-corel/src-bezier-fallback · " + (job.vector.layers || []).length + " layers");
+        event(db, job, "Vectorized · " + (job.vector.layers || []).length + " layers");
         save(db);
-        return json(res, 200, { job: presentJob(job, req), vector: job.vector, meta: job.vector && job.vector.meta });
+        return json(res, 200, { job: presentJob(job, req), vector: presentVector(job.vector), meta: presentVzMeta(job.vector && job.vector.meta) });
       } catch (bezErr) {
         if (vaiTrace.available()) {
           try {
             const result = await runVaiTraceSafe(buf, job, Object.assign({}, body, { mode: "auto" }), sizeMeta);
             applyVectorResult(job, result.vec, result.svg);
             if (body.apply_mockup) applyMockup(job);
-            event(db, job, "Vectorized · vai-trace fallback · " + (job.vector.layers || []).length + " colors");
+            event(db, job, "Vectorized · " + (job.vector.layers || []).length + " layers");
             save(db);
-            return json(res, 200, { job: presentJob(job, req), vector: job.vector, meta: result.meta });
+            return json(res, 200, { job: presentJob(job, req), vector: presentVector(job.vector), meta: presentVzMeta(result.meta) });
           } catch (vaiErr) { /* fall through */ }
         }
         if (vtracer.available()) {
           runVtracerVectorize(job, buf, body);
           if (body.apply_mockup) applyMockup(job);
-          event(db, job, "Vectorized · VTracer fallback · " + (job.vector.layers || []).length + " colors"); save(db);
-          return json(res, 200, { job: presentJob(job, req), vector: job.vector });
+          event(db, job, "Vectorized · " + (job.vector.layers || []).length + " layers"); save(db);
+          return json(res, 200, { job: presentJob(job, req), vector: presentVector(job.vector) });
         }
         throw bezErr;
       }
@@ -1541,7 +1655,7 @@ async function handleApi(req, res, url) {
       rewriteVectorSvg(job);
     }
     event(db, job, "Recolor layer " + idx); save(db);
-    return json(res, 200, { job: presentJob(job, req), vector: job.vector });
+    return json(res, 200, { job: presentJob(job, req), vector: presentVector(job.vector) });
   }
   const stnPath = pth.match(/^\/api\/jobs\/([^/]+)\/stones$/);
   if (stnPath && method === "POST") {
