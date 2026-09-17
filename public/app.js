@@ -577,16 +577,19 @@ async function fillArt(el, job, shopControls) {
     </div>`;
   }).join("") || `<p class="muted">Click Vectorize after you drop art.</p>`;
 
-  function segRow(id, label, tip, options, current) {
-    const btns = options.map((o) =>
-      `<button type="button" class="vz-seg${o.value === current ? " on" : ""}" data-val="${o.value}" title="${escapeHtml(o.tip || "")}">${escapeHtml(o.label)}</button>`
-    ).join("");
+  function sliderIndex(values, current) {
+    const i = values.indexOf(current);
+    return i < 0 ? Math.floor(values.length / 2) : i;
+  }
+  function sliderRow(id, label, tip, values, labels, current) {
+    const idx = sliderIndex(values, current);
     return `<div class="vz-control" id="${id}">
       <div class="vz-control-head">
         <span class="vz-control-label">${escapeHtml(label)}</span>
-        <span class="vz-control-tip muted" title="${escapeHtml(tip)}">${escapeHtml(tip)}</span>
+        <span class="vz-slider-val" id="${id}Val">${escapeHtml(labels[idx])}</span>
       </div>
-      <div class="vz-seg-row">${btns}</div>
+      <input type="range" class="vz-slider" id="${id}Slider" min="0" max="${values.length - 1}" step="1" value="${idx}" aria-label="${escapeHtml(label)}" title="${escapeHtml(tip)}" />
+      <div class="vz-slider-ends muted"><span>${escapeHtml(labels[0])}</span><span>${escapeHtml(labels[labels.length - 1])}</span></div>
     </div>`;
   }
 
@@ -619,21 +622,13 @@ async function fillArt(el, job, shopControls) {
         </div>
         <p class="muted">Turn your mark into smooth production paths — SVG and EPS ready for Corel and Illustrator.</p>
         <div class="vz-options" id="vzOptions">
-          ${segRow("detailRow", "Detail", "How many colors to keep — Low for simple logos, High for fine art", [
-            { value: "low", label: "Low", tip: "Few colors · clean logos" },
-            { value: "medium", label: "Medium", tip: "Balanced for most shop art" },
-            { value: "high", label: "High", tip: "More colors · fine detail" },
-          ], initDetail)}
-          ${segRow("smoothRow", "Smoothing", "Round out jagged edges from photos and screenshots", [
-            { value: "low", label: "Low", tip: "Keep sharper edges" },
-            { value: "medium", label: "Medium", tip: "Shop default" },
-            { value: "high", label: "High", tip: "Softer, cleaner curves" },
-          ], initSmooth)}
-          ${segRow("cornerRow", "Corner smoothness", "Sharp corners for type and badges, Smooth for organic shapes", [
-            { value: "sharp", label: "Sharp", tip: "Crisp corners and points" },
-            { value: "balanced", label: "Balanced", tip: "Shop default" },
-            { value: "smooth", label: "Smooth", tip: "Rounded corners" },
-          ], initCorner)}
+          ${sliderRow("detailRow", "Detail", "How many colors to keep — Low for simple logos, High for fine art",
+            ["low","medium","high"], ["Low","Medium","High"], initDetail === "simple" ? "low" : (initDetail === "fine" ? "high" : (initDetail === "balanced" ? "medium" : initDetail)))}
+          ${sliderRow("smoothRow", "Smoothing", "Round out jagged edges from photos and screenshots",
+            ["low","medium","high"], ["Low","Medium","High"], initSmooth)}
+          ${sliderRow("cornerRow", "Corner smoothness", "Sharp corners for type and badges, Smooth for organic shapes",
+            ["sharp","balanced","smooth"], ["Sharp","Balanced","Smooth"], initCorner)}
+          <p class="muted vz-live-hint" id="vzLiveHint">Drag sliders to update the preview live after Vectorize.</p>
         </div>
         ${usedLine}` : ""}
         ${shopControls && layers.length ? `<div class="color-mode-row" id="colorModeRow">
@@ -682,19 +677,51 @@ async function fillArt(el, job, shopControls) {
   let colorMode = initColorMode === "cmyk" ? "cmyk" : "rgb";
   const DETAIL_COLORS = { low: 4, medium: 8, high: 12 };
 
-  function bindSeg(rowId, onPick) {
-    const row = el.querySelector("#" + rowId);
-    if (!row) return;
-    row.querySelectorAll(".vz-seg").forEach((b) => {
-      b.onclick = () => {
-        row.querySelectorAll(".vz-seg").forEach((x) => x.classList.toggle("on", x === b));
-        onPick(b.getAttribute("data-val"));
-      };
-    });
+  let vzLiveTimer = null;
+  let vzLiveBusy = false;
+  let vzLiveQueued = false;
+  function scheduleLiveVectorize() {
+    if (!job.file_path) return;
+    const errEl = $("#err");
+    const hint = $("#vzLiveHint");
+    if (hint) hint.textContent = "Updating preview…";
+    if (errEl && !vzLiveBusy) errEl.textContent = "Updating preview…";
+    clearTimeout(vzLiveTimer);
+    vzLiveTimer = setTimeout(async () => {
+      if (vzLiveBusy) { vzLiveQueued = true; return; }
+      vzLiveBusy = true;
+      try {
+        await runVectorize(null, { live: true });
+      } catch (err) {
+        if (errEl) errEl.textContent = err.message;
+        if (hint) hint.textContent = "Drag sliders to update the preview live after Vectorize.";
+      } finally {
+        vzLiveBusy = false;
+        if (vzLiveQueued) {
+          vzLiveQueued = false;
+          scheduleLiveVectorize();
+        }
+      }
+    }, 450);
   }
-  bindSeg("detailRow", (v) => { vzDetail = v; saveVzPref("detail", v); });
-  bindSeg("smoothRow", (v) => { vzSmooth = v; saveVzPref("smoothing", v); });
-  bindSeg("cornerRow", (v) => { vzCorner = v; saveVzPref("corner", v); });
+  function bindSlider(rowId, values, labels, prefKey, getSet) {
+    const slider = el.querySelector("#" + rowId + "Slider");
+    const valEl = el.querySelector("#" + rowId + "Val");
+    if (!slider) return;
+    const apply = (n, live) => {
+      const i = Math.max(0, Math.min(values.length - 1, Number(n) || 0));
+      const v = values[i];
+      getSet(v);
+      saveVzPref(prefKey, v);
+      if (valEl) valEl.textContent = labels[i];
+      if (live) scheduleLiveVectorize();
+    };
+    slider.oninput = () => apply(slider.value, true);
+    slider.onchange = () => apply(slider.value, true);
+  }
+  bindSlider("detailRow", ["low","medium","high"], ["Low","Medium","High"], "detail", (v) => { vzDetail = v; });
+  bindSlider("smoothRow", ["low","medium","high"], ["Low","Medium","High"], "smoothing", (v) => { vzSmooth = v; });
+  bindSlider("cornerRow", ["sharp","balanced","smooth"], ["Sharp","Balanced","Smooth"], "corner", (v) => { vzCorner = v; });
 
   function applyColorMode(mode) {
     colorMode = mode === "cmyk" ? "cmyk" : "rgb";
@@ -779,14 +806,6 @@ async function fillArt(el, job, shopControls) {
     try { await api("/api/jobs/" + job.id + "/artops", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ knockout: "white" }) }); renderJob(job.id); }
     catch (err) { $("#err").textContent = err.message; }
   };
-  function triggerArtDownload(url) {
-    const a = document.createElement("a");
-    a.href = url;
-    a.setAttribute("download", "");
-    document.body.appendChild(a);
-    a.click();
-    a.remove();
-  }
   const grey = $("#greyBtn");
   if (grey) grey.onclick = async () => {
     const errEl = $("#err");
@@ -817,9 +836,7 @@ async function fillArt(el, job, shopControls) {
         body: JSON.stringify({ invert: true }),
       });
       const mode = (data && data.mode) || (hasVec ? "vector" : "raster");
-      if (errEl) errEl.textContent = mode === "vector" ? "Invert applied · SVG" : "Invert applied · PNG";
-      if (mode === "vector") triggerArtDownload("/api/export/" + job.id + "/art.svg");
-      else triggerArtDownload("/api/export/" + job.id + "/art.png");
+      if (errEl) errEl.textContent = mode === "vector" ? "Invert applied — use Download SVG when you want the file" : "Invert applied — use Download PNG when you want the file";
       renderJob(job.id);
     } catch (err) {
       if (errEl) errEl.textContent = err.message;
@@ -839,11 +856,13 @@ async function fillArt(el, job, shopControls) {
     await api("/api/jobs/" + job.id, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ art_notes: $("#artn").value }) });
     renderJob(job.id);
   };
-  async function runVectorize(engine) {
+  async function runVectorize(engine, opts) {
+    opts = opts || {};
     const errEl = $("#err");
-    if (errEl) errEl.textContent = "Vectorizing…";
+    const hint = $("#vzLiveHint");
+    if (errEl) errEl.textContent = opts.live ? "Updating preview…" : "Vectorizing…";
     await ensurePngArtwork(job);
-    const maxEdge = 1100;
+    const maxEdge = opts.live ? 900 : 1100;
     const colors = DETAIL_COLORS[vzDetail] || 8;
     const payload = {
       colors: colors,
@@ -866,10 +885,12 @@ async function fillArt(el, job, shopControls) {
     const used = meta.settings || { detail: vzDetail, smoothing: vzSmooth, cornerSmooth: vzCorner };
     const label = (k) => String(k || "").replace(/^\w/, (c) => c.toUpperCase());
     if (errEl) {
-      errEl.textContent = "Used · Detail " + label(used.detail) + " · Smoothing " + label(used.smoothing) + " · Corners " + label(used.cornerSmooth);
+      errEl.textContent = (opts.live ? "Live · " : "Used · ") + "Detail " + label(used.detail) + " · Smoothing " + label(used.smoothing) + " · Corners " + label(used.cornerSmooth);
     }
+    if (hint) hint.textContent = "Drag sliders to update the preview live.";
     renderJob(job.id);
   }
+
   const vz = $("#vectorizeBtn");
   if (vz) vz.onclick = async () => {
     try { await runVectorize(); }

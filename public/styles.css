@@ -396,6 +396,10 @@ th { color: var(--muted); font-weight: 600; font-size: 11px; letter-spacing: .06
 .vz-seg-row { display: flex; gap: 6px; }
 .vz-seg { flex: 1; padding: 8px 6px; border: 1px solid var(--line); background: #fff; cursor: pointer; font-size: 12px; font-weight: 600; border-radius: 8px; color: var(--ink); }
 .vz-seg.on, .vz-seg:hover { border-color: var(--gold); color: var(--gold); background: rgba(196,149,58,0.06); }
+.vz-slider { width: 100%; accent-color: var(--gold); height: 28px; cursor: pointer; }
+.vz-slider-val { font-size: 13px; font-weight: 700; color: var(--gold); min-width: 4.5em; text-align: right; }
+.vz-slider-ends { display: flex; justify-content: space-between; font-size: 10px; margin-top: 2px; }
+.vz-live-hint { margin: 0; font-size: 11px; }
 .vz-used { margin: 4px 0 10px; font-size: 12px; }
 .color-mode-row { display: flex; align-items: center; justify-content: space-between; gap: 10px; margin: 12px 0 6px; }
 .color-mode-seg { max-width: 160px; }
