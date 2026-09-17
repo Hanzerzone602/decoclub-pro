@@ -32,7 +32,12 @@ const METHOD_ICONS = {
   sign: '<rect x="4" y="5" width="16" height="10" rx="1"/><path d="M12 15v5M8 20h8"/>',
 };
 const BLANKS = ["tee","hoodie","hat","tumbler","plaque","sticker","sign","hoop"];
-const PLACES = ["chest","left_chest","full","back","front","wrap","center"];
+const PLACES = [
+  { id: "chest", label: "Center chest" },
+  { id: "left_chest", label: "Left chest" },
+  { id: "full", label: "Full front" },
+  { id: "back", label: "Back (front photo for now)" },
+];
 
 async function api(url, opts = {}) {
   opts = Object.assign({ credentials: "include" }, opts);
@@ -1075,7 +1080,7 @@ function fillMockup(el, job, shopControls) {
             <label>Garment / substrate color (procedural only)</label>
             <input name="garment_color" type="color" value="${job.garment_color || "#2c3138"}" />
             <label>Placement tag</label>
-            <select name="placement" id="placeSel">${PLACES.map((p) => `<option value="${p}" ${p===job.placement?"selected":""}>${p}</option>`).join("")}</select>
+            <select name="placement" id="placeSel">${PLACES.map((p) => `<option value="${p.id}" ${(job.placement||"chest")===p.id?"selected":""}>${p.label}</option>`).join("")}</select>
             <button class="btn" type="submit">Apply to blank</button>
           </form>` : `<p class="muted">Placement mockup for review.${job.blank_label ? " · " + escapeHtml(job.blank_label) : (job.catalog_code ? " · " + escapeHtml(job.catalog_code) : "")}</p>`}
       </div>
