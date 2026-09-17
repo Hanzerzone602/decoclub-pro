@@ -5,11 +5,13 @@ nixPkgs = ["nodejs_20", "python311", "python311Packages.pip", "gcc", "zlib", "li
 cmds = [
   "npm install --omit=dev",
   "python3 -m pip install --upgrade pip",
-  "python3 -m pip install --target=/app/pydeps -r requirements.txt"
+  "python3 -m pip install --target=/app/pydeps -r requirements.txt",
+  "mkdir -p /app/.rembg/models && HOME=/app PYTHONPATH=/app/pydeps python3 -c \"from rembg import new_session; new_session('u2net'); print('rembg-u2net-warmed')\""
 ]
 
 [start]
-cmd = "export PYTHONPATH=/app/pydeps:$PYTHONPATH && export PATH=/app/pydeps/bin:$PATH && node server.js"
+cmd = "export HOME=/app && export PYTHONPATH=/app/pydeps:$PYTHONPATH && export PATH=/app/pydeps/bin:$PATH && node server.js"
 
 [variables]
 PYTHONPATH = "/app/pydeps"
+HOME = "/app"

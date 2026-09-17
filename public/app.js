@@ -325,7 +325,7 @@ async function renderMake() {
         </div>
         <input id="makeFile" type="file" accept="image/*,.svg,.pdf" hidden />
       </div>
-      <label class="remember"><input id="rmbg" type="checkbox" checked /> Remove background · production</label>
+      <label class="remember"><input id="rmbg" type="checkbox" checked /> Remove background · AI</label>
       ${cfg.imagine ? `<div class="card" style="margin-top:18px">
         <div class="kicker">AI Generate</div>
         <p class="muted">Describe a graphic — we place it on this job.</p>
@@ -445,7 +445,7 @@ async function renderIntake() {
       <label>Shop margin %</label><input name="margin_pct" type="number" step="0.1" value="${shop && shop.margin_pct != null ? shop.margin_pct : 20}" />
       <label>Notes</label><textarea name="notes" rows="2"></textarea>
       <label>Artwork</label><input name="artwork" type="file" accept="image/*,.svg,.pdf" />
-      <label class="remember"><input name="remove_bg" type="checkbox" checked /> Remove background · production</label>
+      <label class="remember"><input name="remove_bg" type="checkbox" checked /> Remove background · AI</label>
       <p class="notice" id="err"></p>
       <button class="btn" type="submit">Create job</button>
     </form>`;
@@ -705,7 +705,7 @@ async function fillArt(el, job, shopControls) {
         ${shopControls ? `
         <details class="art-more">
           <summary>More tools</summary>
-          <label class="remember"><input id="rmbg" type="checkbox" checked /> Remove background on replace</label>
+          <label class="remember"><input id="rmbg" type="checkbox" checked /> Remove background · AI on replace</label>
           <div class="row">
             <button class="btn small" type="button" id="replaceBtn">Replace art</button>
             <button class="btn small" type="button" id="rmbgBtn">Remove background</button>
@@ -848,11 +848,19 @@ async function fillArt(el, job, shopControls) {
     }
   }
   $("#rmbgBtn").onclick = async () => {
+    const btn = $("#rmbgBtn");
+    const errEl = $("#err");
     try {
+      if (btn) { btn.disabled = true; btn.textContent = "Removing…"; }
+      if (errEl) errEl.textContent = "AI background removal running…";
       await ensurePngArtwork(job);
       await api("/api/jobs/" + job.id + "/artops", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ remove_background: true, knockout: "production" }) });
+      if (errEl) errEl.textContent = "Background removed";
       renderJob(job.id);
-    } catch (err) { $("#err").textContent = err.message; }
+    } catch (err) {
+      if (errEl) errEl.textContent = err.message;
+      if (btn) { btn.disabled = false; btn.textContent = "Remove background"; }
+    }
   };
   $("#ko").onclick = async () => {
     try {
