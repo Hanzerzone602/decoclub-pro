@@ -16,7 +16,6 @@ RUN python3 -m venv /venv \
 COPY . .
 
 ENV PATH="/venv/bin:${PATH}"
-ENV HOME=/root
 ENV INVENT_WARP_PYTHON=/venv/bin/python3
 ENV DIGITIZE_PYTHON=/venv/bin/python3
 ENV DIGITIZE_EXPORTER=pyembroidery

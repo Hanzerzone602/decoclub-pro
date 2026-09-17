@@ -50,6 +50,27 @@ async function api(url, opts = {}) {
 function money(n) { return "$" + Number(n || 0).toFixed(2); }
 function escapeHtml(s) { return String(s || "").replace(/[&<>"']/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c])); }
 
+function showArtWorking(label) {
+  const drop = document.getElementById("artDrop");
+  if (!drop) return;
+  let ov = document.getElementById("artWorking");
+  if (!ov) {
+    ov = document.createElement("div");
+    ov.id = "artWorking";
+    ov.className = "art-working";
+    ov.setAttribute("aria-live", "polite");
+    ov.innerHTML = '<img src="/logo.png" alt="" /><span></span>';
+    drop.appendChild(ov);
+  }
+  const span = ov.querySelector("span");
+  if (span) span.textContent = label || "Working";
+  ov.hidden = false;
+}
+function hideArtWorking() {
+  const ov = document.getElementById("artWorking");
+  if (ov) ov.hidden = true;
+}
+
 /** Press-floor run-risk from layer count / alignment. Shop language only — never engine ids. */
 function runRiskForJob(job) {
   const layers = (job && job.vector && job.vector.layers) || [];
@@ -325,7 +346,7 @@ async function renderMake() {
         </div>
         <input id="makeFile" type="file" accept="image/*,.svg,.pdf" hidden />
       </div>
-      <label class="remember"><input id="rmbg" type="checkbox" checked /> Remove background · AI</label>
+      <label class="remember"><input id="rmbg" type="checkbox" checked /> Remove background · production</label>
       ${cfg.imagine ? `<div class="card" style="margin-top:18px">
         <div class="kicker">AI Generate</div>
         <p class="muted">Describe a graphic — we place it on this job.</p>
@@ -445,7 +466,7 @@ async function renderIntake() {
       <label>Shop margin %</label><input name="margin_pct" type="number" step="0.1" value="${shop && shop.margin_pct != null ? shop.margin_pct : 20}" />
       <label>Notes</label><textarea name="notes" rows="2"></textarea>
       <label>Artwork</label><input name="artwork" type="file" accept="image/*,.svg,.pdf" />
-      <label class="remember"><input name="remove_bg" type="checkbox" checked /> Remove background · AI</label>
+      <label class="remember"><input name="remove_bg" type="checkbox" checked /> Remove background · production</label>
       <p class="notice" id="err"></p>
       <button class="btn" type="submit">Create job</button>
     </form>`;
@@ -705,7 +726,7 @@ async function fillArt(el, job, shopControls) {
         ${shopControls ? `
         <details class="art-more">
           <summary>More tools</summary>
-          <label class="remember"><input id="rmbg" type="checkbox" checked /> Remove background · AI on replace</label>
+          <label class="remember"><input id="rmbg" type="checkbox" checked /> Remove background on replace</label>
           <div class="row">
             <button class="btn small" type="button" id="replaceBtn">Replace art</button>
             <button class="btn small" type="button" id="rmbgBtn">Remove background</button>
@@ -738,7 +759,7 @@ async function fillArt(el, job, shopControls) {
     const errEl = $("#err");
     const hint = $("#vzLiveHint");
     if (hint) hint.textContent = "Updating preview…";
-    if (errEl && !vzLiveBusy) errEl.textContent = "Updating preview…";
+    if (errEl && !vzLiveBusy) errEl.textContent = "";
     clearTimeout(vzLiveTimer);
     vzLiveTimer = setTimeout(async () => {
       if (vzLiveBusy) { vzLiveQueued = true; return; }
@@ -852,10 +873,9 @@ async function fillArt(el, job, shopControls) {
     const errEl = $("#err");
     try {
       if (btn) { btn.disabled = true; btn.textContent = "Removing…"; }
-      if (errEl) errEl.textContent = "AI background removal running…";
       await ensurePngArtwork(job);
       await api("/api/jobs/" + job.id + "/artops", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ remove_background: true, knockout: "production" }) });
-      if (errEl) errEl.textContent = "Background removed";
+      if (errEl) errEl.textContent = "";
       renderJob(job.id);
     } catch (err) {
       if (errEl) errEl.textContent = err.message;
@@ -923,7 +943,9 @@ async function fillArt(el, job, shopControls) {
     opts = opts || {};
     const errEl = $("#err");
     const hint = $("#vzLiveHint");
-    if (errEl) errEl.textContent = opts.live ? "Updating preview…" : "Vectorizing…";
+    if (errEl) errEl.textContent = "";
+    showArtWorking("Working");
+    try {
     await ensurePngArtwork(job);
     const maxEdge = opts.live ? 900 : 1100;
     const payload = {
@@ -948,9 +970,7 @@ async function fillArt(el, job, shopControls) {
     const d = toPct(used.detail, DETAIL_LEGACY, vzDetail);
     const sm = toPct(used.smoothing, SMOOTH_LEGACY, vzSmooth);
     const c = toPct(used.cornerSmooth, CORNER_LEGACY, vzCorner);
-    if (errEl) {
-      errEl.textContent = (opts.live ? "Live · " : "Used · ") + "Detail " + d + " · Smoothing " + sm + " · Corners " + c;
-    }
+    if (errEl) errEl.textContent = "";
     const usedEl = $("#vzUsed");
     if (usedEl) {
       usedEl.hidden = false;
@@ -958,17 +978,20 @@ async function fillArt(el, job, shopControls) {
     }
     if (hint) hint.textContent = "Drag sliders to update the preview live.";
     renderJob(job.id);
+    } finally {
+      hideArtWorking();
+    }
   }
 
   const vz = $("#vectorizeBtn");
   if (vz) vz.onclick = async () => {
     try { await runVectorize(); }
-    catch (err) { $("#err").textContent = err.message; }
+    catch (err) { hideArtWorking(); const e = $("#err"); if (e) e.textContent = err.message; }
   };
   const pvz = $("#proVectorizeBtn");
   if (pvz) pvz.onclick = async () => {
     try { await runVectorize("vtracer"); }
-    catch (err) { $("#err").textContent = err.message; }
+    catch (err) { hideArtWorking(); const e = $("#err"); if (e) e.textContent = err.message; }
   };
   async function recolorLayer(layer, body) {
     await api("/api/jobs/" + job.id + "/recolor", {

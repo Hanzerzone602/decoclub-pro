@@ -429,3 +429,37 @@ th { color: var(--muted); font-weight: 600; font-size: 11px; letter-spacing: .06
 .blank-hit span { color: var(--muted); line-height: 1.25; max-width: 90px; overflow: hidden; text-overflow: ellipsis; display: -webkit-box; -webkit-line-clamp: 2; -webkit-box-orient: vertical; }
 .blank-selected { margin: 8px 0 4px; min-height: 0; }
 .blank-selected img { max-height: 140px; border: 1px solid var(--line); background: #fff; }
+
+/* Mascot busy overlay on art preview (vectorize / live update) */
+.art-drop { position: relative; }
+.art-working {
+  position: absolute;
+  inset: 0;
+  z-index: 5;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  gap: 10px;
+  background: rgba(248, 251, 255, 0.72);
+  backdrop-filter: blur(2px);
+  pointer-events: none;
+  border-radius: inherit;
+}
+.art-working img {
+  width: 72px;
+  height: 72px;
+  object-fit: contain;
+  animation: art-working-bob 1.1s ease-in-out infinite;
+  filter: drop-shadow(0 4px 10px rgba(20, 40, 80, 0.18));
+}
+.art-working span {
+  font-weight: 650;
+  font-size: 1.05rem;
+  letter-spacing: 0.02em;
+  color: #1a2a44;
+}
+@keyframes art-working-bob {
+  0%, 100% { transform: translateY(0) scale(1); }
+  50% { transform: translateY(-6px) scale(1.04); }
+}
