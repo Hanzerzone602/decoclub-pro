@@ -6,7 +6,7 @@ const crypto = require("crypto");
 const { URL } = require("url");
 const { priceJob, priceQuote } = require("./lib/price");
 const { writeExports, intakePosterSvg } = require("./lib/exports");
-const { writeMockups, BLANKS } = require("./lib/mockup");
+const { writeMockups, BLANKS, searchBlanks, findBlank, blankPublicUrl } = require("./lib/mockup");
 const { loadCatalog, findSku, searchCatalog } = require("./lib/catalog");
 const { generateBadgePng } = require("./lib/demoart");
 const { processArtwork } = require("./lib/artops");
@@ -954,6 +954,25 @@ async function handleApi(req, res, url) {
     const skus = searchCatalog(q);
     return json(res, 200, { skus: skus, total: loadCatalog().length });
   }
+  if (pth === "/api/blanks" && method === "GET") {
+    const q = url.searchParams.get("q");
+    const hits = searchBlanks(q);
+    const items = hits.map(function (it) {
+      return {
+        id: it.id,
+        style: it.style,
+        style_label: it.style_label,
+        color: it.color,
+        label: it.label,
+        source: it.source || "ssactivewear",
+        view: it.view || "flat_front",
+        file: it.file,
+        url: blankPublicUrl(it),
+        cdn: it.cdn || null,
+      };
+    });
+    return json(res, 200, { items: items, total: items.length, source: "S&S Activewear" });
+  }
 
   if (pth === "/api/signup" && method === "POST") {
     const body = parseJsonBody(await readBody(req));
@@ -1139,7 +1158,7 @@ async function handleApi(req, res, url) {
     const job = db.jobs.find(function (j) { return j.id === jobGet[1] && j.shop_id === user.shop_id; });
     if (!job) return json(res, 404, { error: "Job not found" });
     const body = parseJsonBody(await readBody(req));
-    ["title","notes","art_notes","method","due_at","client_id","blank","garment_color","placement","catalog_code"].forEach(function (k) {
+    ["title","notes","art_notes","method","due_at","client_id","blank","garment_color","placement","catalog_code","blank_id","blank_label","blank_file","placement_scale","placement_offset_x","placement_offset_y"].forEach(function (k) {
       if (body[k] != null) job[k] = body[k];
     });
     if (body.width_in != null) job.width_in = Number(body.width_in);
@@ -1262,18 +1281,39 @@ async function handleApi(req, res, url) {
     if (body.blank) job.blank = body.blank;
     if (body.garment_color) job.garment_color = body.garment_color;
     if (body.placement) job.placement = body.placement;
+    if (body.placement_scale != null && body.placement_scale !== "") job.placement_scale = Number(body.placement_scale);
+    if (body.placement_offset_x != null && body.placement_offset_x !== "") job.placement_offset_x = Number(body.placement_offset_x);
+    if (body.placement_offset_y != null && body.placement_offset_y !== "") job.placement_offset_y = Number(body.placement_offset_y);
+    if (body.blank_id) {
+      job.blank_id = String(body.blank_id);
+      const blank = findBlank(job.blank_id);
+      if (blank) {
+        job.blank_label = blank.label || blank.id;
+        job.blank_file = blank.file;
+        job.blank = "tee";
+        if (!body.garment_color && blank.color) {
+          // keep explicit color picker if sent; otherwise leave garment_color alone
+        }
+      }
+    } else if (body.blank_id === "" || body.blank_id === null) {
+      job.blank_id = null;
+      job.blank_label = null;
+      job.blank_file = null;
+    }
+    if (body.blank_label) job.blank_label = String(body.blank_label);
+    if (body.blank_file) job.blank_file = String(body.blank_file).replace(/^\/+/, "");
     if (body.catalog_code) {
       job.catalog_code = body.catalog_code;
       const sku = findSku(body.catalog_code);
       if (sku) {
-        job.blank = sku.kind;
+        if (!job.blank_id) job.blank = sku.kind;
         if (!body.garment_color) job.garment_color = sku.hex;
         if (!body.placement && sku.placements && sku.placements[0]) job.placement = sku.placements[0].id;
       }
     }
     applyMockup(job);
     if (STATUSES.indexOf(job.status) < STATUSES.indexOf("mockup")) job.status = "mockup";
-    event(db, job, "Mockup regenerated"); save(db);
+    event(db, job, job.blank_id ? ("Applied to blank · " + (job.blank_label || job.blank_id)) : "Mockup regenerated"); save(db);
     return json(res, 200, { job: presentJob(job, req) });
   }
   const pr = pth.match(/^\/api\/jobs\/([^/]+)\/price$/);

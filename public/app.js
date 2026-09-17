@@ -1046,56 +1046,82 @@ function bindArtZoom(stage) {
 }
 
 function fillMockup(el, job, shopControls) {
+  const scaleVal = job.placement_scale != null ? job.placement_scale : 100;
+  const ox = job.placement_offset_x != null ? job.placement_offset_x : 0;
+  const oy = job.placement_offset_y != null ? job.placement_offset_y : 0;
   el.innerHTML = `
     <div class="split">
-      <div class="preview">${job.mockup_path ? `<img src="${job.mockup_path}" alt="Mockup" />` : `<span class="muted">Generate a blank</span>`}</div>
+      <div class="preview">${job.mockup_path ? `<img src="${job.mockup_path}" alt="Mockup" />` : `<span class="muted">Select an S&amp;S blank, then Apply to blank</span>`}</div>
       <div>
         ${shopControls ? `
           <form id="mk" class="form">
-            <label>Search catalog (style code)</label>
-            <input id="skuq" type="search" placeholder="PC54, 18000, C112, DC-LASER…" value="${escapeHtml(job.catalog_code || "")}" autocomplete="off" />
-            <div id="skulist" class="sku-list muted">Type a SanMar-style code or DecoClub hardgood.</div>
-            <input type="hidden" name="catalog_code" id="skucode" value="${escapeHtml(job.catalog_code || "")}" />
-            <p id="skupicked" class="muted">${job.catalog_code ? "Selected " + escapeHtml(job.catalog_code) : "No SKU selected"}</p>
-            <label>Blank</label>
+            <p class="muted">Real garment photos from S&amp;S Activewear (flat front). SanMar CDN is gated — these are honest blanks.</p>
+            <label>Search blanks (style / color)</label>
+            <input id="blankq" type="search" placeholder="18000, Gildan, Navy, White…" value="" autocomplete="off" />
+            <div id="blanklist" class="blank-grid muted">Type to search S&amp;S blanks.</div>
+            <input type="hidden" name="blank_id" id="blankid" value="${escapeHtml(job.blank_id || "")}" />
+            <input type="hidden" name="blank_label" id="blanklabel" value="${escapeHtml(job.blank_label || "")}" />
+            <input type="hidden" name="blank_file" id="blankfile" value="${escapeHtml(job.blank_file || "")}" />
+            <p id="blankpicked" class="muted">${job.blank_id ? "Selected " + escapeHtml(job.blank_label || job.blank_id) : "No blank selected"}</p>
+            <div id="blankthumb" class="blank-selected">${job.blank_file ? `<img src="/${escapeHtml(String(job.blank_file).replace(/^\/+/, ""))}" alt="" />` : ""}</div>
+            <label>Art scale %</label>
+            <input name="placement_scale" type="number" min="25" max="250" step="5" value="${scaleVal}" />
+            <div class="row">
+              <div style="flex:1"><label>Offset X %</label><input name="placement_offset_x" type="number" min="-40" max="40" step="1" value="${ox}" /></div>
+              <div style="flex:1"><label>Offset Y %</label><input name="placement_offset_y" type="number" min="-40" max="40" step="1" value="${oy}" /></div>
+            </div>
+            <label>Legacy procedural blank (hardgoods / no photo)</label>
             <select name="blank">${BLANKS.map((b) => `<option value="${b}" ${b===(job.blank||"")?"selected":""}>${b}</option>`).join("")}</select>
-            <label>Garment / substrate color</label>
+            <label>Garment / substrate color (procedural only)</label>
             <input name="garment_color" type="color" value="${job.garment_color || "#2c3138"}" />
-            <label>Placement</label>
+            <label>Placement tag</label>
             <select name="placement" id="placeSel">${PLACES.map((p) => `<option value="${p}" ${p===job.placement?"selected":""}>${p}</option>`).join("")}</select>
-            <button class="btn" type="submit">Generate mockup</button>
-          </form>` : `<p class="muted">Placement mockup for review.${job.catalog_code ? " · " + escapeHtml(job.catalog_code) : ""}</p>`}
+            <button class="btn" type="submit">Apply to blank</button>
+          </form>` : `<p class="muted">Placement mockup for review.${job.blank_label ? " · " + escapeHtml(job.blank_label) : (job.catalog_code ? " · " + escapeHtml(job.catalog_code) : "")}</p>`}
       </div>
     </div>`;
   const mk = $("#mk");
   if (!mk) return;
-  const qEl = $("#skuq");
-  const list = $("#skulist");
+  const qEl = $("#blankq");
+  const list = $("#blanklist");
   let timer = null;
+  function pickBlank(it) {
+    $("#blankid").value = it.id || "";
+    $("#blanklabel").value = it.label || it.id || "";
+    $("#blankfile").value = (it.file || "").replace(/^\/+/, "");
+    $("#blankpicked").textContent = "Selected " + (it.label || it.id);
+    const thumb = $("#blankthumb");
+    const url = it.url || ("/" + String(it.file || "").replace(/^\/+/, ""));
+    thumb.innerHTML = url ? `<img src="${escapeHtml(url)}" alt="" />` : "";
+    mk.blank.value = "tee";
+  }
   async function runSearch() {
     const q = qEl.value.trim();
-    if (q.length < 2) { list.textContent = "Type at least 2 characters."; return; }
-    const data = await api("/api/catalog?q=" + encodeURIComponent(q));
-    const rows = (data.skus || []).slice(0, 24);
-    if (!rows.length) { list.textContent = "No SKUs match."; return; }
-    list.innerHTML = rows.map((s) => `<button type="button" class="sku-hit" data-code="${escapeHtml(s.code)}" data-kind="${escapeHtml(s.kind)}" data-hex="${escapeHtml(s.hex)}" data-place="${escapeHtml((s.placements[0] && s.placements[0].id) || "center")}">
-      <strong>${escapeHtml(s.code)}</strong> <span>${escapeHtml(s.name)}</span>
+    const data = await api("/api/blanks?q=" + encodeURIComponent(q));
+    const rows = (data.items || []).slice(0, 36);
+    if (!rows.length) { list.textContent = "No blanks match."; return; }
+    list.classList.remove("muted");
+    list.innerHTML = rows.map((s) => `<button type="button" class="blank-hit" data-id="${escapeHtml(s.id)}" title="${escapeHtml(s.label || s.id)}">
+      <img src="${escapeHtml(s.url || ("/" + s.file))}" alt="" loading="lazy" />
+      <span>${escapeHtml(s.label || s.id)}</span>
     </button>`).join("");
-    list.querySelectorAll(".sku-hit").forEach((b) => {
+    list.querySelectorAll(".blank-hit").forEach((b) => {
       b.onclick = () => {
-        $("#skucode").value = b.dataset.code;
-        $("#skupicked").textContent = "Selected " + b.dataset.code;
-        mk.blank.value = b.dataset.kind;
-        mk.garment_color.value = b.dataset.hex;
-        if (b.dataset.place) mk.placement.value = b.dataset.place;
+        const hit = rows.find((r) => r.id === b.dataset.id);
+        if (hit) pickBlank(hit);
       };
     });
   }
-  qEl.oninput = () => { clearTimeout(timer); timer = setTimeout(runSearch, 180); };
-  if ((job.catalog_code || "").length >= 2) runSearch().catch(() => {});
+  qEl.oninput = () => { clearTimeout(timer); timer = setTimeout(() => { runSearch().catch(() => {}); }, 180); };
+  runSearch().catch(() => {});
   mk.onsubmit = async (e) => {
     e.preventDefault();
-    await api("/api/jobs/" + job.id + "/mockup", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(Object.fromEntries(new FormData(mk).entries())) });
+    if (!$("#blankid").value) {
+      $("#blankpicked").textContent = "Pick an S&S blank first (or clear and use procedural hardgood).";
+      // still allow procedural if they want hardgoods — only block when apparel intent without blank? Allow submit for procedural.
+    }
+    const payload = Object.fromEntries(new FormData(mk).entries());
+    await api("/api/jobs/" + job.id + "/mockup", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(payload) });
     renderJob(job.id);
   };
 }

@@ -420,3 +420,12 @@ th { color: var(--muted); font-weight: 600; font-size: 11px; letter-spacing: .06
 @media (max-width: 960px) {
   .dig-canvas { height: 48vh; }
 }
+
+/* S&S blank picker */
+.blank-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(96px, 1fr)); gap: 8px; max-height: 280px; overflow: auto; border: 1px solid var(--line); background: var(--panel-2); padding: 8px; margin: 8px 0; font-size: 11px; }
+.blank-hit { display: flex; flex-direction: column; align-items: center; gap: 4px; background: var(--panel); border: 1px solid var(--line); border-radius: 6px; padding: 6px; cursor: pointer; color: var(--ink); text-align: center; }
+.blank-hit:hover, .blank-hit:focus { border-color: var(--accent, #017ece); outline: none; }
+.blank-hit img { width: 72px; height: 90px; object-fit: contain; background: #fff; border-radius: 2px; }
+.blank-hit span { color: var(--muted); line-height: 1.25; max-width: 90px; overflow: hidden; text-overflow: ellipsis; display: -webkit-box; -webkit-line-clamp: 2; -webkit-box-orient: vertical; }
+.blank-selected { margin: 8px 0 4px; min-height: 0; }
+.blank-selected img { max-height: 140px; border: 1px solid var(--line); background: #fff; }
