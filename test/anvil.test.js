@@ -120,6 +120,10 @@ function squarePng() {
   assert.ok(dig.dst && dig.dst.length > 512, "DST longer than header");
   assert.ok(dig.dst[0] === 0x4C && dig.dst[1] === 0x41 && dig.dst[2] === 0x3A, "DST starts with LA:");
   assert.ok(dig.stitchCount > 50, "1in square has real stitches, not 4 jumps");
+  assert.ok(dig.preview && dig.preview.stitches && dig.preview.stitches.length > 20, "3D preview payload");
+  assert.ok(dig.colorStops && dig.colorStops[0] && dig.colorStops[0].madeiraCode, "Madeira code on colorStops");
+  const dig2 = digitizeLayers(vec, { name: "SQUARE2", widthIn: 2, heightIn: 2, density: 0.4, previewOnly: true });
+  assert.ok(dig2.stitchCount > dig.stitchCount * 2.4, "2in restitch grows stitch count");
   const stones = packStonesFromPng(buf, 2, 2, { ss: "SS10" });
   assert.ok(stones.length > 8, "SS10 pack on 2in art is more than a handful");
   const pals = listPalettes();
@@ -199,6 +203,21 @@ function squarePng() {
   assert.strictEqual(img.rgba[0], img.rgba[1]);
   assert.strictEqual(img.rgba[1], img.rgba[2]);
   console.log("ok hi-res greyscale");
+}
+
+
+{
+  const { processArtwork } = require("../lib/artops");
+  const { encodePng, makeRgba, decodePng } = require("../lib/png");
+  const w = 8, h = 8;
+  const rgba = makeRgba(w, h, [200, 40, 40, 200]);
+  const out = processArtwork(encodePng(w, h, rgba), { invert: true });
+  const img = decodePng(out);
+  assert.strictEqual(img.rgba[0], 55);
+  assert.strictEqual(img.rgba[1], 215);
+  assert.strictEqual(img.rgba[2], 215);
+  assert.strictEqual(img.rgba[3], 200);
+  console.log("ok invert black & white");
 }
 
 console.log("all tests passed");

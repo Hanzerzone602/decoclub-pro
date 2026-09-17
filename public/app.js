@@ -278,11 +278,12 @@ async function renderMake() {
     nav();
     return renderBoard();
   }
-  const chips = METHODS.map((m) => `<button type="button" class="process-chip${m===makeMethod?" on":""}" data-chip="${m}">${METHOD_LABELS[m]}</button>`).join("");
+  // Quiet default method — no process-chip picker on Make
+  if (METHODS.indexOf(makeMethod) === -1) makeMethod = "apparel";
   main.innerHTML = `
     <div class="make-home">
       <h1 class="make-title">Drop art. Vectorize. Recolor. Export.</h1>
-      <p class="muted make-sub">Studio first — layers, palettes, stitches, stones.</p>
+      <p class="muted make-sub">Vectorize-first studio — clean SVG/EPS for Corel and Illustrator.</p>
       ${paywallNote()}
       <div class="make-drop" id="makeDrop" tabindex="0" role="button" aria-label="Drop art. Vectorize. Recolor. Export. or tap to pick a file">
         <div class="drop-hint">
@@ -292,22 +293,14 @@ async function renderMake() {
         <input id="makeFile" type="file" accept="image/*,.svg,.pdf" hidden />
       </div>
       <label class="remember"><input id="rmbg" type="checkbox" checked /> Remove background · production</label>
-      <div class="process-chips" id="makeChips">${chips}</div>
       ${cfg.imagine ? `<div class="card" style="margin-top:18px">
         <div class="kicker">AI Generate</div>
-        <p class="muted">Typed art for this process.</p>
+        <p class="muted">Describe a graphic — we place it on this job.</p>
         <textarea id="imaginePrompt" rows="2" placeholder="A varsity mascot, clean print-ready graphic on transparent"></textarea>
         <button class="btn small" type="button" id="imagineGo">AI Generate</button>
       </div>` : ""}
       <p class="notice" id="makeErr"></p>
     </div>`;
-  main.querySelectorAll("[data-chip]").forEach((b) => {
-    b.onclick = (e) => {
-      e.preventDefault();
-      makeMethod = b.dataset.chip;
-      main.querySelectorAll("[data-chip]").forEach((x) => x.classList.toggle("on", x.dataset.chip === makeMethod));
-    };
-  });
   const drop = $("#makeDrop");
   const fileEl = $("#makeFile");
   async function take(file) {
@@ -622,6 +615,7 @@ async function fillArt(el, job, shopControls) {
         <div class="art-actions">
           <button class="btn primary" id="vectorizeBtn" type="button">Vectorize</button>
           <button class="btn ghost" id="greyBtn" type="button">Hi-res greyscale</button>
+          <button class="btn ghost" id="invertBtn" type="button">Invert black &amp; white</button>
         </div>
         <p class="muted">Turn your mark into smooth production paths — SVG and EPS ready for Corel and Illustrator.</p>
         <div class="vz-options" id="vzOptions">
@@ -650,11 +644,15 @@ async function fillArt(el, job, shopControls) {
           </div>
         </div>` : ""}
         <div class="layer-list${shopControls ? " color-mode-" + initColorMode : ""}">${layerRows}</div>
-        ${shopControls && layers.length ? `<div class="export-grid export-hero art-dl">
+        ${shopControls && (layers.length || job.vector_svg) ? `<div class="export-grid export-hero art-dl">
           <a href="/api/export/${job.id}/art.svg">Download SVG</a>
           <a href="/api/export/${job.id}/art.eps">Download EPS</a>
         </div>
         <p class="muted">Production SVG / EPS · real curves</p>` : ""}
+        ${shopControls && job.file_path && !job.vector_svg ? `<div class="export-grid export-hero art-dl">
+          <a href="/api/export/${job.id}/art.png" id="dlArtPng">Download PNG</a>
+        </div>
+        <p class="muted">Raster art · PNG</p>` : ""}
         ${shopControls ? `
         <details class="art-more">
           <summary>More tools</summary>
@@ -781,13 +779,53 @@ async function fillArt(el, job, shopControls) {
     try { await api("/api/jobs/" + job.id + "/artops", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ knockout: "white" }) }); renderJob(job.id); }
     catch (err) { $("#err").textContent = err.message; }
   };
+  function triggerArtDownload(url) {
+    const a = document.createElement("a");
+    a.href = url;
+    a.setAttribute("download", "");
+    document.body.appendChild(a);
+    a.click();
+    a.remove();
+  }
   const grey = $("#greyBtn");
   if (grey) grey.onclick = async () => {
+    const errEl = $("#err");
     try {
+      grey.disabled = true;
+      grey.textContent = "Greyscale…";
       await ensurePngArtwork(job);
       await api("/api/jobs/" + job.id + "/artops", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ greyscale: true, scale: 2 }) });
+      if (errEl) errEl.textContent = "Greyscale applied";
       renderJob(job.id);
-    } catch (err) { $("#err").textContent = err.message; }
+    } catch (err) {
+      if (errEl) errEl.textContent = err.message;
+      grey.disabled = false;
+      grey.textContent = "Hi-res greyscale";
+    }
+  };
+  const invertBtn = $("#invertBtn");
+  if (invertBtn) invertBtn.onclick = async () => {
+    const errEl = $("#err");
+    try {
+      invertBtn.disabled = true;
+      invertBtn.textContent = "Inverting…";
+      const hasVec = !!(job.vector_svg || (job.vector && job.vector.layers && job.vector.layers.length));
+      if (!hasVec) await ensurePngArtwork(job);
+      const data = await api("/api/jobs/" + job.id + "/artops", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ invert: true }),
+      });
+      const mode = (data && data.mode) || (hasVec ? "vector" : "raster");
+      if (errEl) errEl.textContent = mode === "vector" ? "Invert applied · SVG" : "Invert applied · PNG";
+      if (mode === "vector") triggerArtDownload("/api/export/" + job.id + "/art.svg");
+      else triggerArtDownload("/api/export/" + job.id + "/art.png");
+      renderJob(job.id);
+    } catch (err) {
+      if (errEl) errEl.textContent = err.message;
+      invertBtn.disabled = false;
+      invertBtn.textContent = "Invert black & white";
+    }
   };
   const ig = $("#imagineGo");
   if (ig) ig.onclick = async () => {

@@ -510,6 +510,63 @@ function scheduleVectorize(jobId) {
   /* Upload stays snappy: do NOT auto-vectorize. User clicks Vectorize. */
   return;
 }
+function clearJobVector(job) {
+  if (!job) return;
+  delete job.vector;
+  delete job.vector_svg;
+  delete job.vector_eps;
+}
+function jobHasUsableVector(job) {
+  if (!job) return false;
+  if (job.vector_svg) return true;
+  return !!(job.vector && Array.isArray(job.vector.layers) && job.vector.layers.length);
+}
+function invertHexColor(hex) {
+  const rgb = colorspec.parseHex(hex);
+  if (!rgb) return hex;
+  return colorspec.rgbToHex(255 - rgb[0], 255 - rgb[1], 255 - rgb[2]);
+}
+function invertPaintColorToken(color) {
+  const c = String(color || "").trim();
+  if (/^#([0-9a-fA-F]{6})$/.test(c)) return invertHexColor(c);
+  if (/^#([0-9a-fA-F]{3})$/.test(c)) {
+    const h = c.slice(1);
+    return invertHexColor("#" + h[0] + h[0] + h[1] + h[1] + h[2] + h[2]);
+  }
+  const rgb = c.match(/^rgb\(\s*(\d+)\s*,\s*(\d+)\s*,\s*(\d+)\s*\)$/i);
+  if (rgb) return "rgb(" + (255 - Number(rgb[1])) + "," + (255 - Number(rgb[2])) + "," + (255 - Number(rgb[3])) + ")";
+  return c;
+}
+/** Invert fill/stroke/stop-color only — never raw #ids in url(#…). */
+function invertSvgMarkup(svg) {
+  return String(svg || "").replace(
+    /((?:fill|stroke|stop-color|flood-color|lighting-color|color)\s*[:=]\s*["']?)(#(?:[0-9a-fA-F]{6}|[0-9a-fA-F]{3})|rgb\(\s*\d+\s*,\s*\d+\s*,\s*\d+\s*\))/gi,
+    function (m, prefix, color) {
+      return prefix + invertPaintColorToken(color);
+    }
+  );
+}
+function invertJobVector(job) {
+  if (!job) return;
+  if (job.vector_svg) {
+    const abs = path.join(UPLOADS, path.basename(job.vector_svg));
+    if (fs.existsSync(abs)) {
+      const svg = invertSvgMarkup(fs.readFileSync(abs, "utf8"));
+      const name = Date.now() + "-" + uid() + "-vector.svg";
+      fs.writeFileSync(path.join(UPLOADS, name), svg);
+      job.vector_svg = "/uploads/" + name;
+      delete job.vector_eps;
+    }
+  }
+  if (job.vector && Array.isArray(job.vector.layers)) {
+    job.vector.layers = job.vector.layers.map(function (L) {
+      return colorspec.annotateLayer(Object.assign({}, L, { hex: invertHexColor(L.hex || "#000000") }));
+    });
+    if (!job.vector_svg && vectorHasRealPaths(job.vector)) {
+      rewriteVectorSvg(job);
+    }
+  }
+}
 function rewriteVectorSvg(job) {
   if (!job || !job.vector || !job.vector.layers) return;
   // Prefer keeping on-disk vector_svg when layers lack real path `d` (vai-trace / invent-warp).
@@ -1005,19 +1062,49 @@ async function handleApi(req, res, url) {
   if (ops && method === "POST") {
     if (!canRunFloor(user)) return json(res, 403, { error: "Shop login required" });
     const job = db.jobs.find(function (j) { return j.id === ops[1] && j.shop_id === user.shop_id; });
-    if (!job || !job.file_path) return json(res, 400, { error: "PNG artwork required for knockout / color swap" });
+    if (!job) return json(res, 404, { error: "Job not found" });
+    const body = parseJsonBody(await readBody(req));
+    // Vector invert: keep geometry, flip fill/stroke + layer hex/rgb/cmyk
+    if (body.invert && jobHasUsableVector(job)) {
+      try {
+        invertJobVector(job);
+        applyMockup(job);
+        event(db, job, "Invert black & white · vector"); save(db);
+        return json(res, 200, {
+          job: presentJob(job, req),
+          mode: "vector",
+          applied: "invert",
+          download: "svg",
+        });
+      } catch (err) {
+        return json(res, 400, { error: IS_PROD ? "Could not invert vector" : err.message });
+      }
+    }
+    if (!job.file_path) return json(res, 400, { error: "PNG artwork required for knockout / color swap" });
     const abs = path.join(UPLOADS, path.basename(job.file_path));
     if (!fs.existsSync(abs)) return json(res, 404, { error: "Artwork missing" });
-    const body = parseJsonBody(await readBody(req));
+    const srcBuf = fs.readFileSync(abs);
+    if (srcBuf[0] !== 0x89 || srcBuf[1] !== 0x50) {
+      return json(res, 400, { error: "PNG artwork required — convert JPEG/WebP to PNG first" });
+    }
     try {
-      const out = processArtwork(fs.readFileSync(abs), body);
+      const out = processArtwork(srcBuf, body);
       const name = Date.now() + "-" + uid() + ".png";
       fs.writeFileSync(path.join(UPLOADS, name), out);
       job.file_path = "/uploads/" + name;
+      // Greyscale / invert replace the raster preview — drop stale vector so UI shows the PNG
+      const skipRevector = !!(body.greyscale || body.invert);
+      if (skipRevector) clearJobVector(job);
       applyMockup(job);
-      event(db, job, "Artwork processed"); save(db);
-      scheduleVectorize(job.id);
-      return json(res, 200, { job: presentJob(job, req) });
+      const label = body.greyscale ? "Hi-res greyscale" : (body.invert ? "Invert black & white · raster" : "Artwork processed");
+      event(db, job, label); save(db);
+      if (!skipRevector) scheduleVectorize(job.id);
+      return json(res, 200, {
+        job: presentJob(job, req),
+        mode: "raster",
+        applied: body.greyscale ? "greyscale" : (body.invert ? "invert" : "artops"),
+        download: body.invert ? "png" : null,
+      });
     } catch (err) { return json(res, 400, { error: IS_PROD ? "Could not process artwork" : err.message }); }
   }
   const imgJob = pth.match(/^\/api\/jobs\/([^/]+)\/imagine$/);
@@ -1536,6 +1623,12 @@ async function handleApi(req, res, url) {
       const abs = path.join(UPLOADS, path.basename(job.vector_svg));
       if (fs.existsSync(abs)) {
         return download(res, "decoclub-" + job.id.slice(0, 8) + "-art.svg", fs.readFileSync(abs), "image/svg+xml");
+      }
+    }
+    if (expFile[2] === "art.png" && job.file_path) {
+      const abs = path.join(UPLOADS, path.basename(job.file_path));
+      if (fs.existsSync(abs)) {
+        return download(res, "decoclub-" + job.id.slice(0, 8) + "-art.png", fs.readFileSync(abs), "image/png");
       }
     }
     if (expFile[2] === "art.eps" && job.vector_eps) {
