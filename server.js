@@ -828,28 +828,36 @@ function applyQuote(job) {
   job.total = q.total;
   return q;
 }
+function rasterizeSvgForMockup(job, svgAbs) {
+  const outName = "mockart-" + job.id.slice(0, 12) + ".png";
+  const outAbs = path.join(UPLOADS, outName);
+  try {
+    const { spawnSync } = require("child_process");
+    const r = spawnSync("rsvg-convert", ["-w", "1400", "-h", "1400", "--keep-aspect-ratio", "-f", "png", "-o", outAbs, svgAbs], { encoding: "utf8" });
+    if (r.status === 0 && fs.existsSync(outAbs) && fs.statSync(outAbs).size > 200) {
+      job.vector_png = "/uploads/" + outName;
+      return job.vector_png;
+    }
+    console.error("rsvg-convert mockup fail", r.status, r.stderr && String(r.stderr).slice(0, 300));
+  } catch (e) {
+    console.error("rsvg-convert mockup error", e && e.message);
+  }
+  return null;
+}
 function artPathForMockup(job) {
-  // Prefer a raster the mockup compositor can load (PNG/JPEG). SVG alone used to yield a blank shirt.
+  // Prefer vectorized art when present (old JPEG-first path left dark logos on black blanks).
   if (job.vector_png && fs.existsSync(path.join(UPLOADS, path.basename(job.vector_png)))) return job.vector_png;
+  if (job.vector_svg) {
+    const svgAbs = path.join(UPLOADS, path.basename(job.vector_svg));
+    if (fs.existsSync(svgAbs)) {
+      const png = rasterizeSvgForMockup(job, svgAbs);
+      if (png) return png;
+    }
+  }
   if (job.file_path) {
     const abs = path.join(UPLOADS, path.basename(job.file_path));
     const ext = path.extname(abs).toLowerCase();
     if (fs.existsSync(abs) && (ext === ".png" || ext === ".jpg" || ext === ".jpeg" || ext === ".webp")) return job.file_path;
-  }
-  if (job.vector_svg) {
-    const svgAbs = path.join(UPLOADS, path.basename(job.vector_svg));
-    if (fs.existsSync(svgAbs)) {
-      const outName = "mockart-" + job.id.slice(0, 12) + ".png";
-      const outAbs = path.join(UPLOADS, outName);
-      try {
-        const { spawnSync } = require("child_process");
-        const r = spawnSync("rsvg-convert", ["-w", "1200", "-h", "1200", "--keep-aspect-ratio", "-f", "png", "-o", outAbs, svgAbs], { encoding: "utf8" });
-        if (r.status === 0 && fs.existsSync(outAbs)) {
-          job.vector_png = "/uploads/" + outName;
-          return job.vector_png;
-        }
-      } catch (e) { /* fall through */ }
-    }
   }
   return job.file_path || null;
 }
@@ -1339,7 +1347,9 @@ async function handleApi(req, res, url) {
     }
     applyMockup(job);
     if (STATUSES.indexOf(job.status) < STATUSES.indexOf("mockup")) job.status = "mockup";
-    event(db, job, job.blank_id ? ("Applied to blank · " + (job.blank_label || job.blank_id)) : "Mockup regenerated"); save(db);
+    event(db, job, job.blank_id
+      ? ("Applied to blank · " + (job.blank_label || job.blank_id) + (job._mockup_art_missing ? " · art missing (upload/vector not loaded)" : ""))
+      : "Mockup regenerated"); save(db);
     return json(res, 200, { job: presentJob(job, req) });
   }
   const pr = pth.match(/^\/api\/jobs\/([^/]+)\/price$/);
