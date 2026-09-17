@@ -37,6 +37,7 @@ const PLACES = [
   { id: "left_chest", label: "Left chest" },
   { id: "full", label: "Full front" },
   { id: "back", label: "Back (front photo for now)" },
+  { id: "youth", label: "Youth chest" },
 ];
 
 async function api(url, opts = {}) {
