@@ -674,7 +674,7 @@ async function fillArt(el, job, shopControls) {
           <button class="btn ghost" id="greyBtn" type="button">Hi-res greyscale</button>
           <button class="btn ghost" id="invertBtn" type="button">Invert black &amp; white</button>
         </div>
-        <p class="muted">Turn your mark into smooth production paths — SVG and EPS ready for Corel and Illustrator.</p>
+        <p class="muted">Best on clean Canva / shop logos (smooth SVG/EPS for Corel). Soft junk JPEGs and busy posters improve, but are not Vectorizer.AI-class yet.</p>
         <div class="vz-options" id="vzOptions">
           ${continuousSliderRow("detailRow", "Detail", "How many colors to keep — drag for live preview",
             initDetail, "Simple", "Fine art", detailReadout)}
@@ -855,8 +855,11 @@ async function fillArt(el, job, shopControls) {
     } catch (err) { $("#err").textContent = err.message; }
   };
   $("#ko").onclick = async () => {
-    try { await api("/api/jobs/" + job.id + "/artops", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ knockout: "white" }) }); renderJob(job.id); }
-    catch (err) { $("#err").textContent = err.message; }
+    try {
+      await ensurePngArtwork(job);
+      await api("/api/jobs/" + job.id + "/artops", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ knockout: "white" }) });
+      renderJob(job.id);
+    } catch (err) { $("#err").textContent = err.message; }
   };
   const grey = $("#greyBtn");
   if (grey) grey.onclick = async () => {

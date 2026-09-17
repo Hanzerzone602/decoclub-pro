@@ -1250,9 +1250,16 @@ async function handleApi(req, res, url) {
     if (!job.file_path) return json(res, 400, { error: "PNG artwork required for knockout / color swap" });
     const abs = path.join(UPLOADS, path.basename(job.file_path));
     if (!fs.existsSync(abs)) return json(res, 404, { error: "Artwork missing" });
-    const srcBuf = fs.readFileSync(abs);
+    let srcBuf = fs.readFileSync(abs);
     if (srcBuf[0] !== 0x89 || srcBuf[1] !== 0x50) {
-      return json(res, 400, { error: "PNG artwork required — convert JPEG/WebP to PNG first" });
+      try {
+        srcBuf = vaiTrace.decodeRasterToPng(srcBuf);
+        const converted = Date.now() + "-" + uid() + ".png";
+        fs.writeFileSync(path.join(UPLOADS, converted), srcBuf);
+        job.file_path = "/uploads/" + converted;
+      } catch (convErr) {
+        return json(res, 400, { error: "Could not convert JPEG/WebP to PNG — export a PNG and drop that" });
+      }
     }
     try {
       const out = processArtwork(srcBuf, body);
