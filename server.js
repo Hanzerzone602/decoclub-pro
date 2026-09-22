@@ -126,6 +126,429 @@ function ensureAdmin(db) {
   return dirty;
 }
 
+
+function canRunFloor(user) {
+  return !!(user && (user.role === "shop" || (user.role === "admin" && user.shop_id)));
+}
+
+function isComped(user) { return !!(user && user.role === "admin"); }
+
+function isPaidMember(user) {
+  if (!user) return false;
+  if (user.plan !== "shop" && user.plan !== "studio") return false;
+  if (!user.plan_expires) return true;
+  return Date.parse(user.plan_expires) > Date.now();
+}
+
+function isActiveTrial(user) {
+  if (!user || user.plan !== "trial") return false;
+  if (!user.plan_expires) return true;
+  return Date.parse(user.plan_expires) > Date.now();
+}
+
+function canProduce(user) { return isComped(user) || isPaidMember(user) || isActiveTrial(user); }
+
+function canProducePackets(user) { return isComped(user) || isPaidMember(user); }
+
+function requireProduce(user, res) {
+  if (canProduce(user)) return true;
+  json(res, 402, { error: "Membership or active trial required. Start free for 7 days, or use Shop / Studio." });
+  return false;
+}
+
+function requirePaidProduce(user, res) {
+  if (canProducePackets(user)) return true;
+  if (isActiveTrial(user)) {
+    json(res, 402, { error: "Stitch packets (DST/EXP) and stone maps need a Shop or Studio plan. Vectorize and SVG/EPS stay free on trial." });
+    return false;
+  }
+  json(res, 402, { error: "Membership required to finish production. Admin is complimentary. Shop and Studio plans unlock proofs and packets." });
+  return false;
+}
+
+function truthy(v) { return v === true || v === 1 || v === "1" || v === "true" || v === "on"; }
+
+function applyUploadMatte(publicPath, fields) {
+  if (!publicPath || !truthy(fields && (fields.remove_bg || fields.remove_background))) return publicPath;
+  const abs = path.join(UPLOADS, path.basename(publicPath));
+  if (!fs.existsSync(abs)) return publicPath;
+  const buf = fs.readFileSync(abs);
+  if (buf[0] !== 0x89 || buf[1] !== 0x50) return publicPath;
+  try {
+    const out = removeBackground(buf);
+    const name = Date.now() + "-" + uid() + ".png";
+    fs.writeFileSync(path.join(UPLOADS, name), out);
+    return "/uploads/" + name;
+  } catch (e) { return publicPath; }
+}
+
+function saveImaginePng(buf) {
+  const name = Date.now() + "-" + uid() + ".png";
+  fs.writeFileSync(path.join(UPLOADS, name), buf);
+  return "/uploads/" + name;
+}
+
+function applyCorelImportResult(job, result) {
+  const svgName = Date.now() + "-" + uid() + "-corel.svg";
+  fs.writeFileSync(path.join(UPLOADS, svgName), result.svg);
+  job.vector_svg = "/uploads/" + svgName;
+  delete job.vector_eps;
+  job.vector = result.vec;
+  return result;
+}
+
+function runCorelImportOnJob(job, buf, body) {
+  body = body || {};
+  const sizeIn = Number(body.sizeIn) || Number(job.width_in) || 10;
+  const opts = {
+    sizeIn: sizeIn,
+    pad: body.pad != null ? Number(body.pad) : 40,
+    paperUnderlay: body.paperUnderlay !== false,
+  };
+  if (body.bbox && body.bbox.minx != null) opts.bbox = body.bbox;
+  const result = corelImport.transfer(buf, opts);
+  // Keep job plate size square when Corel-import remaps to square studio art
+  job.width_in = sizeIn;
+  job.height_in = sizeIn;
+  applyCorelImportResult(job, result);
+  return result;
+}
+
+function tryAutoCorelImport(job, filePath, originalName) {
+  if (!job || !filePath) return false;
+  const abs = path.join(UPLOADS, path.basename(filePath));
+  if (!fs.existsSync(abs)) return false;
+  const buf = fs.readFileSync(abs);
+  if (!corelImport.looksLikeSvg(buf)) return false;
+  const text = buf.toString("utf8");
+  const nameHint = String(originalName || filePath || "").toLowerCase();
+  if (!corelImport.isCorelSvg(text) && !/\.svg$/i.test(nameHint)) return false;
+  if (!corelImport.isCorelSvg(text)) return false;
+  runCorelImportOnJob(job, buf, {});
+  return true;
+}
+
+function applyVectorResult(job, vec, svg) {
+  if (!job || !vec) return;
+  job.vector = vec;
+  if (job._pendingVzSettings) {
+    job.vector.meta = Object.assign({}, job.vector.meta || {}, { settings: job._pendingVzSettings });
+  }
+  const name = Date.now() + "-" + uid() + "-vector.svg";
+  fs.writeFileSync(path.join(UPLOADS, name), svg);
+  job.vector_svg = "/uploads/" + name;
+  delete job.vector_eps;
+}
+
+function stampVzSettings(job, body) {
+  if (!job || !body || !body._vzSettings) return;
+  job._pendingVzSettings = body._vzSettings;
+  if (job.vector) {
+    job.vector.meta = Object.assign({}, job.vector.meta || {}, { settings: body._vzSettings });
+  }
+}
+
+function applyVtracerResult(job, result) {
+  const svgName = Date.now() + "-" + uid() + "-vtracer.svg";
+  fs.writeFileSync(path.join(UPLOADS, svgName), result.svg);
+  job.vector_svg = "/uploads/" + svgName;
+  if (result.eps && result.eps.length) {
+    const epsName = Date.now() + "-" + uid() + "-vtracer.eps";
+    fs.writeFileSync(path.join(UPLOADS, epsName), result.eps);
+    job.vector_eps = "/uploads/" + epsName;
+  } else {
+    delete job.vector_eps;
+  }
+  job.vector = result.vec;
+  if (job._pendingVzSettings && job.vector) {
+    job.vector.meta = Object.assign({}, job.vector.meta || {}, { settings: job._pendingVzSettings });
+  }
+}
+
+function runVtracerVectorize(job, buf, body) {
+  if (!vtracer.available()) {
+    const err = new Error("VTracer binary missing on host");
+    err.code = "NO_VTRACER";
+    throw err;
+  }
+  const norm = body && body._vzSettings ? body : normalizeVectorizeBody(body || {});
+  const result = vtracer.vectorizeBuffer(buf, {
+    widthIn: job.width_in,
+    heightIn: job.height_in,
+    colors: norm.colors,
+    cornerThreshold: norm.cornerThreshold,
+    filterSpeckle: norm.filterSpeckle,
+    segmentLength: norm.segmentLength,
+    timeoutMs: 120000,
+  });
+  applyVtracerResult(job, result);
+  if (job.vector) {
+    job.vector.meta = Object.assign({}, job.vector.meta || {}, { settings: norm._vzSettings });
+  }
+  return result;
+}
+
+function vectorizeInWorker(buf, widthIn, heightIn, opts, timeoutMs, engine) {
+  return new Promise(function (resolve, reject) {
+    const worker = new Worker(path.resolve(__dirname, "lib", "vectorize-worker.js"), {
+      workerData: {
+        bufB64: Buffer.from(buf).toString("base64"),
+        widthIn: widthIn,
+        heightIn: heightIn,
+        opts: opts || {},
+        engine: engine || "bezier",
+      },
+    });
+    let done = false;
+    const timer = setTimeout(function () {
+      if (done) return;
+      done = true;
+      try { worker.terminate(); } catch (e) {}
+      reject(new Error("Vectorize timed out"));
+    }, timeoutMs || 90000);
+    worker.on("message", function (msg) {
+      if (done) return;
+      done = true;
+      clearTimeout(timer);
+      try { worker.terminate(); } catch (e) {}
+      if (msg && msg.ok) resolve(msg);
+      else reject(new Error((msg && msg.error) || "Vectorize failed"));
+    });
+    worker.on("error", function (err) {
+      if (done) return;
+      done = true;
+      clearTimeout(timer);
+      reject(err);
+    });
+  });
+}
+
+function normalizeVectorizeBody(body) {
+  body = body || {};
+  const DETAIL = {
+    low: 4, simple: 4,
+    medium: 8, balanced: 8,
+    high: 12, fine: 12,
+  };
+  const SMOOTH = {
+    low: { epsilon: 0.55, filterSpeckle: 2, segmentLength: 3.2 },
+    medium: { epsilon: 0.95, filterSpeckle: 4, segmentLength: 4 },
+    high: { epsilon: 1.4, filterSpeckle: 8, segmentLength: 5.5 },
+  };
+  const CORNER = {
+    sharp: { fitError: 0.55, cornerCos: -0.55, cornerThreshold: 40 },
+    balanced: { fitError: 1.1, cornerCos: -0.28, cornerThreshold: 60 },
+    smooth: { fitError: 1.85, cornerCos: 0.15, cornerThreshold: 90 },
+  };
+  function clamp(n, lo, hi, fallback) {
+    const v = Number(n);
+    if (!Number.isFinite(v)) return fallback;
+    return Math.max(lo, Math.min(hi, v));
+  }
+  function lerp(a, b, t) { return a + (b - a) * t; }
+  function isPctLike(v) {
+    if (v == null || v === "") return false;
+    const s = String(v).toLowerCase();
+    if (DETAIL[s] || SMOOTH[s] || CORNER[s]) return false;
+    return Number.isFinite(Number(v));
+  }
+  function pctFromColors(c) {
+    return Math.round(clamp(((Number(c) - 3) / 21) * 100, 0, 100, 50));
+  }
+
+  let detailPct = null;
+  const detailRaw = body.detail != null ? body.detail : body.detailLevel;
+  if (isPctLike(detailRaw)) {
+    detailPct = clamp(detailRaw, 0, 100, 50);
+  } else {
+    let detailKey = String(detailRaw || "").toLowerCase();
+    if (!detailKey && body.colors != null) {
+      const c = Number(body.colors);
+      detailKey = c <= 5 ? "low" : (c >= 11 ? "high" : "medium");
+    }
+    if (!DETAIL[detailKey]) detailKey = "medium";
+    detailPct = detailKey === "simple" || detailKey === "low" ? 15
+      : (detailKey === "fine" || detailKey === "high" ? 85 : 50);
+  }
+
+  let colors;
+  if (body.colors != null && Number.isFinite(Number(body.colors))) {
+    colors = clamp(body.colors, 2, 24, 8);
+    if (!isPctLike(detailRaw)) detailPct = pctFromColors(colors);
+  } else {
+    colors = clamp(Math.round(lerp(3, 24, detailPct / 100)), 2, 24, 8);
+  }
+
+  let smoothPct = null;
+  const smoothRaw = body.smoothing != null ? body.smoothing : body.smooth;
+  if (isPctLike(smoothRaw)) {
+    smoothPct = clamp(smoothRaw, 0, 100, 50);
+  } else {
+    let smoothKey = String(smoothRaw || "").toLowerCase();
+    if (!SMOOTH[smoothKey]) smoothKey = "medium";
+    smoothPct = smoothKey === "low" ? 15 : (smoothKey === "high" ? 85 : 50);
+  }
+  const smoothT = smoothPct / 100;
+  const smoothDefaults = {
+    epsilon: lerp(0.4, 1.6, smoothT),
+    filterSpeckle: Math.round(lerp(2, 10, smoothT)),
+    segmentLength: lerp(3.0, 6.0, smoothT),
+  };
+
+  let cornerPct = null;
+  const cornerRaw = body.cornerSmooth != null ? body.cornerSmooth : (body.corners != null ? body.corners : body.corner);
+  if (isPctLike(cornerRaw)) {
+    cornerPct = clamp(cornerRaw, 0, 100, 50);
+  } else {
+    let cornerKey = String(cornerRaw || "").toLowerCase();
+    if (!CORNER[cornerKey]) cornerKey = "balanced";
+    cornerPct = cornerKey === "sharp" ? 10 : (cornerKey === "smooth" ? 90 : 50);
+  }
+  const cornerT = cornerPct / 100;
+  const cornerDefaults = {
+    fitError: lerp(0.4, 2.0, cornerT),
+    cornerCos: lerp(-0.55, 0.15, cornerT),
+    cornerThreshold: Math.round(lerp(40, 90, cornerT)),
+  };
+
+  const epsilon = clamp(body.epsilon != null ? body.epsilon : smoothDefaults.epsilon, 0.2, 3, smoothDefaults.epsilon);
+  const fitError = clamp(body.fitError != null ? body.fitError : cornerDefaults.fitError, 0.2, 4, cornerDefaults.fitError);
+  const cornerCos = clamp(body.cornerCos != null ? body.cornerCos : cornerDefaults.cornerCos, -1, 1, cornerDefaults.cornerCos);
+  const cornerThreshold = clamp(body.cornerThreshold != null ? body.cornerThreshold : cornerDefaults.cornerThreshold, 20, 120, cornerDefaults.cornerThreshold);
+  const filterSpeckle = clamp(body.filterSpeckle != null ? body.filterSpeckle : smoothDefaults.filterSpeckle, 0, 16, smoothDefaults.filterSpeckle);
+  const segmentLength = clamp(body.segmentLength != null ? body.segmentLength : smoothDefaults.segmentLength, 1, 12, smoothDefaults.segmentLength);
+
+  const settings = {
+    detail: Math.round(detailPct),
+    smoothing: Math.round(smoothPct),
+    cornerSmooth: Math.round(cornerPct),
+    colors: colors,
+    epsilon: epsilon,
+    fitError: fitError,
+    cornerCos: cornerCos,
+  };
+
+  return Object.assign({}, body, {
+    colors: colors,
+    epsilon: epsilon,
+    fitError: fitError,
+    cornerCos: cornerCos,
+    cornerThreshold: cornerThreshold,
+    filterSpeckle: filterSpeckle,
+    segmentLength: segmentLength,
+    detail: settings.detail,
+    smoothing: settings.smoothing,
+    cornerSmooth: settings.cornerSmooth,
+    live: body.live === true || body.live === "true" || body.live === 1,
+    _vzSettings: settings,
+  });
+}
+
+function scheduleVectorize(jobId) {
+  /* Upload stays snappy: do NOT auto-vectorize. User clicks Vectorize. */
+  return;
+}
+
+function clearJobVector(job) {
+  if (!job) return;
+  delete job.vector;
+  delete job.vector_svg;
+  delete job.vector_eps;
+}
+
+function jobHasUsableVector(job) {
+  if (!job) return false;
+  if (job.vector_svg) return true;
+  return !!(job.vector && Array.isArray(job.vector.layers) && job.vector.layers.length);
+}
+
+function invertHexColor(hex) {
+  const rgb = colorspec.parseHex(hex);
+  if (!rgb) return hex;
+  return colorspec.rgbToHex(255 - rgb[0], 255 - rgb[1], 255 - rgb[2]);
+}
+
+function invertPaintColorToken(color) {
+  const c = String(color || "").trim();
+  if (/^#([0-9a-fA-F]{6})$/.test(c)) return invertHexColor(c);
+  if (/^#([0-9a-fA-F]{3})$/.test(c)) {
+    const h = c.slice(1);
+    return invertHexColor("#" + h[0] + h[0] + h[1] + h[1] + h[2] + h[2]);
+  }
+  const rgb = c.match(/^rgb\(\s*(\d+)\s*,\s*(\d+)\s*,\s*(\d+)\s*\)$/i);
+  if (rgb) return "rgb(" + (255 - Number(rgb[1])) + "," + (255 - Number(rgb[2])) + "," + (255 - Number(rgb[3])) + ")";
+  return c;
+}
+
+function invertSvgMarkup(svg) {
+  return String(svg || "").replace(
+    /((?:fill|stroke|stop-color|flood-color|lighting-color|color)\s*[:=]\s*["']?)(#(?:[0-9a-fA-F]{6}|[0-9a-fA-F]{3})|rgb\(\s*\d+\s*,\s*\d+\s*,\s*\d+\s*\))/gi,
+    function (m, prefix, color) {
+      return prefix + invertPaintColorToken(color);
+    }
+  );
+}
+
+function invertJobVector(job) {
+  if (!job) return;
+  if (job.vector_svg) {
+    const abs = path.join(UPLOADS, path.basename(job.vector_svg));
+    if (fs.existsSync(abs)) {
+      const svg = invertSvgMarkup(fs.readFileSync(abs, "utf8"));
+      const name = Date.now() + "-" + uid() + "-vector.svg";
+      fs.writeFileSync(path.join(UPLOADS, name), svg);
+      job.vector_svg = "/uploads/" + name;
+      delete job.vector_eps;
+    }
+  }
+  if (job.vector && Array.isArray(job.vector.layers)) {
+    job.vector.layers = job.vector.layers.map(function (L) {
+      return colorspec.annotateLayer(Object.assign({}, L, { hex: invertHexColor(L.hex || "#000000") }));
+    });
+    if (!job.vector_svg && vectorHasRealPaths(job.vector)) {
+      rewriteVectorSvg(job);
+    }
+  }
+}
+
+function rewriteVectorSvg(job) {
+  if (!job || !job.vector || !job.vector.layers) return;
+  // Prefer keeping on-disk vector_svg when layers lack real path `d` (vai-trace / invent-warp).
+  // Never rebuild via svgFromLayers([]) ΓÇö that emits empty d="" and nukes geometry.
+  if (job.vector_svg && !vectorHasRealPaths(job.vector)) {
+    const abs = path.join(UPLOADS, path.basename(job.vector_svg));
+    if (fs.existsSync(abs)) {
+      const svg = fs.readFileSync(abs, "utf8");
+      const name = Date.now() + "-" + uid() + "-vector.svg";
+      fs.writeFileSync(path.join(UPLOADS, name), svg);
+      job.vector_svg = "/uploads/" + name;
+      return;
+    }
+  }
+  if (vectorHasRealPaths(job.vector)) {
+    const svg = svgFromLayers(job.vector.layers, job.vector.widthIn || job.width_in, job.vector.heightIn || job.height_in);
+    const name = Date.now() + "-" + uid() + "-vector.svg";
+    fs.writeFileSync(path.join(UPLOADS, name), svg);
+    job.vector_svg = "/uploads/" + name;
+    delete job.vector_eps;
+    return;
+  }
+  // File missing and no path data ΓÇö last resort (may be empty)
+  const svg = svgFromLayers(job.vector.layers, job.vector.widthIn || job.width_in, job.vector.heightIn || job.height_in);
+  const name = Date.now() + "-" + uid() + "-vector.svg";
+  fs.writeFileSync(path.join(UPLOADS, name), svg);
+  job.vector_svg = "/uploads/" + name;
+  delete job.vector_eps;
+}
+
+function requireAdmin(user, res) {
+  if (!user || user.role !== "admin") {
+    json(res, 403, { error: "Admin required" });
+    return false;
+  }
+  return true;
+}
+
 function seedDemoArt() {
   const pth = path.join(UPLOADS, "demo-badge.png");
   if (!fs.existsSync(pth)) fs.writeFileSync(pth, generateBadgePng());
