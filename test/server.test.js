@@ -83,10 +83,17 @@ function stop(child) {
     assert.ok(appJs.text.indexOf("Drop art. Vectorize. Recolor. Export.") !== -1);
     assert.ok(appJs.text.indexOf("or tap to pick a file") !== -1);
     assert.ok(appJs.text.indexOf("Remove background") !== -1);
-    assert.ok(appJs.text.indexOf("Grok Imagine") !== -1);
+    assert.ok(appJs.text.indexOf("AI Generate") !== -1);
+    assert.ok(appJs.text.indexOf("Grok Imagine") === -1);
+    assert.ok(appJs.text.indexOf("crossOrigin") === -1);
     assert.ok(appJs.text.indexOf("Vectorize") !== -1);
     assert.ok(appJs.text.indexOf("DST") !== -1);
     assert.ok(appJs.text.indexOf("No DST") === -1);
+    assert.ok(appJs.text.indexOf("fillDigitize") !== -1);
+    assert.ok(appJs.text.indexOf("Digitize") !== -1);
+    const previewJs = await req(port, "GET", "/digitize-preview.js");
+    assert.strictEqual(previewJs.status, 200);
+    assert.ok(previewJs.text.indexOf("DigitizePreview") !== -1);
     assert.ok(appJs.text.indexOf('credentials: "include"') !== -1);
     const cfg = await req(port, "GET", "/api/config");
     assert.strictEqual(cfg.json.demo, false);
@@ -131,7 +138,14 @@ function stop(child) {
     assert.ok(job.json.job.proof_token.length >= 64);
     assert.ok(job.json.job.proof_url.indexOf("/proof.html?t=") !== -1);
     const pack = await req(port, "GET", "/api/export/" + job.json.job.id + "/cut-contour.svg", { headers: { Cookie: cookie } });
-    assert.strictEqual(pack.status, 402);
+    assert.strictEqual(pack.status, 200, "trial keeps SVG/EPS/cut files");
+    const dstTrial = await req(port, "GET", "/api/export/" + job.json.job.id + "/design.dst", { headers: { Cookie: cookie } });
+    assert.strictEqual(dstTrial.status, 402, "trial DST fence");
+    const digTrial = await req(port, "POST", "/api/jobs/" + job.json.job.id + "/digitize", {
+      headers: { "Content-Type": "application/json", Cookie: cookie },
+      body: JSON.stringify({ density: 0.4 }),
+    });
+    assert.strictEqual(digTrial.status, 402, "trial digitize/DST fence");
     const loginHtml = await req(port, "GET", "/login.html");
     assert.ok(loginHtml.text.indexOf("Remember me") !== -1);
     assert.ok(loginHtml.text.indexOf("remember_me") !== -1);
@@ -152,7 +166,7 @@ function stop(child) {
     const adminPw = Buffer.from("4463502d755f75524e6f4e6c6a5a483350453163", "hex").toString("utf8");
     const adminLogin = await req(port, "POST", "/api/login", {
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ email: "david@coreltrainer.com", password: adminPw, remember_me: true }),
+      body: JSON.stringify({ email: "Davidhanes2@yahoo.com", password: adminPw, remember_me: true }),
     });
     assert.strictEqual(adminLogin.status, 200);
     assert.strictEqual(adminLogin.json.user.entitled, true);
@@ -230,7 +244,7 @@ function stop(child) {
     const adminPw = Buffer.from("4463502d755f75524e6f4e6c6a5a483350453163", "hex").toString("utf8");
     const adminLogin = await req(port3, "POST", "/api/login", {
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ email: "david@coreltrainer.com", password: adminPw }),
+      body: JSON.stringify({ email: "Davidhanes2@yahoo.com", password: adminPw }),
     });
     assert.strictEqual(adminLogin.status, 200);
     assert.strictEqual(adminLogin.json.user.role, "admin");
@@ -307,7 +321,7 @@ function stop(child) {
   const hash = salt + ":" + crypto.scryptSync(adminPwLegacy, salt, 32).toString("hex");
   fs.writeFileSync(path.join(dirLegacy, "store.json"), JSON.stringify({
     shops: [], users: [{
-      id: "admin-legacy", email: "david@coreltrainer.com", name: "David Hanes",
+      id: "admin-legacy", email: "Davidhanes2@yahoo.com", name: "David Hanes",
       password_hash: hash, role: "admin", shop_id: null, plan: "studio", plan_expires: null,
       created_at: new Date().toISOString(),
     }], sessions: [], jobs: [], events: [],
@@ -325,7 +339,7 @@ function stop(child) {
     assert.strictEqual(attached.shops[0].name, "My shop");
     const lg = await req(portLegacy, "POST", "/api/login", {
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ email: "david@coreltrainer.com", password: adminPwLegacy }),
+      body: JSON.stringify({ email: "Davidhanes2@yahoo.com", password: adminPwLegacy }),
     });
     assert.strictEqual(lg.status, 200);
     const ck = String(lg.headers["set-cookie"] || "").split(";")[0];

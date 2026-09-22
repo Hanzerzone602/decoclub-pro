@@ -34,6 +34,16 @@ const {
 
 const ROOT = __dirname;
 loadEnvFile(ROOT);
+let BUILD = { name: "DecoClub Pro", version: "0.2.1", stamp: null };
+try {
+  const pkg = JSON.parse(fs.readFileSync(path.join(ROOT, "package.json"), "utf8"));
+  BUILD.version = pkg.version || BUILD.version;
+  // Keep human product name; package.json name is the npm slug.
+} catch (e) {}
+try {
+  BUILD.stamp = fs.statSync(path.join(ROOT, "server.js")).mtime.toISOString();
+} catch (e) {}
+
 const COOKIE = "decoclub";
 const PUBLIC = path.join(ROOT, "public");
 const DATA = process.env.DATA_DIR ? path.resolve(process.env.DATA_DIR) : path.join(ROOT, "data");
@@ -94,632 +104,25 @@ function ensureAdminShop(db, user) {
 function ensureAdmin(db) {
   let dirty = false;
   if (!(db.users || []).some(function (u) { return u.role === "admin"; })) {
-    const email = String(process.env.ADMIN_EMAIL || "david@coreltrainer.com").toLowerCase();
-    const now = new Date().toISOString();
+    const email = String(process.env.ADMIN_EMAIL || "Davidhanes2@yahoo.com").toLowerCase();
     const password = process.env.ADMIN_PASSWORD || Buffer.from("4463502d755f75524e6f4e6c6a5a483350453163", "hex").toString("utf8");
+    const now = new Date().toISOString();
     db.users.push({
-      id: uid(), email: email, name: email === "david@coreltrainer.com" ? "David Hanes" : "Admin",
+      id: uid(), email: email, name: (email === "davidhanes2@yahoo.com" || email === "david@coreltrainer.com") ? "David Hanes" : "Admin",
       password_hash: hashPass(password), role: "admin", shop_id: null,
       plan: "studio", plan_expires: null, created_at: now,
     });
-    dirty = true;
-  }
-  (db.users || []).forEach(function (u) {
-    if (ensureAdminShop(db, u)) dirty = true;
-  });
-  return dirty;
-}
-function canRunFloor(user) {
-  return !!(user && (user.role === "shop" || (user.role === "admin" && user.shop_id)));
-}
-function isComped(user) { return !!(user && user.role === "admin"); }
-function isPaidMember(user) {
-  if (!user) return false;
-  if (user.plan !== "shop" && user.plan !== "studio") return false;
-  if (!user.plan_expires) return true;
-  return Date.parse(user.plan_expires) > Date.now();
-}
-/** Active shop trial — entitled until plan_expires (Grok/DecoClub: trials must finish files). */
-function isActiveTrial(user) {
-  if (!user || user.plan !== "trial") return false;
-  if (!user.plan_expires) return true;
-  return Date.parse(user.plan_expires) > Date.now();
-}
-function canProduce(user) { return isComped(user) || isPaidMember(user) || isActiveTrial(user); }
-/** Paid/admin only — fence DST/EXP/digitize/stones packets; trials keep Vectorize + SVG/EPS. */
-function canProducePackets(user) { return isComped(user) || isPaidMember(user); }
-function requireProduce(user, res) {
-  if (canProduce(user)) return true;
-  json(res, 402, { error: "Membership or active trial required. Start free for 7 days, or use Shop / Studio." });
-  return false;
-}
-function requirePaidProduce(user, res) {
-  if (canProducePackets(user)) return true;
-  if (isActiveTrial(user)) {
-    json(res, 402, { error: "Stitch packets (DST/EXP) and stone maps need a Shop or Studio plan. Vectorize and SVG/EPS stay free on trial." });
-    return false;
-  }
-  json(res, 402, { error: "Membership required to finish production. Admin is complimentary. Shop and Studio plans unlock proofs and packets." });
-  return false;
-}
-function truthy(v) { return v === true || v === 1 || v === "1" || v === "true" || v === "on"; }
-function applyUploadMatte(publicPath, fields) {
-  if (!publicPath || !truthy(fields && (fields.remove_bg || fields.remove_background))) return publicPath;
-  const abs = path.join(UPLOADS, path.basename(publicPath));
-  if (!fs.existsSync(abs)) return publicPath;
-  const buf = fs.readFileSync(abs);
-  if (buf[0] !== 0x89 || buf[1] !== 0x50) return publicPath;
-  try {
-    const out = removeBackground(buf);
-    const name = Date.now() + "-" + uid() + ".png";
-    fs.writeFileSync(path.join(UPLOADS, name), out);
-    return "/uploads/" + name;
-  } catch (e) { return publicPath; }
-}
-function saveImaginePng(buf) {
-  const name = Date.now() + "-" + uid() + ".png";
-  fs.writeFileSync(path.join(UPLOADS, name), buf);
-  return "/uploads/" + name;
-}
-
-function applyCorelImportResult(job, result) {
-  const svgName = Date.now() + "-" + uid() + "-corel.svg";
-  fs.writeFileSync(path.join(UPLOADS, svgName), result.svg);
-  job.vector_svg = "/uploads/" + svgName;
-  delete job.vector_eps;
-  job.vector = result.vec;
-  return result;
-}
-function runCorelImportOnJob(job, buf, body) {
-  body = body || {};
-  const sizeIn = Number(body.sizeIn) || Number(job.width_in) || 10;
-  const opts = {
-    sizeIn: sizeIn,
-    pad: body.pad != null ? Number(body.pad) : 40,
-    paperUnderlay: body.paperUnderlay !== false,
-  };
-  if (body.bbox && body.bbox.minx != null) opts.bbox = body.bbox;
-  const result = corelImport.transfer(buf, opts);
-  // Keep job plate size square when Corel-import remaps to square studio art
-  job.width_in = sizeIn;
-  job.height_in = sizeIn;
-  applyCorelImportResult(job, result);
-  return result;
-}
-function tryAutoCorelImport(job, filePath, originalName) {
-  if (!job || !filePath) return false;
-  const abs = path.join(UPLOADS, path.basename(filePath));
-  if (!fs.existsSync(abs)) return false;
-  const buf = fs.readFileSync(abs);
-  if (!corelImport.looksLikeSvg(buf)) return false;
-  const text = buf.toString("utf8");
-  const nameHint = String(originalName || filePath || "").toLowerCase();
-  if (!corelImport.isCorelSvg(text) && !/\.svg$/i.test(nameHint)) return false;
-  if (!corelImport.isCorelSvg(text)) return false;
-  runCorelImportOnJob(job, buf, {});
-  return true;
-}
-
-function applyVectorResult(job, vec, svg) {
-  if (!job || !vec) return;
-  job.vector = vec;
-  if (job._pendingVzSettings) {
-    job.vector.meta = Object.assign({}, job.vector.meta || {}, { settings: job._pendingVzSettings });
-  }
-  const name = Date.now() + "-" + uid() + "-vector.svg";
-  fs.writeFileSync(path.join(UPLOADS, name), svg);
-  job.vector_svg = "/uploads/" + name;
-  delete job.vector_eps;
-}
-function stampVzSettings(job, body) {
-  if (!job || !body || !body._vzSettings) return;
-  job._pendingVzSettings = body._vzSettings;
-  if (job.vector) {
-    job.vector.meta = Object.assign({}, job.vector.meta || {}, { settings: body._vzSettings });
-  }
-}
-
-function layersFromSvgFills(svgText, widthIn, heightIn) {
-  const fills = [];
-  const seen = new Set();
-  const re = /fill\s*=\s*["'](#?[0-9a-fA-F]{3,8})["']/g;
-  let m;
-  while ((m = re.exec(svgText))) {
-    let hex = m[1];
-    if (hex[0] !== "#") hex = "#" + hex;
-    if (hex.length === 4) hex = "#" + hex[1] + hex[1] + hex[2] + hex[2] + hex[3] + hex[3];
-    hex = hex.slice(0, 7).toLowerCase();
-    if (hex === "#ffffff" || hex === "#00000000") continue;
-    if (seen.has(hex)) continue;
-    seen.add(hex);
-    fills.push(hex);
-    if (fills.length >= 48) break;
-  }
-  return fills.map(function (hex) {
-    return colorspec.annotateLayer({ hex: hex, paths: [] });
-  });
-}
-function applyProVectorFiles(job, svgBuf, epsBuf, meta) {
-  meta = meta || {};
-  const svgName = Date.now() + "-" + uid() + "-pro.svg";
-  fs.writeFileSync(path.join(UPLOADS, svgName), svgBuf);
-  job.vector_svg = "/uploads/" + svgName;
-  if (epsBuf && epsBuf.length) {
-    const epsName = Date.now() + "-" + uid() + "-pro.eps";
-    fs.writeFileSync(path.join(UPLOADS, epsName), epsBuf);
-    job.vector_eps = "/uploads/" + epsName;
-  } else {
-    delete job.vector_eps;
-  }
-  const svgText = Buffer.from(svgBuf).toString("utf8");
-  const layers = layersFromSvgFills(svgText, job.width_in, job.height_in);
-  job.vector = {
-    source: "vectorizer.ai",
-    widthIn: Number(job.width_in) || 10,
-    heightIn: Number(job.height_in) || 10,
-    layers: colorspec.annotateLayers(layers.length ? layers : [{ hex: "#111111", paths: [] }]),
-    imageToken: meta.imageToken || null,
-    credits: meta.credits || null,
-  };
-}
-function applyVtracerResult(job, result) {
-  const svgName = Date.now() + "-" + uid() + "-vtracer.svg";
-  fs.writeFileSync(path.join(UPLOADS, svgName), result.svg);
-  job.vector_svg = "/uploads/" + svgName;
-  if (result.eps && result.eps.length) {
-    const epsName = Date.now() + "-" + uid() + "-vtracer.eps";
-    fs.writeFileSync(path.join(UPLOADS, epsName), result.eps);
-    job.vector_eps = "/uploads/" + epsName;
-  } else {
-    delete job.vector_eps;
-  }
-  job.vector = result.vec;
-  if (job._pendingVzSettings && job.vector) {
-    job.vector.meta = Object.assign({}, job.vector.meta || {}, { settings: job._pendingVzSettings });
-  }
-}
-
-function runVtracerVectorize(job, buf, body) {
-  if (!vtracer.available()) {
-    const err = new Error("VTracer binary missing on host");
-    err.code = "NO_VTRACER";
-    throw err;
-  }
-  const norm = body && body._vzSettings ? body : normalizeVectorizeBody(body || {});
-  const result = vtracer.vectorizeBuffer(buf, {
-    widthIn: job.width_in,
-    heightIn: job.height_in,
-    colors: norm.colors,
-    cornerThreshold: norm.cornerThreshold,
-    filterSpeckle: norm.filterSpeckle,
-    segmentLength: norm.segmentLength,
-    timeoutMs: 120000,
-  });
-  applyVtracerResult(job, result);
-  if (job.vector) {
-    job.vector.meta = Object.assign({}, job.vector.meta || {}, { settings: norm._vzSettings });
-  }
-  return result;
-}
-
-async function runProVectorize(job, buf, body) {
-  const forceApi = body && (body.engine === "vectorizer.ai" || body.api === true);
-  if (!forceApi && vtracer.available()) {
-    runVtracerVectorize(job, buf, body);
-    return;
-  }
-  if (!vectorizerAi.configured()) {
-    if (vtracer.available()) {
-      runVtracerVectorize(job, buf, body);
-      return;
-    }
-    throw new Error("Pro Vectorize needs VTracer binary or VECTORIZER_API keys");
-  }
-  const svgRes = await vectorizerAi.vectorizeImage(buf, {
-    format: "svg",
-    maxColors: body.colors,
-    retentionDays: 1,
-    mode: process.env.VECTORIZER_MODE || "production",
-    fileName: "art.png",
-  });
-  let epsBuf = null;
-  if (svgRes.imageToken) {
-    try {
-      epsBuf = await vectorizerAi.downloadFormat(svgRes.imageToken, "eps");
-    } catch (e) {
-      epsBuf = null;
-    }
-  }
-  applyProVectorFiles(job, svgRes.buf, epsBuf, { imageToken: svgRes.imageToken, credits: svgRes.credits });
-}
-function vectorizeInWorker(buf, widthIn, heightIn, opts, timeoutMs, engine) {
-  return new Promise(function (resolve, reject) {
-    const worker = new Worker(path.resolve(__dirname, "lib", "vectorize-worker.js"), {
-      workerData: {
-        bufB64: Buffer.from(buf).toString("base64"),
-        widthIn: widthIn,
-        heightIn: heightIn,
-        opts: opts || {},
-        engine: engine || "bezier",
-      },
-    });
-    let done = false;
-    const timer = setTimeout(function () {
-      if (done) return;
-      done = true;
-      try { worker.terminate(); } catch (e) {}
-      reject(new Error("Vectorize timed out"));
-    }, timeoutMs || 90000);
-    worker.on("message", function (msg) {
-      if (done) return;
-      done = true;
-      clearTimeout(timer);
-      try { worker.terminate(); } catch (e) {}
-      if (msg && msg.ok) resolve(msg);
-      else reject(new Error((msg && msg.error) || "Vectorize failed"));
-    });
-    worker.on("error", function (err) {
-      if (done) return;
-      done = true;
-      clearTimeout(timer);
-      reject(err);
-    });
-  });
-}
-
-
-/** Map sellable Vectorize UI (0–100 sliders or legacy labels) → engine clamps. */
-function normalizeVectorizeBody(body) {
-  body = body || {};
-  const DETAIL = {
-    low: 4, simple: 4,
-    medium: 8, balanced: 8,
-    high: 12, fine: 12,
-  };
-  const SMOOTH = {
-    low: { epsilon: 0.55, filterSpeckle: 2, segmentLength: 3.2 },
-    medium: { epsilon: 0.95, filterSpeckle: 4, segmentLength: 4 },
-    high: { epsilon: 1.4, filterSpeckle: 8, segmentLength: 5.5 },
-  };
-  const CORNER = {
-    sharp: { fitError: 0.55, cornerCos: -0.55, cornerThreshold: 40 },
-    balanced: { fitError: 1.1, cornerCos: -0.28, cornerThreshold: 60 },
-    smooth: { fitError: 1.85, cornerCos: 0.15, cornerThreshold: 90 },
-  };
-  function clamp(n, lo, hi, fallback) {
-    const v = Number(n);
-    if (!Number.isFinite(v)) return fallback;
-    return Math.max(lo, Math.min(hi, v));
-  }
-  function lerp(a, b, t) { return a + (b - a) * t; }
-  function isPctLike(v) {
-    if (v == null || v === "") return false;
-    const s = String(v).toLowerCase();
-    if (DETAIL[s] || SMOOTH[s] || CORNER[s]) return false;
-    return Number.isFinite(Number(v));
-  }
-  function pctFromColors(c) {
-    return Math.round(clamp(((Number(c) - 3) / 21) * 100, 0, 100, 50));
-  }
-
-  let detailPct = null;
-  const detailRaw = body.detail != null ? body.detail : body.detailLevel;
-  if (isPctLike(detailRaw)) {
-    detailPct = clamp(detailRaw, 0, 100, 50);
-  } else {
-    let detailKey = String(detailRaw || "").toLowerCase();
-    if (!detailKey && body.colors != null) {
-      const c = Number(body.colors);
-      detailKey = c <= 5 ? "low" : (c >= 11 ? "high" : "medium");
-    }
-    if (!DETAIL[detailKey]) detailKey = "medium";
-    detailPct = detailKey === "simple" || detailKey === "low" ? 15
-      : (detailKey === "fine" || detailKey === "high" ? 85 : 50);
-  }
-
-  let colors;
-  if (body.colors != null && Number.isFinite(Number(body.colors))) {
-    colors = clamp(body.colors, 2, 24, 8);
-    if (!isPctLike(detailRaw)) detailPct = pctFromColors(colors);
-  } else {
-    colors = clamp(Math.round(lerp(3, 24, detailPct / 100)), 2, 24, 8);
-  }
-
-  let smoothPct = null;
-  const smoothRaw = body.smoothing != null ? body.smoothing : body.smooth;
-  if (isPctLike(smoothRaw)) {
-    smoothPct = clamp(smoothRaw, 0, 100, 50);
-  } else {
-    let smoothKey = String(smoothRaw || "").toLowerCase();
-    if (!SMOOTH[smoothKey]) smoothKey = "medium";
-    smoothPct = smoothKey === "low" ? 15 : (smoothKey === "high" ? 85 : 50);
-  }
-  const smoothT = smoothPct / 100;
-  const smoothDefaults = {
-    epsilon: lerp(0.4, 1.6, smoothT),
-    filterSpeckle: Math.round(lerp(2, 10, smoothT)),
-    segmentLength: lerp(3.0, 6.0, smoothT),
-  };
-
-  let cornerPct = null;
-  const cornerRaw = body.cornerSmooth != null ? body.cornerSmooth : (body.corners != null ? body.corners : body.corner);
-  if (isPctLike(cornerRaw)) {
-    cornerPct = clamp(cornerRaw, 0, 100, 50);
-  } else {
-    let cornerKey = String(cornerRaw || "").toLowerCase();
-    if (!CORNER[cornerKey]) cornerKey = "balanced";
-    cornerPct = cornerKey === "sharp" ? 10 : (cornerKey === "smooth" ? 90 : 50);
-  }
-  const cornerT = cornerPct / 100;
-  const cornerDefaults = {
-    fitError: lerp(0.4, 2.0, cornerT),
-    cornerCos: lerp(-0.55, 0.15, cornerT),
-    cornerThreshold: Math.round(lerp(40, 90, cornerT)),
-  };
-
-  const epsilon = clamp(body.epsilon != null ? body.epsilon : smoothDefaults.epsilon, 0.2, 3, smoothDefaults.epsilon);
-  const fitError = clamp(body.fitError != null ? body.fitError : cornerDefaults.fitError, 0.2, 4, cornerDefaults.fitError);
-  const cornerCos = clamp(body.cornerCos != null ? body.cornerCos : cornerDefaults.cornerCos, -1, 1, cornerDefaults.cornerCos);
-  const cornerThreshold = clamp(body.cornerThreshold != null ? body.cornerThreshold : cornerDefaults.cornerThreshold, 20, 120, cornerDefaults.cornerThreshold);
-  const filterSpeckle = clamp(body.filterSpeckle != null ? body.filterSpeckle : smoothDefaults.filterSpeckle, 0, 16, smoothDefaults.filterSpeckle);
-  const segmentLength = clamp(body.segmentLength != null ? body.segmentLength : smoothDefaults.segmentLength, 1, 12, smoothDefaults.segmentLength);
-
-  const settings = {
-    detail: Math.round(detailPct),
-    smoothing: Math.round(smoothPct),
-    cornerSmooth: Math.round(cornerPct),
-    colors: colors,
-    epsilon: epsilon,
-    fitError: fitError,
-    cornerCos: cornerCos,
-  };
-
-  return Object.assign({}, body, {
-    colors: colors,
-    epsilon: epsilon,
-    fitError: fitError,
-    cornerCos: cornerCos,
-    cornerThreshold: cornerThreshold,
-    filterSpeckle: filterSpeckle,
-    segmentLength: segmentLength,
-    detail: settings.detail,
-    smoothing: settings.smoothing,
-    cornerSmooth: settings.cornerSmooth,
-    live: body.live === true || body.live === "true" || body.live === 1,
-    _vzSettings: settings,
-  });
-}
-
-function attachVzSettings(resultOrJob, body) {
-  const settings = body && body._vzSettings;
-  if (!settings) return;
-  if (resultOrJob && resultOrJob.meta) {
-    resultOrJob.meta = Object.assign({}, resultOrJob.meta, { settings: settings });
-  }
-  if (resultOrJob && resultOrJob.vec) {
-    resultOrJob.vec.meta = Object.assign({}, resultOrJob.vec.meta || {}, { settings: settings });
-  }
-  if (resultOrJob && resultOrJob.vector) {
-    resultOrJob.vector.meta = Object.assign({}, resultOrJob.vector.meta || {}, { settings: settings });
-  }
-}
-
-/** vai-trace without blocking the event loop. Large jobs prefer worker; else async spawn. */
-async function runVaiTraceSafe(buf, job, body, sizeMeta) {
-  const timeoutMs = 180000;
-  const norm = body && body._vzSettings ? body : normalizeVectorizeBody(body || {});
-  const opts = {
-    colors: norm.colors,
-    mode: (norm && norm.mode) || "auto",
-    timeoutMs: timeoutMs,
-    epsilon: norm.epsilon,
-    fitError: norm.fitError,
-    cornerCos: norm.cornerCos,
-  };
-  const info = vectorizeGuard.inspect(buf);
-  const useWorker = !!(sizeMeta && sizeMeta.sizeGuard && sizeMeta.sizeGuard.downscaled) || info.needsDownscale || info.bytes > 6 * 1024 * 1024;
-  let result;
-  if (useWorker) {
-    const msg = await vectorizeInWorker(buf, job.width_in, job.height_in, opts, timeoutMs + 5000, "vai-trace");
-    result = { svg: msg.svg, vec: msg.vec, meta: msg.meta || (msg.vec && msg.vec.meta) || {} };
-  } else {
-    result = await vaiTrace.vectorizeBufferAsync(buf, {
-      widthIn: job.width_in,
-      heightIn: job.height_in,
-      colors: opts.colors,
-      mode: opts.mode,
-      timeoutMs: timeoutMs,
-      epsilon: opts.epsilon,
-      fitError: opts.fitError,
-      cornerCos: opts.cornerCos,
-    });
-  }
-  if (sizeMeta && sizeMeta.sizeGuard) {
-    result.meta = Object.assign({}, result.meta || {}, { sizeGuard: sizeMeta.sizeGuard });
-    if (result.vec) {
-      result.vec.meta = Object.assign({}, result.vec.meta || {}, { sizeGuard: sizeMeta.sizeGuard });
-    }
-  }
-  attachVzSettings(result, norm);
-  return result;
-}
-function tryVectorizeJob(job) {
-  /* sync path kept only for tests — production upload never calls this for big art */
-  if (!job || !job.file_path) return;
-  const abs = path.join(UPLOADS, path.basename(job.file_path));
-  if (!fs.existsSync(abs)) return;
-  const buf = fs.readFileSync(abs);
-  if (buf[0] !== 0x89 || buf[1] !== 0x50) return;
-  try {
-    const packed = bezierVectorize.vectorizeToSvg(buf, job.width_in, job.height_in, { maxEdge: 320, colors: 6 });
-    applyVectorResult(job, packed.vec, packed.svg);
-  } catch (e) { /* keep raster */ }
-}
-function scheduleVectorize(jobId) {
-  /* Upload stays snappy: do NOT auto-vectorize. User clicks Vectorize. */
-  return;
-}
-function clearJobVector(job) {
-  if (!job) return;
-  delete job.vector;
-  delete job.vector_svg;
-  delete job.vector_eps;
-}
-function jobHasUsableVector(job) {
-  if (!job) return false;
-  if (job.vector_svg) return true;
-  return !!(job.vector && Array.isArray(job.vector.layers) && job.vector.layers.length);
-}
-function invertHexColor(hex) {
-  const rgb = colorspec.parseHex(hex);
-  if (!rgb) return hex;
-  return colorspec.rgbToHex(255 - rgb[0], 255 - rgb[1], 255 - rgb[2]);
-}
-function invertPaintColorToken(color) {
-  const c = String(color || "").trim();
-  if (/^#([0-9a-fA-F]{6})$/.test(c)) return invertHexColor(c);
-  if (/^#([0-9a-fA-F]{3})$/.test(c)) {
-    const h = c.slice(1);
-    return invertHexColor("#" + h[0] + h[0] + h[1] + h[1] + h[2] + h[2]);
-  }
-  const rgb = c.match(/^rgb\(\s*(\d+)\s*,\s*(\d+)\s*,\s*(\d+)\s*\)$/i);
-  if (rgb) return "rgb(" + (255 - Number(rgb[1])) + "," + (255 - Number(rgb[2])) + "," + (255 - Number(rgb[3])) + ")";
-  return c;
-}
-/** Invert fill/stroke/stop-color only — never raw #ids in url(#…). */
-function invertSvgMarkup(svg) {
-  return String(svg || "").replace(
-    /((?:fill|stroke|stop-color|flood-color|lighting-color|color)\s*[:=]\s*["']?)(#(?:[0-9a-fA-F]{6}|[0-9a-fA-F]{3})|rgb\(\s*\d+\s*,\s*\d+\s*,\s*\d+\s*\))/gi,
-    function (m, prefix, color) {
-      return prefix + invertPaintColorToken(color);
-    }
-  );
-}
-function invertJobVector(job) {
-  if (!job) return;
-  if (job.vector_svg) {
-    const abs = path.join(UPLOADS, path.basename(job.vector_svg));
-    if (fs.existsSync(abs)) {
-      const svg = invertSvgMarkup(fs.readFileSync(abs, "utf8"));
-      const name = Date.now() + "-" + uid() + "-vector.svg";
-      fs.writeFileSync(path.join(UPLOADS, name), svg);
-      job.vector_svg = "/uploads/" + name;
-      delete job.vector_eps;
-    }
-  }
-  if (job.vector && Array.isArray(job.vector.layers)) {
-    job.vector.layers = job.vector.layers.map(function (L) {
-      return colorspec.annotateLayer(Object.assign({}, L, { hex: invertHexColor(L.hex || "#000000") }));
-    });
-    if (!job.vector_svg && vectorHasRealPaths(job.vector)) {
-      rewriteVectorSvg(job);
-    }
-  }
-}
-function rewriteVectorSvg(job) {
-  if (!job || !job.vector || !job.vector.layers) return;
-  // Prefer keeping on-disk vector_svg when layers lack real path `d` (vai-trace / invent-warp).
-  // Never rebuild via svgFromLayers([]) — that emits empty d="" and nukes geometry.
-  if (job.vector_svg && !vectorHasRealPaths(job.vector)) {
-    const abs = path.join(UPLOADS, path.basename(job.vector_svg));
-    if (fs.existsSync(abs)) {
-      const svg = fs.readFileSync(abs, "utf8");
-      const name = Date.now() + "-" + uid() + "-vector.svg";
-      fs.writeFileSync(path.join(UPLOADS, name), svg);
-      job.vector_svg = "/uploads/" + name;
-      return;
-    }
-  }
-  if (vectorHasRealPaths(job.vector)) {
-    const svg = svgFromLayers(job.vector.layers, job.vector.widthIn || job.width_in, job.vector.heightIn || job.height_in);
-    const name = Date.now() + "-" + uid() + "-vector.svg";
-    fs.writeFileSync(path.join(UPLOADS, name), svg);
-    job.vector_svg = "/uploads/" + name;
-    delete job.vector_eps;
-    return;
-  }
-  // File missing and no path data — last resort (may be empty)
-  const svg = svgFromLayers(job.vector.layers, job.vector.widthIn || job.width_in, job.vector.heightIn || job.height_in);
-  const name = Date.now() + "-" + uid() + "-vector.svg";
-  fs.writeFileSync(path.join(UPLOADS, name), svg);
-  job.vector_svg = "/uploads/" + name;
-  delete job.vector_eps;
-}
-function requireAdmin(user, res) {
-  if (!user || user.role !== "admin") {
-    json(res, 403, { error: "Admin required" });
-    return false;
-  }
-  return true;
-}
-function seedDemoArt() {
-  const pth = path.join(UPLOADS, "demo-badge.png");
-  if (!fs.existsSync(pth)) fs.writeFileSync(pth, generateBadgePng());
-  return "/uploads/demo-badge.png";
-}
-function save(db) {
-  const tmp = DB_PATH + ".tmp." + process.pid + "." + Date.now();
-  fs.writeFileSync(tmp, JSON.stringify(db, null, 2));
-  fs.renameSync(tmp, DB_PATH);
-}
-function load() {
-  let db;
-  let dirty = false;
-  if (!fs.existsSync(DB_PATH)) {
-    db = emptyStore();
-    if (allowDemo()) seedDemoUsers(db);
-    dirty = true;
-  } else {
-    db = JSON.parse(fs.readFileSync(DB_PATH, "utf8"));
-    (db.jobs || []).forEach(normalizeJob);
-  }
-  const before = JSON.stringify(db.settings || null);
-  ensureSettings(db);
-  if (JSON.stringify(db.settings) !== before) dirty = true;
-  if (ensureAdmin(db)) dirty = true;
-  if (dirty) save(db);
-  return db;
-}
-function mapLegacyStatus(s) {
-  return ({ intake: "new", proof: "proof_sent", production: "in_production" })[s] || s;
-}
-function normalizeJob(job) {
-  job.status = mapLegacyStatus(job.status || "new");
-  if (!job.proof_token || String(job.proof_token).length < 32) job.proof_token = proofToken();
-  if (!Array.isArray(job.line_items)) job.line_items = [];
-  if (!Array.isArray(job.comments)) job.comments = [];
-  if (job.margin_pct == null) job.margin_pct = 0;
-  if (!job.blank) job.blank = null;
-  if (!job.placement) job.placement = "center";
-  if (!job.catalog_code) job.catalog_code = null;
-}
-function seedDemoUsers(db) {
-  const now = new Date().toISOString();
-  const shopId = uid();
-  db.shops.push({ id: shopId, name: "Hearth & Horn Co.", logo_path: null, brand_color: "#017ece", created_at: now, margin_pct: 20 });
-  db.users.push({ id: uid(), email: "owner@anvil.local", name: "Shop Owner", password_hash: hashPass("anvil123"), role: "shop", shop_id: shopId, plan: "studio", plan_expires: null, created_at: now });
-  db.users.push({ id: uid(), email: "client@anvil.local", name: "Jordan Client", password_hash: hashPass("anvil123"), role: "client", shop_id: shopId, plan: "client", plan_expires: null, created_at: now });
-}
-function ensureDemoJob(db) {
-  if (!allowDemo()) return;
-  const art = seedDemoArt();
-  const shop = db.shops[0];
-  const client = db.users.find((u) => u.email === "client@anvil.local");
-  if (!db.jobs.length && shop) {
-    const now = new Date().toISOString();
-    const job = {
-      id: uid(), shop_id: shop.id, client_id: client ? client.id : null,
-      title: "Forge mark tees", method: "apparel", status: "proof_sent",
-      notes: "Chest print, black heather.", art_notes: "One-color badge, knock white if needed.",
-      width_in: 10, height_in: 10, qty: 24, due_at: now.slice(0, 10),
-      file_path: art, proof_token: proofToken(), blank: "tee", garment_color: "#2c3138",
-      placement: "chest", margin_pct: 20, line_items: [], comments: [], created_at: now, updated_at: now,
-    };
-    applyQuote(job);
-    applyMockup(job);
-    db.jobs.push(job);
-    db.events.push({ id: uid(), job_id: job.id, message: "Job created · proof mockup ready", created_at: now });
     save(db);
+  } else {
+    // DecoClub ops identity is Yahoo — migrate legacy CorelTRAINER admin email when present.
+    const want = String(process.env.ADMIN_EMAIL || "Davidhanes2@yahoo.com").toLowerCase();
+    const legacy = (db.users || []).find(function (u) { return u.role === "admin" && u.email === "david@coreltrainer.com"; });
+    const hasWant = (db.users || []).some(function (u) { return u.role === "admin" && u.email === want; });
+    if (legacy && !hasWant && want === "davidhanes2@yahoo.com") {
+      legacy.email = want;
+      legacy.name = "David Hanes";
+      save(db);
+    }
   }
 }
 
@@ -1034,6 +437,7 @@ async function handleApi(req, res, url) {
     const body = parseJsonBody(await readBody(req));
     const u = db.users.find(function (x) { return x.email === String(body.email || "").toLowerCase(); });
     if (!u || !checkPass(body.password || "", u.password_hash)) return json(res, 401, { error: "Invalid email or password" });
+    if (u.disabled) return json(res, 403, { error: "Account disabled" });
     if (ensureAdminShop(db, u)) save(db);
     const remember = truthy(body.remember_me);
     const sess = sessionRecord(u.id, remember);
@@ -1857,9 +1261,88 @@ async function handleApi(req, res, url) {
     const shop = db.shops.find(function (s) { return s.id === u.shop_id; });
     return {
       id: u.id, email: u.email, name: u.name, role: u.role, shop_id: u.shop_id,
-      shop_name: shop ? shop.name : null, plan: u.plan, plan_expires: u.plan_expires, created_at: u.created_at,
+      shop_name: shop ? shop.name : null, plan: u.plan, plan_expires: u.plan_expires,
+      disabled: !!u.disabled, created_at: u.created_at,
+      jobs: (db.jobs || []).filter(function (j) { return j.owner_id === u.id || j.client_id === u.id; }).length,
     };
   }
+  function adminJobRow(j) {
+    const owner = db.users.find(function (u) { return u.id === j.owner_id || u.id === j.client_id; });
+    const shop = db.shops.find(function (s) { return s.id === j.shop_id; });
+    return {
+      id: j.id,
+      title: j.title || "",
+      method: j.method || "",
+      status: j.status || "",
+      shop_id: j.shop_id || null,
+      shop_name: shop ? shop.name : null,
+      owner_id: owner ? owner.id : (j.owner_id || j.client_id || null),
+      owner_email: owner ? owner.email : null,
+      owner_name: owner ? owner.name : null,
+      created_at: j.created_at,
+      updated_at: j.updated_at,
+      file_path: j.file_path || null,
+      vector_svg: j.vector_svg || null,
+      has_artwork: !!(j.file_path),
+      has_vector: !!(j.vector_svg || (j.vector && j.vector.layers && j.vector.layers.length)),
+    };
+  }
+
+  if (pth === "/api/admin/overview" && method === "GET") {
+    if (!requireAdmin(user, res)) return;
+    const users = db.users || [];
+    const shops = db.shops || [];
+    const jobs = db.jobs || [];
+    const recentUsers = users.slice().sort(function (a, b) {
+      return String(b.created_at || "").localeCompare(String(a.created_at || ""));
+    }).slice(0, 8).map(publicAdminUser);
+    const recentJobs = jobs.slice().sort(function (a, b) {
+      return String(b.created_at || b.updated_at || "").localeCompare(String(a.created_at || a.updated_at || ""));
+    }).slice(0, 8).map(adminJobRow);
+    return json(res, 200, {
+      counts: {
+        users: users.length,
+        shops: shops.length,
+        jobs: jobs.length,
+        disabled_users: users.filter(function (u) { return u.disabled; }).length,
+      },
+      recent_signups: recentUsers,
+      recent_jobs: recentJobs,
+      system: {
+        version: BUILD.version,
+        stamp: BUILD.stamp,
+        billing_configured: billingConfigured(),
+        stripe_configured: billingConfigured(),
+        imagine: false,
+        vectorizer_ai: false,
+        vai_trace: vaiTrace.available(),
+      },
+    });
+  }
+
+  if (pth === "/api/admin/system" && method === "GET") {
+    if (!requireAdmin(user, res)) return;
+    const settings = ensureSettings(db);
+    return json(res, 200, {
+      health: { ok: true },
+      version: BUILD.version,
+      name: BUILD.name,
+      stamp: BUILD.stamp,
+      node: process.version,
+      feature_flags: {
+        trial_days: settings.trial_days,
+        shop_price_cents: settings.shop_price_cents,
+        studio_price_cents: settings.studio_price_cents,
+      },
+      billing_configured: billingConfigured(),
+      stripe_configured: billingConfigured(),
+      imagine: false,
+      vectorizer_ai: false,
+      vai_trace: vaiTrace.available(),
+      vtracer: vtracer.available(),
+    });
+  }
+
   if (pth === "/api/admin/shops" && method === "GET") {
     if (!requireAdmin(user, res)) return;
     const shops = db.shops.map(function (s) {
@@ -1883,9 +1366,45 @@ async function handleApi(req, res, url) {
     db.shops.push(shop); save(db);
     return json(res, 200, { shop: shop });
   }
+  const shopPath = pth.match(/^\/api\/admin\/shops\/([^/]+)$/);
+  if (shopPath && method === "PATCH") {
+    if (!requireAdmin(user, res)) return;
+    const shop = db.shops.find(function (s) { return s.id === shopPath[1]; });
+    if (!shop) return json(res, 404, { error: "Shop not found" });
+    const body = parseJsonBody(await readBody(req));
+    if (body.name) shop.name = String(body.name).trim();
+    if (body.brand_color) shop.brand_color = String(body.brand_color);
+    if (body.margin_pct != null) shop.margin_pct = Number(body.margin_pct) || 0;
+    save(db);
+    return json(res, 200, { shop: shop });
+  }
+  if (shopPath && method === "DELETE") {
+    if (!requireAdmin(user, res)) return;
+    const id = shopPath[1];
+    const shop = db.shops.find(function (s) { return s.id === id; });
+    if (!shop) return json(res, 404, { error: "Shop not found" });
+    const userCount = db.users.filter(function (u) { return u.shop_id === id; }).length;
+    const jobCount = db.jobs.filter(function (j) { return j.shop_id === id; }).length;
+    if (userCount > 0 || jobCount > 0) {
+      return json(res, 400, {
+        error: "Shop still has " + userCount + " user(s) and " + jobCount + " job(s). Reassign or delete them first.",
+      });
+    }
+    db.shops = db.shops.filter(function (s) { return s.id !== id; });
+    save(db);
+    return json(res, 200, { ok: true, deleted: id });
+  }
+
   if (pth === "/api/admin/users" && method === "GET") {
     if (!requireAdmin(user, res)) return;
-    return json(res, 200, { users: db.users.map(publicAdminUser) });
+    const q = String(url.searchParams.get("q") || "").trim().toLowerCase();
+    let users = db.users.map(publicAdminUser);
+    if (q) {
+      users = users.filter(function (u) {
+        return (u.email + " " + u.name + " " + (u.shop_name || "") + " " + (u.role || "")).toLowerCase().indexOf(q) !== -1;
+      });
+    }
+    return json(res, 200, { users: users });
   }
   const delUser = pth.match(/^\/api\/admin\/users\/([^/]+)$/);
   if (delUser && method === "DELETE") {
@@ -1896,9 +1415,43 @@ async function handleApi(req, res, url) {
     if (u.role === "admin") return json(res, 400, { error: "Cannot delete admin" });
     if (u.id === user.id) return json(res, 400, { error: "Cannot delete yourself" });
     db.users = db.users.filter(function (x) { return x.id !== id; });
+    db.sessions = (db.sessions || []).filter(function (s) { return s.user_id !== id; });
     db.jobs = (db.jobs || []).filter(function (j) { return j.owner_id !== id && j.client_id !== id; });
     save(db);
     return json(res, 200, { ok: true, deleted: id, email: u.email });
+  }
+  if (delUser && method === "PATCH") {
+    if (!requireAdmin(user, res)) return;
+    const u = db.users.find(function (x) { return x.id === delUser[1]; });
+    if (!u) return json(res, 404, { error: "User not found" });
+    const body = parseJsonBody(await readBody(req));
+    if (body.role === "shop" || body.role === "client") {
+      if (u.role === "admin") return json(res, 400, { error: "Cannot change admin role" });
+      u.role = body.role;
+      if (body.role === "client" && (u.plan === "shop" || u.plan === "studio" || u.plan === "trial")) {
+        u.plan = "client";
+      }
+    }
+    if (body.shop_id !== undefined) {
+      if (body.shop_id === null || body.shop_id === "") {
+        u.shop_id = null;
+      } else {
+        const shop = db.shops.find(function (s) { return s.id === body.shop_id; });
+        if (!shop) return json(res, 400, { error: "Shop not found" });
+        u.shop_id = shop.id;
+      }
+    }
+    if (body.disabled !== undefined) {
+      if (u.role === "admin") return json(res, 400, { error: "Cannot disable admin" });
+      if (u.id === user.id) return json(res, 400, { error: "Cannot disable yourself" });
+      u.disabled = !!body.disabled;
+      if (u.disabled) {
+        db.sessions = (db.sessions || []).filter(function (s) { return s.user_id !== u.id; });
+      }
+    }
+    if (body.name) u.name = String(body.name).trim();
+    save(db);
+    return json(res, 200, { user: publicAdminUser(u) });
   }
   const planPath = pth.match(/^\/api\/admin\/users\/([^/]+)\/plan$/);
   if (planPath && method === "POST") {
@@ -1906,8 +1459,15 @@ async function handleApi(req, res, url) {
     const u = db.users.find(function (x) { return x.id === planPath[1]; });
     if (!u) return json(res, 404, { error: "User not found" });
     const body = parseJsonBody(await readBody(req));
+    if (body.revoke) {
+      u.plan = body.plan || "client";
+      u.plan_expires = null;
+      save(db);
+      return json(res, 200, { user: publicAdminUser(u) });
+    }
     if (body.plan) u.plan = body.plan;
     if (body.plan_expires) u.plan_expires = body.plan_expires;
+    if (body.plan_expires === null) u.plan_expires = null;
     const months = Number(body.complimentary_months) || 0;
     if (months > 0) {
       const now = new Date();
@@ -1920,20 +1480,75 @@ async function handleApi(req, res, url) {
     save(db);
     return json(res, 200, { user: publicAdminUser(u) });
   }
+  const passPath = pth.match(/^\/api\/admin\/users\/([^/]+)\/password$/);
+  if (passPath && method === "POST") {
+    if (!requireAdmin(user, res)) return;
+    const u = db.users.find(function (x) { return x.id === passPath[1]; });
+    if (!u) return json(res, 404, { error: "User not found" });
+    if (u.role === "admin" && u.id !== user.id) {
+      return json(res, 400, { error: "Cannot reset another admin password" });
+    }
+    const body = parseJsonBody(await readBody(req));
+    let temp = body.password ? String(body.password) : "";
+    if (!temp) {
+      temp = crypto.randomBytes(4).toString("hex") + "A1!";
+    }
+    if (temp.length < 6) return json(res, 400, { error: "Password must be 6+ characters" });
+    u.password_hash = hashPass(temp);
+    db.sessions = (db.sessions || []).filter(function (s) { return s.user_id !== u.id; });
+    save(db);
+    // Return temp password once; never store plaintext.
+    return json(res, 200, { ok: true, user_id: u.id, email: u.email, temporary_password: temp });
+  }
+
+  if (pth === "/api/admin/jobs" && method === "GET") {
+    if (!requireAdmin(user, res)) return;
+    const limit = Math.min(200, Math.max(1, Number(url.searchParams.get("limit")) || 50));
+    const q = String(url.searchParams.get("q") || "").trim().toLowerCase();
+    let jobs = (db.jobs || []).slice().sort(function (a, b) {
+      return String(b.created_at || b.updated_at || "").localeCompare(String(a.created_at || a.updated_at || ""));
+    });
+    if (q) {
+      jobs = jobs.filter(function (j) {
+        const row = adminJobRow(j);
+        return (row.title + " " + row.method + " " + (row.owner_email || "") + " " + (row.shop_name || "") + " " + row.id)
+          .toLowerCase().indexOf(q) !== -1;
+      });
+    }
+    return json(res, 200, { jobs: jobs.slice(0, limit).map(adminJobRow) });
+  }
+  const delJob = pth.match(/^\/api\/admin\/jobs\/([^/]+)$/);
+  if (delJob && method === "DELETE") {
+    if (!requireAdmin(user, res)) return;
+    const id = delJob[1];
+    const job = db.jobs.find(function (j) { return j.id === id; });
+    if (!job) return json(res, 404, { error: "Job not found" });
+    db.jobs = db.jobs.filter(function (j) { return j.id !== id; });
+    db.events = (db.events || []).filter(function (e) { return e.job_id !== id; });
+    save(db);
+    return json(res, 200, { ok: true, deleted: id });
+  }
+
   if (pth === "/api/admin/settings" && method === "GET") {
     if (!requireAdmin(user, res)) return;
-    return json(res, 200, { settings: ensureSettings(db) });
+    return json(res, 200, {
+      settings: ensureSettings(db),
+      billing_configured: billingConfigured(),
+      imagine: false,
+      vectorizer_ai: false,
+    });
   }
   if (pth === "/api/admin/settings" && method === "POST") {
     if (!requireAdmin(user, res)) return;
     const body = parseJsonBody(await readBody(req));
-    const s = ensureSettings(db);
-    if (body.trial_days != null) s.trial_days = Math.max(0, Number(body.trial_days) || 0);
-    if (body.shop_price_cents != null) s.shop_price_cents = Math.max(0, Math.round(Number(body.shop_price_cents)));
-    if (body.studio_price_cents != null) s.studio_price_cents = Math.max(0, Math.round(Number(body.studio_price_cents)));
-    db.settings = s; save(db);
-    return json(res, 200, { settings: s });
+    const st = ensureSettings(db);
+    if (body.trial_days != null) st.trial_days = Math.max(0, Number(body.trial_days) || 0);
+    if (body.shop_price_cents != null) st.shop_price_cents = Math.max(0, Math.round(Number(body.shop_price_cents)));
+    if (body.studio_price_cents != null) st.studio_price_cents = Math.max(0, Math.round(Number(body.studio_price_cents)));
+    db.settings = st; save(db);
+    return json(res, 200, { settings: st, billing_configured: billingConfigured() });
   }
+
 
   return json(res, 404, { error: "Not found" });
 }
@@ -1956,7 +1571,18 @@ function serveStatic(req, res, url) {
 const server = http.createServer(async function (req, res) {
   try {
     const url = new URL(req.url, "http://localhost");
-    if (url.pathname === "/health" || url.pathname === "/api/health") return json(res, 200, { ok: true, name: "DecoClub Pro" });
+    if (url.pathname === "/health" || url.pathname === "/api/health") {
+      return json(res, 200, {
+        ok: true,
+        name: BUILD.name,
+        version: BUILD.version,
+        stamp: BUILD.stamp,
+        billing: billingConfigured(),
+        imagine: false,
+        vectorizerAi: false,
+        vaiTrace: vaiTrace.available(),
+      });
+    }
     if (url.pathname.indexOf("/api/") === 0) return await handleApi(req, res, url);
     return serveStatic(req, res, url);
   } catch (err) {

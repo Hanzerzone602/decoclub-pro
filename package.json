@@ -1,6 +1,6 @@
 {
   "name": "decoclub-pro",
-  "version": "0.2.0",
+  "version": "0.2.1",
   "private": true,
   "engines": {
     "node": ">=18"
@@ -8,7 +8,7 @@
   "main": "server.js",
   "scripts": {
     "start": "node server.js",
-    "test": "node test/anvil.test.js && node test/server.test.js"
+    "test": "node test/anvil.test.js && node test/server.test.js && node test/plate_lock.test.js"
   },
   "dependencies": {
     "jpeg-js": "^0.4.4"

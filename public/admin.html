@@ -7,6 +7,22 @@
   <link rel="icon" href="/logo.png" />
   <link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Sans:wght@400;500;600;700&family=IBM+Plex+Serif:wght@600&display=swap" rel="stylesheet" />
   <link rel="stylesheet" href="/styles.css" />
+  <style>
+    .admin-stats { display: grid; grid-template-columns: repeat(auto-fit, minmax(140px, 1fr)); gap: 12px; margin: 16px 0 24px; }
+    .admin-stat { background: var(--panel-2); border: 1px solid var(--line); border-radius: 10px; padding: 14px 16px; }
+    .admin-stat .n { font-size: 28px; font-weight: 700; line-height: 1.1; }
+    .admin-stat .l { font-size: 12px; color: var(--muted); text-transform: uppercase; letter-spacing: .04em; margin-top: 4px; }
+    .admin-toolbar { display: flex; gap: 10px; flex-wrap: wrap; align-items: center; margin: 12px 0 16px; }
+    .admin-toolbar input[type="search"], .admin-toolbar input[type="text"] { min-width: 200px; }
+    .pill { display: inline-block; padding: 2px 8px; border-radius: 999px; font-size: 11px; background: var(--panel-2); border: 1px solid var(--line); }
+    .pill.warn { color: #b45309; border-color: #f59e0b55; }
+    .pill.ok { color: var(--ok); }
+    .pill.off { color: var(--muted); }
+    .actions { display: flex; flex-wrap: wrap; gap: 4px; }
+    .actions .btn { white-space: nowrap; }
+    details.admin-detail { margin-top: 8px; }
+    details.admin-detail summary { cursor: pointer; color: var(--muted); font-size: 12px; }
+  </style>
 </head>
 <body>
   <div class="app-shell">
@@ -14,9 +30,12 @@
       <a class="brand" href="/"><img src="/logo.png" alt="" /> DECOCLUB PRO</a>
       <a class="btn make-office" href="/app.html">Make something</a>
       <p class="side-kicker">Office</p>
-      <button class="linkish active" data-view="users">Users</button>
+      <button class="linkish active" data-view="overview">Overview</button>
+      <button class="linkish" data-view="users">Users</button>
       <button class="linkish" data-view="shops">Shops</button>
+      <button class="linkish" data-view="jobs">Jobs</button>
       <button class="linkish" data-view="settings">Pricing</button>
+      <button class="linkish" data-view="system">System</button>
       <p class="muted" id="who" style="margin-top:auto;font-size:12px;padding:10px"></p>
       <button class="btn ghost small" id="logout">Log out</button>
     </aside>
