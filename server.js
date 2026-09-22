@@ -112,19 +112,90 @@ function ensureAdmin(db) {
       password_hash: hashPass(password), role: "admin", shop_id: null,
       plan: "studio", plan_expires: null, created_at: now,
     });
-    save(db);
+    dirty = true;
   } else {
-    // DecoClub ops identity is Yahoo — migrate legacy CorelTRAINER admin email when present.
     const want = String(process.env.ADMIN_EMAIL || "Davidhanes2@yahoo.com").toLowerCase();
     const legacy = (db.users || []).find(function (u) { return u.role === "admin" && u.email === "david@coreltrainer.com"; });
     const hasWant = (db.users || []).some(function (u) { return u.role === "admin" && u.email === want; });
     if (legacy && !hasWant && want === "davidhanes2@yahoo.com") {
       legacy.email = want;
       legacy.name = "David Hanes";
-      save(db);
+      dirty = true;
     }
   }
+  return dirty;
 }
+
+function seedDemoArt() {
+  const pth = path.join(UPLOADS, "demo-badge.png");
+  if (!fs.existsSync(pth)) fs.writeFileSync(pth, generateBadgePng());
+  return "/uploads/demo-badge.png";
+}
+function save(db) {
+  const tmp = DB_PATH + ".tmp." + process.pid + "." + Date.now();
+  fs.writeFileSync(tmp, JSON.stringify(db, null, 2));
+  fs.renameSync(tmp, DB_PATH);
+}
+function load() {
+  let db;
+  let dirty = false;
+  if (!fs.existsSync(DB_PATH)) {
+    db = emptyStore();
+    if (allowDemo()) seedDemoUsers(db);
+    dirty = true;
+  } else {
+    db = JSON.parse(fs.readFileSync(DB_PATH, "utf8"));
+    (db.jobs || []).forEach(normalizeJob);
+  }
+  const before = JSON.stringify(db.settings || null);
+  ensureSettings(db);
+  if (JSON.stringify(db.settings) !== before) dirty = true;
+  if (ensureAdmin(db)) dirty = true;
+  if (dirty) save(db);
+  return db;
+}
+function mapLegacyStatus(s) {
+  return ({ intake: "new", proof: "proof_sent", production: "in_production" })[s] || s;
+}
+function normalizeJob(job) {
+  job.status = mapLegacyStatus(job.status || "new");
+  if (!job.proof_token || String(job.proof_token).length < 32) job.proof_token = proofToken();
+  if (!Array.isArray(job.line_items)) job.line_items = [];
+  if (!Array.isArray(job.comments)) job.comments = [];
+  if (job.margin_pct == null) job.margin_pct = 0;
+  if (!job.blank) job.blank = null;
+  if (!job.placement) job.placement = "center";
+  if (!job.catalog_code) job.catalog_code = null;
+}
+function seedDemoUsers(db) {
+  const now = new Date().toISOString();
+  const shopId = uid();
+  db.shops.push({ id: shopId, name: "Hearth & Horn Co.", logo_path: null, brand_color: "#017ece", created_at: now, margin_pct: 20 });
+  db.users.push({ id: uid(), email: "owner@anvil.local", name: "Shop Owner", password_hash: hashPass("anvil123"), role: "shop", shop_id: shopId, plan: "studio", plan_expires: null, created_at: now });
+  db.users.push({ id: uid(), email: "client@anvil.local", name: "Jordan Client", password_hash: hashPass("anvil123"), role: "client", shop_id: shopId, plan: "client", plan_expires: null, created_at: now });
+}
+function ensureDemoJob(db) {
+  if (!allowDemo()) return;
+  const art = seedDemoArt();
+  const shop = db.shops[0];
+  const client = db.users.find(function (u) { return u.email === "client@anvil.local"; });
+  if (!db.jobs.length && shop) {
+    const now = new Date().toISOString();
+    const job = {
+      id: uid(), shop_id: shop.id, client_id: client ? client.id : null,
+      title: "Forge mark tees", method: "apparel", status: "proof_sent",
+      notes: "Chest print, black heather.", art_notes: "One-color badge, knock white if needed.",
+      width_in: 10, height_in: 10, qty: 24, due_at: now.slice(0, 10),
+      file_path: art, proof_token: proofToken(), blank: "tee", garment_color: "#2c3138",
+      placement: "chest", margin_pct: 20, line_items: [], comments: [], created_at: now, updated_at: now,
+    };
+    applyQuote(job);
+    applyMockup(job);
+    db.jobs.push(job);
+    save(db);
+  }
+}
+
 
 const MIME = { ".html": "text/html; charset=utf-8", ".css": "text/css; charset=utf-8", ".js": "text/javascript; charset=utf-8", ".svg": "image/svg+xml", ".png": "image/png", ".jpg": "image/jpeg", ".jpeg": "image/jpeg", ".gif": "image/gif", ".webp": "image/webp", ".pdf": "application/pdf", ".json": "application/json", ".plt": "application/vnd.hp-hpgl", ".txt": "text/plain; charset=utf-8", ".eps": "application/postscript", ".dst": "application/octet-stream", ".exp": "application/octet-stream", ".csv": "text/csv; charset=utf-8" };
 function send(res, code, body, headers) {
