@@ -1464,6 +1464,7 @@ async function handleApi(req, res, url) {
         lpi: body.lpi,
         angle: body.angle,
         contrast: body.contrast,
+        colorMode: body.colorMode || body.color_mode || "source",
         color: body.color || "#000000",
         knockout: body.knockout != null || body.knockoutWhite != null
           ? !!(body.knockout || body.knockoutWhite)
@@ -1513,6 +1514,7 @@ async function handleApi(req, res, url) {
         lpi: body.lpi,
         angle: body.angle,
         contrast: body.contrast,
+        colorMode: body.colorMode || body.color_mode || "source",
         color: body.color || "#000000",
         knockout: body.knockout != null || body.knockoutWhite != null
           ? !!(body.knockout || body.knockoutWhite)
@@ -1540,6 +1542,7 @@ async function handleApi(req, res, url) {
         lpi: packed.meta.lpi,
         angle: packed.meta.angle,
         contrast: packed.meta.contrast,
+        colorMode: packed.meta.colorMode,
         color: packed.meta.color,
         knockout: packed.meta.knockout,
         elements: packed.meta.elements,

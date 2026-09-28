@@ -18,11 +18,18 @@
   <script>
     (function () {
       var METHODS = ["dtf","uvdtf","uv","vinyl","laser","sticker","hat","apparel","patch","embroidery","sublimation","rhinestone","sign"];
-      var q = new URLSearchParams(location.search).get("method") || "";
+      var params = new URLSearchParams(location.search);
+      var q = params.get("method") || "";
+      var tool = (params.get("tool") || "").toLowerCase();
       var stored = sessionStorage.getItem("decoclub_start_method") || "";
       var method = METHODS.indexOf(q) !== -1 ? q : (METHODS.indexOf(stored) !== -1 ? stored : "");
       if (method) sessionStorage.setItem("decoclub_start_method", method);
-      var qs = method ? ("?method=" + encodeURIComponent(method) + "&station=art") : "";
+      if (tool) sessionStorage.setItem("decoclub_start_tool", tool);
+      var qsParts = [];
+      if (method) qsParts.push("method=" + encodeURIComponent(method));
+      qsParts.push("station=art");
+      if (tool) qsParts.push("tool=" + encodeURIComponent(tool));
+      var qs = qsParts.length ? ("?" + qsParts.join("&")) : "";
       fetch("/api/me").then(function (r) { return r.json(); }).then(function (data) {
         if (data.user) location.replace("/app.html" + qs);
         else location.replace("/signup.html" + (method ? "?method=" + encodeURIComponent(method) : ""));

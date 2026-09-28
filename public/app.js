@@ -250,6 +250,7 @@ async function boot() {
   }
   const startMethod = consumeStartMethod();
   if (startMethod) makeMethod = startMethod;
+  consumeStartTool();
   if (!canFloor()) view = "board";
   nav();
   render();
@@ -262,9 +263,27 @@ function consumeStartMethod() {
   const method = METHODS.indexOf(fromUrl) !== -1 ? fromUrl : (METHODS.indexOf(fromStore) !== -1 ? fromStore : "");
   sessionStorage.removeItem("decoclub_start_method");
   if (method && (params.get("method") || params.get("station"))) {
-    history.replaceState({}, "", "/app.html");
+    // keep tool= in URL until consumeStartTool runs; strip below if no tool
+    if (!params.get("tool")) history.replaceState({}, "", "/app.html");
   }
   return method;
+}
+
+/** Deep-link ?tool=halftones (or start.html session) → open HT panel, hide Vectorize chrome. */
+function consumeStartTool() {
+  const params = new URLSearchParams(location.search);
+  const fromUrl = (params.get("tool") || "").toLowerCase();
+  const fromStore = (sessionStorage.getItem("decoclub_start_tool") || "").toLowerCase();
+  sessionStorage.removeItem("decoclub_start_tool");
+  const tool = fromUrl || fromStore;
+  if (tool === "halftones" || tool === "halftone") {
+    htPanelWantOpen = true;
+    station = "art";
+  }
+  if (params.get("tool") || params.get("method") || params.get("station")) {
+    history.replaceState({}, "", "/app.html");
+  }
+  return tool;
 }
 
 function titleFromFile(file) {
@@ -869,9 +888,11 @@ async function fillArt(el, job, shopControls) {
             <label>LPI <input type="number" id="htLpi" min="8" max="120" step="1" value="45" title="Lines per inch" /></label>
             <label>Angle <input type="number" id="htAngle" min="0" max="90" step="1" value="45" title="Screen angle degrees" /></label>
             <label>Contrast <input type="number" id="htContrast" min="0.25" max="2.5" step="0.05" value="1" title="Dot gain / punch" /></label>
-            <label>Ink <input type="color" id="htColor" value="#000000" title="Ink color" /></label>
             <label class="ht-ko" title="Print knockout — transparent plate, ink marks only (true HT / DTF)"><input type="checkbox" id="htKnockout" checked /> Knockout (transparent)</label>
+            <label class="ht-ink-toggle" title="Optional single-ink override for screen / one-color shops"><input type="checkbox" id="htUseInk" /> Use one ink color</label>
+            <label id="htInkRow" class="ht-ink-row" hidden>Ink override <input type="color" id="htColor" value="#000000" title="Ink override (optional)" /></label>
           </div>
+          <p class="muted ht-color-hint" id="htColorHint">Art colors (DTF) — each mark keeps real artwork color; spot size follows tone.</p>
           <div class="ht-actions">
             <button class="btn primary" type="button" id="htApply">Apply halftone</button>
             <button class="btn ghost" type="button" id="htCancel">Close</button>
@@ -1125,7 +1146,7 @@ async function fillArt(el, job, shopControls) {
       invertBtn.textContent = "Invert black & white";
     }
   };
-  // --- Vector Halftones (real SVG paths / circles) --- ht-transparent-v5
+  // --- Vector Halftones (real SVG paths / circles) --- ht-color-v6
   const HALFTONE_STYLES = [
     { id: "classic-round", name: "Classic Round", kind: "am-round", lpi: 45, angle: 45, contrast: 1 },
     { id: "elliptical", name: "Elliptical", kind: "am-ellipse", lpi: 45, angle: 45, contrast: 1 },
@@ -1242,11 +1263,13 @@ async function fillArt(el, job, shopControls) {
   }
 
   function htPayload() {
+    const useInk = !!($("#htUseInk") && $("#htUseInk").checked);
     return {
       style: htStyle,
       lpi: Number($("#htLpi") && $("#htLpi").value) || undefined,
       angle: Number($("#htAngle") && $("#htAngle").value),
       contrast: Number($("#htContrast") && $("#htContrast").value) || 1,
+      colorMode: useInk ? "ink" : "source",
       color: ($("#htColor") && $("#htColor").value) || "#000000",
       knockout: !!($("#htKnockout") && $("#htKnockout").checked),
     };
@@ -1343,7 +1366,46 @@ async function fillArt(el, job, shopControls) {
     }
   }
 
+  /** Hide Vectorize-only chrome while Halftones panel is open (whole Art station). */
+  function setHtModeUi(open) {
+    const on = !!open;
+    ["vzOptions", "vzUsed", "vzLiveHint", "colorModeRow"].forEach((id) => {
+      const n = $("#" + id);
+      if (n) n.hidden = on;
+    });
+    const layerList = el.querySelector(".layer-list");
+    if (layerList) layerList.hidden = on;
+    const vzBtn = $("#vectorizeBtn");
+    if (vzBtn) {
+      vzBtn.classList.toggle("secondary", on);
+      vzBtn.hidden = on;
+    }
+    const grey = $("#greyBtn");
+    const inv = $("#invertBtn");
+    if (grey) grey.hidden = on;
+    if (inv) inv.hidden = on;
+    // Keep Halftones primary; mute leftover art-actions noise
+    const hintVz = el.querySelector(".art-card > p.muted");
+    if (hintVz && /Best on clean Canva/.test(hintVz.textContent || "")) {
+      hintVz.hidden = on;
+    }
+    document.body.classList.toggle("ht-mode", on);
+  }
+
+  function syncHtInkRow() {
+    const useInk = !!($("#htUseInk") && $("#htUseInk").checked);
+    const row = $("#htInkRow");
+    if (row) row.hidden = !useInk;
+    const hint = $("#htColorHint");
+    if (hint) {
+      hint.textContent = useInk
+        ? "One ink — all marks use the override color (screen / one-color)."
+        : "Art colors (DTF) — each mark keeps real artwork color; spot size follows tone.";
+    }
+  }
+
   function renderHtStyles() {
+
     const box = $("#htStyles");
     if (!box) return;
     box.innerHTML = HALFTONE_STYLES.map((s) => {
@@ -1426,19 +1488,31 @@ async function fillArt(el, job, shopControls) {
       const lpi = $("#htLpi"); if (lpi && job.halftone.lpi != null) lpi.value = job.halftone.lpi;
       const ang = $("#htAngle"); if (ang && job.halftone.angle != null) ang.value = job.halftone.angle;
       const con = $("#htContrast"); if (con && job.halftone.contrast != null) con.value = job.halftone.contrast;
-      const col = $("#htColor"); if (col && job.halftone.color) col.value = job.halftone.color;
+      const useInkEl = $("#htUseInk");
+      // Default DTF = source. Only check ink override when colorMode === "ink".
+      if (useInkEl) useInkEl.checked = job.halftone.colorMode === "ink";
+      const col = $("#htColor");
+      if (col && job.halftone.color && String(job.halftone.color).indexOf("#") === 0) col.value = job.halftone.color;
       const ko = $("#htKnockout"); if (ko) ko.checked = job.halftone.knockout != null ? !!job.halftone.knockout : true;
       const hint = $("#htHint");
       if (hint) hint.textContent = "Last · " + (job.halftone.styleName || job.halftone.style) + " · " + (job.halftone.elements || "?") + " marks · tweak for live preview";
+      // Job came in as HT → keep HT panel preferred
+      if (job.vector && job.vector.source === "vector-halftone") htPanelWantOpen = true;
     }
+    syncHtInkRow();
     function bindHtParamListeners() {
-      ["htLpi", "htAngle", "htContrast", "htColor", "htKnockout"].forEach((id) => {
-        const el = $("#" + id);
-        if (!el || el._htBound) return;
-        el._htBound = true;
-        const ev = id === "htColor" || id === "htKnockout" ? "change" : "input";
-        el.addEventListener(ev, () => scheduleHtPreview());
-        if (id !== "htColor" && id !== "htKnockout") el.addEventListener("change", () => scheduleHtPreview());
+      ["htLpi", "htAngle", "htContrast", "htColor", "htKnockout", "htUseInk"].forEach((id) => {
+        const node = $("#" + id);
+        if (!node || node._htBound) return;
+        node._htBound = true;
+        const ev = (id === "htColor" || id === "htKnockout" || id === "htUseInk") ? "change" : "input";
+        node.addEventListener(ev, () => {
+          if (id === "htUseInk") syncHtInkRow();
+          scheduleHtPreview();
+        });
+        if (id !== "htColor" && id !== "htKnockout" && id !== "htUseInk") {
+          node.addEventListener("change", () => scheduleHtPreview());
+        }
       });
     }
     bindHtParamListeners();
@@ -1447,10 +1521,12 @@ async function fillArt(el, job, shopControls) {
       htPanel.hidden = !htPanel.hidden;
       htPanelWantOpen = !htPanel.hidden;
       if (!htPanel.hidden) {
+        setHtModeUi(true);
         renderHtStyles();
         showHtPreviewPlate();
         scheduleHtPreview();
       } else {
+        setHtModeUi(false);
         clearHtPreview();
       }
     };
@@ -1458,6 +1534,7 @@ async function fillArt(el, job, shopControls) {
     if (htCancel) htCancel.onclick = () => {
       htPanel.hidden = true;
       htPanelWantOpen = false;
+      setHtModeUi(false);
       clearHtPreview();
     };
     const htApply = $("#htApply");
@@ -1500,8 +1577,11 @@ async function fillArt(el, job, shopControls) {
 
     if (htPanelWantOpen) {
       htPanel.hidden = false;
+      setHtModeUi(true);
       showHtPreviewPlate();
       scheduleHtPreview();
+    } else {
+      setHtModeUi(false);
     }
   }
 

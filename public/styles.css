@@ -664,7 +664,20 @@ th { color: var(--muted); font-weight: 600; font-size: 11px; letter-spacing: .06
 .art-drop.ht-previewing .ht-preview-frame { pointer-events: none; }
 
 
-/* Halftones service chip / buy row (ht5 transparent) */
+/* Halftones service chip / buy row (ht6 color DTF) */
 .ht-panel-head { display: flex; flex-wrap: wrap; align-items: center; gap: 8px; }
 .ht-status { font-size: 11px; }
 .ht-buy { display: flex; flex-wrap: wrap; align-items: center; gap: 8px; margin: 8px 0 4px; }
+
+/* HT mode: Vectorize chrome hidden via JS; CSS backup */
+body.ht-mode #vzOptions,
+body.ht-mode #vzUsed,
+body.ht-mode #vzLiveHint,
+body.ht-mode #colorModeRow { display: none !important; }
+body.ht-mode .art-actions #vectorizeBtn,
+body.ht-mode .art-actions #greyBtn,
+body.ht-mode .art-actions #invertBtn { display: none !important; }
+.ht-ink-toggle,
+.ht-ink-row { display: inline-flex; align-items: center; gap: 6px; }
+.ht-ink-row[hidden] { display: none !important; }
+.ht-color-hint { margin: 4px 0 0; font-size: 12px; }
