@@ -378,8 +378,19 @@ th { color: var(--muted); font-weight: 600; font-size: 11px; letter-spacing: .06
 .layer-meta { display:flex; flex-direction:column; gap:2px; min-width:0; flex:1; }
 .layer-name { font-size:12px; line-height:1.25; word-break:break-word; }
 .layer-sub { font-size:11px; }
-.art-svg-host { width:100%; display:flex; align-items:center; justify-content:center; }
-.art-svg-host svg { width:100%; height:auto; max-width:100%; overflow:visible; }
+.art-svg-host { width:100%; display:flex; align-items:center; justify-content:center;
+  background-color: #eceff3;
+  background-image:
+    linear-gradient(45deg, #dfe3ea 25%, transparent 25%),
+    linear-gradient(-45deg, #dfe3ea 25%, transparent 25%),
+    linear-gradient(45deg, transparent 75%, #dfe3ea 75%),
+    linear-gradient(-45deg, transparent 75%, #dfe3ea 75%);
+  background-size: 16px 16px;
+  background-position: 0 0, 0 8px, 8px -8px, -8px 0;
+  border-radius: 6px;
+  min-height: 120px;
+}
+.art-svg-host svg { width:100%; height:auto; max-width:100%; max-height:420px; overflow:visible; }
 .art-drop.has-art .art-svg-host { pointer-events:none; user-select:none; }
 
 .run-risk { margin: 0 0 10px; padding: 10px 12px; border: 1px solid var(--line); font-size: 13px; line-height: 1.35; }
@@ -491,31 +502,59 @@ th { color: var(--muted); font-weight: 600; font-size: 11px; letter-spacing: .06
 }
 .ht-styles {
   display: grid;
-  grid-template-columns: repeat(auto-fill, minmax(118px, 1fr));
-  gap: 6px;
-  max-height: 220px;
+  grid-template-columns: repeat(auto-fill, minmax(108px, 1fr));
+  gap: 8px;
+  max-height: 280px;
   overflow: auto;
   padding: 2px;
 }
 .ht-style {
-  display: block;
+  display: flex;
+  flex-direction: column;
+  align-items: stretch;
+  gap: 6px;
   width: 100%;
   text-align: left;
-  padding: 8px 10px;
+  padding: 6px;
   border: 1px solid var(--line);
   background: var(--panel-2);
   border-radius: 8px;
-  font-size: 12px;
+  font-size: 11px;
   font-weight: 650;
   cursor: pointer;
   color: var(--ink);
-  line-height: 1.25;
+  line-height: 1.2;
 }
 .ht-style:hover { filter: brightness(1.04); border-color: #9ab0cc; }
 .ht-style.on {
   background: #0b5fff;
   color: #fff;
   border-color: #0b5fff;
+}
+.ht-thumb-wrap {
+  display: block;
+  width: 100%;
+  border-radius: 5px;
+  overflow: hidden;
+  background: #f4f6f8;
+  border: 1px solid rgba(0,0,0,0.08);
+  line-height: 0;
+}
+.ht-style .ht-thumb,
+.ht-style .ht-thumb-wrap svg {
+  display: block;
+  width: 100%;
+  height: auto;
+  max-height: 40px;
+  shape-rendering: geometricPrecision;
+}
+.ht-style.on .ht-thumb-wrap { border-color: rgba(255,255,255,0.35); }
+.ht-style-name {
+  display: block;
+  padding: 0 2px 2px;
+  font-size: 11px;
+  font-weight: 650;
+  line-height: 1.25;
 }
 .ht-params {
   display: flex;
@@ -549,3 +588,51 @@ th { color: var(--muted); font-weight: 600; font-size: 11px; letter-spacing: .06
 .ht-ko { font-weight: 600; }
 .ht-actions { display: flex; gap: 8px; flex-wrap: wrap; }
 .ht-hint { margin: 0; font-size: 12px; }
+
+/* Live halftone preview overlay on art drop */
+.ht-preview-frame {
+  position: absolute;
+  inset: 0;
+  z-index: 4;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  padding: 10px;
+  overflow: auto;
+  pointer-events: none;
+  background-color: #eceff3;
+  background-image:
+    linear-gradient(45deg, #dfe3ea 25%, transparent 25%),
+    linear-gradient(-45deg, #dfe3ea 25%, transparent 25%),
+    linear-gradient(45deg, transparent 75%, #dfe3ea 75%),
+    linear-gradient(-45deg, transparent 75%, #dfe3ea 75%);
+  background-size: 16px 16px;
+  background-position: 0 0, 0 8px, 8px -8px, -8px 0;
+  border-radius: 6px;
+}
+.ht-preview-frame[hidden] { display: none !important; }
+.ht-preview-frame.is-loading::after {
+  content: "Preview…";
+  position: absolute;
+  top: 10px;
+  right: 12px;
+  font-size: 11px;
+  font-weight: 700;
+  letter-spacing: 0.04em;
+  text-transform: uppercase;
+  color: #1a2a44;
+  background: rgba(255,255,255,0.85);
+  padding: 4px 8px;
+  border-radius: 4px;
+}
+.ht-preview-frame svg {
+  width: 100%;
+  height: auto;
+  max-height: 420px;
+  overflow: visible;
+}
+.art-drop.ht-previewing .art-zoom-inner {
+  opacity: 0.12;
+  filter: grayscale(0.4);
+}
+.art-drop.ht-previewing .ht-preview-frame { pointer-events: none; }

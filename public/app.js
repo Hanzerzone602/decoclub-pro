@@ -106,6 +106,11 @@ function showArtWorking(label) {
   if (span) span.textContent = label || "Working";
   ov.hidden = false;
 }
+/** Keep Halftones panel open across renderJob after Apply / while previewing. */
+let htPanelWantOpen = false;
+let htPreviewTimer = null;
+let htPreviewSeq = 0;
+
 function hideArtWorking() {
   const ov = document.getElementById("artWorking");
   if (ov) ov.hidden = true;
@@ -826,6 +831,7 @@ async function fillArt(el, job, shopControls) {
       <div class="art-stage">
         <div class="preview art-drop${hasArt ? " has-art" : ""}" id="artDrop" tabindex="0">
           <div class="art-zoom-inner" id="artZoomInner">${preview}</div>
+          <div class="ht-preview-frame" id="htPreviewFrame" hidden aria-live="polite"></div>
         </div>
         ${hasArt ? `<div class="zoom-bar">
           <button type="button" class="zoom-btn" id="zoomOut" title="Zoom out">−</button>
@@ -862,7 +868,7 @@ async function fillArt(el, job, shopControls) {
             <button class="btn primary" type="button" id="htApply">Apply halftone</button>
             <button class="btn ghost" type="button" id="htCancel">Close</button>
           </div>
-          <p class="muted ht-hint" id="htHint">Pick a shop style, then Apply. Output is real vector SVG.</p>
+          <p class="muted ht-hint" id="htHint">Live preview on the art · Apply commits real vector SVG.</p>
         </div>
         <p class="muted">Best on clean Canva / shop logos (smooth SVG/EPS for Corel). Soft junk JPEGs and busy posters improve, but are not Vectorizer.AI-class yet.</p>
         <div class="vz-options" id="vzOptions">
@@ -1113,38 +1119,212 @@ async function fillArt(el, job, shopControls) {
   };
   // --- Vector Halftones (real SVG paths / circles) ---
   const HALFTONE_STYLES = [
-    { id: "classic-round", name: "Classic Round", lpi: 45, angle: 45, contrast: 1 },
-    { id: "elliptical", name: "Elliptical", lpi: 45, angle: 45, contrast: 1 },
-    { id: "line", name: "Line", lpi: 40, angle: 45, contrast: 1 },
-    { id: "crosshatch", name: "Crosshatch", lpi: 35, angle: 45, contrast: 1 },
-    { id: "diamond", name: "Diamond", lpi: 45, angle: 45, contrast: 1 },
-    { id: "square", name: "Square", lpi: 45, angle: 45, contrast: 1 },
-    { id: "stochastic", name: "Stochastic / FM", lpi: 60, angle: 0, contrast: 1 },
-    { id: "coarse-spot", name: "Coarse Spot", lpi: 22, angle: 45, contrast: 1.1 },
-    { id: "fine-spot", name: "Fine Spot", lpi: 65, angle: 45, contrast: 0.95 },
-    { id: "dual-tone", name: "Dual Tone", lpi: 40, angle: 45, contrast: 1 },
-    { id: "soft-fade", name: "Soft Fade", lpi: 45, angle: 45, contrast: 0.65 },
-    { id: "hard-punch", name: "Hard Punch", lpi: 40, angle: 45, contrast: 1.55 },
-    { id: "newspaper", name: "Newspaper", lpi: 28, angle: 45, contrast: 1.15 },
-    { id: "comic-dot", name: "Comic Dot", lpi: 18, angle: 0, contrast: 1.25 },
-    { id: "cmyk-cyan", name: "CMYK Cyan angle", lpi: 45, angle: 15, contrast: 1 },
-    { id: "cmyk-magenta", name: "CMYK Magenta angle", lpi: 45, angle: 75, contrast: 1 },
-    { id: "cmyk-yellow", name: "CMYK Yellow angle", lpi: 45, angle: 0, contrast: 1 },
-    { id: "cmyk-black", name: "CMYK Black angle", lpi: 45, angle: 45, contrast: 1 },
-    { id: "horizontal-line", name: "Horizontal Line", lpi: 40, angle: 0, contrast: 1 },
-    { id: "vertical-line", name: "Vertical Line", lpi: 40, angle: 90, contrast: 1 },
-    { id: "mesh", name: "Mesh / Wire", lpi: 30, angle: 0, contrast: 1 },
-    { id: "triangle", name: "Triangle Spot", lpi: 40, angle: 30, contrast: 1 },
-    { id: "hex-spot", name: "Hex Spot", lpi: 38, angle: 30, contrast: 1 },
-    { id: "grain", name: "Grain / Mezzotint", lpi: 55, angle: 0, contrast: 1.1 },
+    { id: "classic-round", name: "Classic Round", kind: "am-round", lpi: 45, angle: 45, contrast: 1 },
+    { id: "elliptical", name: "Elliptical", kind: "am-ellipse", lpi: 45, angle: 45, contrast: 1 },
+    { id: "line", name: "Line", kind: "line", lpi: 40, angle: 45, contrast: 1 },
+    { id: "crosshatch", name: "Crosshatch", kind: "crosshatch", lpi: 35, angle: 45, contrast: 1 },
+    { id: "diamond", name: "Diamond", kind: "am-diamond", lpi: 45, angle: 45, contrast: 1 },
+    { id: "square", name: "Square", kind: "am-square", lpi: 45, angle: 45, contrast: 1 },
+    { id: "stochastic", name: "Stochastic / FM", kind: "fm", lpi: 60, angle: 0, contrast: 1 },
+    { id: "coarse-spot", name: "Coarse Spot", kind: "am-round", lpi: 22, angle: 45, contrast: 1.1 },
+    { id: "fine-spot", name: "Fine Spot", kind: "am-round", lpi: 65, angle: 45, contrast: 0.95 },
+    { id: "dual-tone", name: "Dual Tone", kind: "dual", lpi: 40, angle: 45, contrast: 1 },
+    { id: "soft-fade", name: "Soft Fade", kind: "am-round", lpi: 45, angle: 45, contrast: 0.65 },
+    { id: "hard-punch", name: "Hard Punch", kind: "am-round", lpi: 40, angle: 45, contrast: 1.55 },
+    { id: "newspaper", name: "Newspaper", kind: "am-round", lpi: 28, angle: 45, contrast: 1.15 },
+    { id: "comic-dot", name: "Comic Dot", kind: "am-round", lpi: 18, angle: 0, contrast: 1.25 },
+    { id: "cmyk-cyan", name: "CMYK Cyan angle", kind: "am-round", lpi: 45, angle: 15, contrast: 1 },
+    { id: "cmyk-magenta", name: "CMYK Magenta angle", kind: "am-round", lpi: 45, angle: 75, contrast: 1 },
+    { id: "cmyk-yellow", name: "CMYK Yellow angle", kind: "am-round", lpi: 45, angle: 0, contrast: 1 },
+    { id: "cmyk-black", name: "CMYK Black angle", kind: "am-round", lpi: 45, angle: 45, contrast: 1 },
+    { id: "horizontal-line", name: "Horizontal Line", kind: "line", lpi: 40, angle: 0, contrast: 1 },
+    { id: "vertical-line", name: "Vertical Line", kind: "line", lpi: 40, angle: 90, contrast: 1 },
+    { id: "mesh", name: "Mesh / Wire", kind: "mesh", lpi: 30, angle: 0, contrast: 1 },
+    { id: "triangle", name: "Triangle Spot", kind: "am-triangle", lpi: 40, angle: 30, contrast: 1 },
+    { id: "hex-spot", name: "Hex Spot", kind: "am-hex", lpi: 38, angle: 30, contrast: 1 },
+    { id: "grain", name: "Grain / Mezzotint", kind: "grain", lpi: 55, angle: 0, contrast: 1.1 },
   ];
   let htStyle = (job.halftone && job.halftone.style) || "classic-round";
+
+  function htThumbSvg(s) {
+    const kind = s.kind || "am-round";
+    const ang = Number(s.angle) || 0;
+    const coarse = (Number(s.lpi) || 45) <= 22;
+    const pitch = coarse ? 10 : (kind === "fm" || kind === "grain" ? 4.5 : 7);
+    const parts = [];
+    const W = 56, H = 40;
+    // tone ramp left→right (light → dark)
+    function toneAt(x) { return Math.max(0.05, Math.min(0.95, x / W)); }
+    if (kind === "line" || kind === "crosshatch" || kind === "mesh") {
+      const angles = kind === "crosshatch" ? [ang, ang + 90] : kind === "mesh" ? [0, 90] : [ang];
+      angles.forEach((a) => {
+        const rad = (a * Math.PI) / 180;
+        const nx = Math.cos(rad + Math.PI / 2);
+        const ny = Math.sin(rad + Math.PI / 2);
+        const dx = Math.cos(rad);
+        const dy = Math.sin(rad);
+        for (let i = -6; i < 14; i++) {
+          const ox = W / 2 + nx * (i - 3.5) * (pitch * 0.7);
+          const oy = H / 2 + ny * (i - 3.5) * (pitch * 0.7);
+          const t = toneAt(ox);
+          const sw = 0.4 + t * 2.2;
+          parts.push('<path d="M ' + (ox - dx * 40).toFixed(1) + " " + (oy - dy * 40).toFixed(1) +
+            " L " + (ox + dx * 40).toFixed(1) + " " + (oy + dy * 40).toFixed(1) +
+            '" fill="none" stroke="#111" stroke-width="' + sw.toFixed(2) + '"/>');
+        }
+      });
+    } else if (kind === "fm" || kind === "grain") {
+      for (let y = 3; y < H; y += pitch) {
+        for (let x = 3; x < W; x += pitch) {
+          const t = toneAt(x);
+          const rnd = ((Math.sin(x * 12.9898 + y * 78.233) * 43758.5453) % 1 + 1) % 1;
+          if (rnd > t) continue;
+          const r = kind === "grain" ? (0.6 + t * 1.4 * rnd) : 1.1;
+          parts.push('<circle cx="' + x.toFixed(1) + '" cy="' + y.toFixed(1) + '" r="' + r.toFixed(2) + '" fill="#111"/>');
+        }
+      }
+    } else {
+      // AM family — round / ellipse / diamond / square / triangle / hex / dual
+      for (let y = pitch / 2; y < H; y += pitch) {
+        for (let x = pitch / 2; x < W; x += pitch) {
+          const t = toneAt(x);
+          const r = (coarse ? 4.2 : 2.8) * Math.sqrt(t);
+          if (r < 0.35) continue;
+          if (kind === "am-ellipse") {
+            parts.push('<ellipse cx="' + x.toFixed(1) + '" cy="' + y.toFixed(1) + '" rx="' + (r * 0.75).toFixed(2) +
+              '" ry="' + (r * 1.15).toFixed(2) + '" transform="rotate(' + ang + " " + x.toFixed(1) + " " + y.toFixed(1) + ')" fill="#111"/>');
+          } else if (kind === "am-diamond") {
+            parts.push('<path d="M ' + x.toFixed(1) + " " + (y - r).toFixed(1) + " L " + (x + r).toFixed(1) + " " + y.toFixed(1) +
+              " L " + x.toFixed(1) + " " + (y + r).toFixed(1) + " L " + (x - r).toFixed(1) + " " + y.toFixed(1) + ' Z" fill="#111"/>');
+          } else if (kind === "am-square") {
+            const s = r * 0.85;
+            parts.push('<rect x="' + (x - s).toFixed(1) + '" y="' + (y - s).toFixed(1) + '" width="' + (s * 2).toFixed(1) +
+              '" height="' + (s * 2).toFixed(1) + '" transform="rotate(' + ang + " " + x.toFixed(1) + " " + y.toFixed(1) + ')" fill="#111"/>');
+          } else if (kind === "am-triangle") {
+            const a0 = (ang * Math.PI) / 180;
+            const pts = [];
+            for (let i = 0; i < 3; i++) {
+              const a = a0 + (i * 2 * Math.PI) / 3 - Math.PI / 2;
+              pts.push((x + Math.cos(a) * r).toFixed(1) + "," + (y + Math.sin(a) * r).toFixed(1));
+            }
+            parts.push('<polygon points="' + pts.join(" ") + '" fill="#111"/>');
+          } else if (kind === "am-hex") {
+            const a0 = (ang * Math.PI) / 180;
+            const pts = [];
+            for (let i = 0; i < 6; i++) {
+              const a = a0 + (i * Math.PI) / 3;
+              pts.push((x + Math.cos(a) * r).toFixed(1) + "," + (y + Math.sin(a) * r).toFixed(1));
+            }
+            parts.push('<polygon points="' + pts.join(" ") + '" fill="#111"/>');
+          } else if (kind === "dual") {
+            parts.push('<circle cx="' + x.toFixed(1) + '" cy="' + y.toFixed(1) + '" r="' + r.toFixed(2) + '" fill="#111"/>');
+            if (t > 0.45) {
+              parts.push('<circle cx="' + (x + pitch * 0.28).toFixed(1) + '" cy="' + (y + pitch * 0.1).toFixed(1) +
+                '" r="' + (r * 0.35).toFixed(2) + '" fill="#111"/>');
+            }
+          } else {
+            parts.push('<circle cx="' + x.toFixed(1) + '" cy="' + y.toFixed(1) + '" r="' + r.toFixed(2) + '" fill="#111"/>');
+          }
+        }
+      }
+    }
+    return '<svg class="ht-thumb" viewBox="0 0 ' + W + " " + H + '" width="56" height="40" aria-hidden="true">' +
+      '<rect width="' + W + '" height="' + H + '" fill="#f4f6f8"/>' + parts.join("") + "</svg>";
+  }
+
+  function htPayload() {
+    return {
+      style: htStyle,
+      lpi: Number($("#htLpi") && $("#htLpi").value) || undefined,
+      angle: Number($("#htAngle") && $("#htAngle").value),
+      contrast: Number($("#htContrast") && $("#htContrast").value) || 1,
+      color: ($("#htColor") && $("#htColor").value) || "#000000",
+      knockout: !!($("#htKnockout") && $("#htKnockout").checked),
+    };
+  }
+
+  function clearHtPreview() {
+    const frame = $("#htPreviewFrame");
+    if (frame) {
+      frame.hidden = true;
+      frame.innerHTML = "";
+      frame.classList.remove("is-loading");
+    }
+    const drop = $("#artDrop");
+    if (drop) drop.classList.remove("ht-previewing");
+  }
+
+  function showHtPreviewSvg(svgText) {
+    const frame = $("#htPreviewFrame");
+    const drop = $("#artDrop");
+    if (!frame || !drop) return;
+    frame.innerHTML = svgText;
+    const elSvg = frame.querySelector("svg");
+    if (elSvg) {
+      elSvg.removeAttribute("width");
+      elSvg.removeAttribute("height");
+      elSvg.setAttribute("preserveAspectRatio", "xMidYMid meet");
+      elSvg.style.width = "100%";
+      elSvg.style.height = "auto";
+      elSvg.style.maxHeight = "420px";
+    }
+    frame.hidden = false;
+    frame.classList.remove("is-loading");
+    drop.classList.add("ht-previewing", "has-art");
+  }
+
+  function scheduleHtPreview() {
+    if (!htPanelWantOpen) return;
+    if (!$("#htPanel") || $("#htPanel").hidden) return;
+    if (!job.file_path && !job.vector_svg) {
+      const hint = $("#htHint");
+      if (hint) hint.textContent = "Drop art first, then preview styles.";
+      return;
+    }
+    if (htPreviewTimer) clearTimeout(htPreviewTimer);
+    htPreviewTimer = setTimeout(runHtPreview, 350);
+  }
+
+  async function runHtPreview() {
+    const hint = $("#htHint");
+    const frame = $("#htPreviewFrame");
+    const seq = ++htPreviewSeq;
+    try {
+      if (frame) {
+        frame.hidden = false;
+        frame.classList.add("is-loading");
+      }
+      if (hint) hint.textContent = "Updating preview…";
+      await ensurePngArtwork(job);
+      if (seq !== htPreviewSeq) return;
+      const data = await api("/api/jobs/" + job.id + "/halftone/preview", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(htPayload()),
+      });
+      if (seq !== htPreviewSeq) return;
+      if (data && data.svg) showHtPreviewSvg(data.svg);
+      const meta = (data && data.meta) || {};
+      if (hint) {
+        hint.textContent = "Preview · " + (meta.styleName || htStyle) + " · " + (meta.elements || "?") +
+          " marks · Apply to commit";
+      }
+    } catch (err) {
+      if (seq !== htPreviewSeq) return;
+      if (frame) frame.classList.remove("is-loading");
+      if (hint) hint.textContent = (err && err.message) || "Preview failed — try Apply or re-drop art.";
+    }
+  }
+
   function renderHtStyles() {
     const box = $("#htStyles");
     if (!box) return;
     box.innerHTML = HALFTONE_STYLES.map((s) => {
       const on = s.id === htStyle ? " on" : "";
-      return `<button type="button" class="ht-style${on}" data-ht="${escapeHtml(s.id)}" role="option" aria-selected="${s.id === htStyle ? "true" : "false"}">${escapeHtml(s.name)}</button>`;
+      return '<button type="button" class="ht-style' + on + '" data-ht="' + escapeHtml(s.id) +
+        '" role="option" aria-selected="' + (s.id === htStyle ? "true" : "false") +
+        '" title="' + escapeHtml(s.name) + '"><span class="ht-thumb-wrap">' + htThumbSvg(s) +
+        '</span><span class="ht-style-name">' + escapeHtml(s.name) + "</span></button>";
     }).join("");
     box.querySelectorAll("[data-ht]").forEach((b) => {
       b.onclick = () => {
@@ -1156,9 +1336,11 @@ async function fillArt(el, job, shopControls) {
           const con = $("#htContrast"); if (con) con.value = def.contrast;
         }
         renderHtStyles();
+        scheduleHtPreview();
       };
     });
   }
+
   const htBtn = $("#halftoneBtn");
   const htPanel = $("#htPanel");
   if (htBtn && htPanel) {
@@ -1170,14 +1352,36 @@ async function fillArt(el, job, shopControls) {
       const col = $("#htColor"); if (col && job.halftone.color) col.value = job.halftone.color;
       const ko = $("#htKnockout"); if (ko) ko.checked = !!job.halftone.knockout;
       const hint = $("#htHint");
-      if (hint) hint.textContent = "Last · " + (job.halftone.styleName || job.halftone.style) + " · " + (job.halftone.elements || "?") + " marks";
+      if (hint) hint.textContent = "Last · " + (job.halftone.styleName || job.halftone.style) + " · " + (job.halftone.elements || "?") + " marks · tweak for live preview";
     }
+    function bindHtParamListeners() {
+      ["htLpi", "htAngle", "htContrast", "htColor", "htKnockout"].forEach((id) => {
+        const el = $("#" + id);
+        if (!el || el._htBound) return;
+        el._htBound = true;
+        const ev = id === "htColor" || id === "htKnockout" ? "change" : "input";
+        el.addEventListener(ev, () => scheduleHtPreview());
+        if (id !== "htColor" && id !== "htKnockout") el.addEventListener("change", () => scheduleHtPreview());
+      });
+    }
+    bindHtParamListeners();
+
     htBtn.onclick = () => {
       htPanel.hidden = !htPanel.hidden;
-      if (!htPanel.hidden) renderHtStyles();
+      htPanelWantOpen = !htPanel.hidden;
+      if (!htPanel.hidden) {
+        renderHtStyles();
+        scheduleHtPreview();
+      } else {
+        clearHtPreview();
+      }
     };
     const htCancel = $("#htCancel");
-    if (htCancel) htCancel.onclick = () => { htPanel.hidden = true; };
+    if (htCancel) htCancel.onclick = () => {
+      htPanel.hidden = true;
+      htPanelWantOpen = false;
+      clearHtPreview();
+    };
     const htApply = $("#htApply");
     if (htApply) htApply.onclick = async () => {
       const errEl = $("#err");
@@ -1188,30 +1392,29 @@ async function fillArt(el, job, shopControls) {
         showArtWorking("Halftone…");
         if (hint) hint.textContent = "Building vector halftone…";
         await ensurePngArtwork(job);
-        const payload = {
-          style: htStyle,
-          lpi: Number($("#htLpi") && $("#htLpi").value) || undefined,
-          angle: Number($("#htAngle") && $("#htAngle").value),
-          contrast: Number($("#htContrast") && $("#htContrast").value) || 1,
-          color: ($("#htColor") && $("#htColor").value) || "#000000",
-          knockout: !!($("#htKnockout") && $("#htKnockout").checked),
-        };
         const data = await api("/api/jobs/" + job.id + "/halftone", {
           method: "POST",
           headers: { "Content-Type": "application/json" },
-          body: JSON.stringify(payload),
+          body: JSON.stringify(htPayload()),
         });
         const meta = (data && data.meta) || {};
         if (errEl) errEl.textContent = "Halftone · " + (meta.styleName || htStyle) + " · " + (meta.elements || "") + " vector marks";
+        htPanelWantOpen = true;
+        if (hint) hint.textContent = "Applied · " + (meta.styleName || htStyle) + " · " + (meta.elements || "") + " marks — panel stays open to tweak";
         renderJob(job.id);
       } catch (err) {
         hideArtWorking();
         if (errEl) errEl.textContent = (err && err.message) || shopHttpError(err && err.status, null, "Halftone failed");
-        if (hint) hint.textContent = "Pick a shop style, then Apply. Output is real vector SVG.";
+        if (hint) hint.textContent = "Live preview on the art · Apply commits real vector SVG.";
         htApply.disabled = false;
         htBtn.disabled = false;
       }
     };
+
+    if (htPanelWantOpen) {
+      htPanel.hidden = false;
+      scheduleHtPreview();
+    }
   }
 
   const ig = $("#imagineGo");

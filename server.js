@@ -1337,6 +1337,47 @@ async function handleApi(req, res, url) {
   if (htStyles) {
     return json(res, 200, { styles: vectorHalftone.listStyles() });
   }
+  const htPreview = pth.match(/^\/api\/jobs\/([^/]+)\/halftone\/preview$/);
+  if (htPreview && method === "POST") {
+    if (!canRunFloor(user)) return json(res, 403, { error: "Shop login required" });
+    const job = db.jobs.find(function (j) { return j.id === htPreview[1] && j.shop_id === user.shop_id; });
+    if (!job) return json(res, 404, { error: "Job not found" });
+    if (!job.file_path) return json(res, 400, { error: "Artwork required for halftone" });
+    const body = parseJsonBody(await readBody(req));
+    const styleId = String(body.style || "classic-round");
+    if (!vectorHalftone.resolveStyle(styleId)) {
+      return json(res, 400, { error: "Unknown halftone style. Use GET /api/halftone/styles." });
+    }
+    const abs = path.join(UPLOADS, path.basename(job.file_path));
+    if (!fs.existsSync(abs)) return json(res, 404, { error: "Artwork missing" });
+    let srcBuf = fs.readFileSync(abs);
+    if (srcBuf[0] !== 0x89 || srcBuf[1] !== 0x50) {
+      try {
+        srcBuf = vaiTrace.decodeRasterToPng(srcBuf);
+      } catch (convErr) {
+        return json(res, 400, { error: "Could not convert art to PNG for halftone — export a PNG and drop that" });
+      }
+    }
+    try {
+      const packed = vectorHalftone.halftoneToSvg(srcBuf, {
+        style: styleId,
+        lpi: body.lpi,
+        angle: body.angle,
+        contrast: body.contrast,
+        color: body.color || "#000000",
+        knockout: !!(body.knockout || body.knockoutWhite || body.whiteBg),
+        widthIn: job.width_in || 10,
+        heightIn: job.height_in || job.width_in || 10,
+        preview: true,
+        previewPlate: true,
+        maxEdge: body.maxEdge,
+        maxCells: body.maxCells,
+      });
+      return json(res, 200, { svg: packed.svg, meta: packed.meta });
+    } catch (err) {
+      return json(res, 400, { error: clientFacingError(err, "Could not preview halftone") });
+    }
+  }
   const htJob = pth.match(/^\/api\/jobs\/([^/]+)\/halftone$/);
   if (htJob && method === "POST") {
     if (!canRunFloor(user)) return json(res, 403, { error: "Shop login required" });
