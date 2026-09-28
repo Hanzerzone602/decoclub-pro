@@ -40,21 +40,61 @@ const PLACES = [
   { id: "youth", label: "Youth chest" },
 ];
 
+/** Map HTTP failures to shop-floor language (avoid bare "Server error" / raw codes). */
+function shopHttpError(status, data, fallback) {
+  const serverMsg = (data && data.error) ? String(data.error) : "";
+  const hint = (data && data.hint) ? String(data.hint) : "";
+  const usable = serverMsg && serverMsg !== "Server error" && serverMsg !== "Request failed";
+  if (status === 413) {
+    if (usable) return hint ? (serverMsg.replace(/\.\s*$/, "") + ". " + hint) : serverMsg;
+    return "File too large for Vectorize. Export a smaller PNG and try again.";
+  }
+  if (status === 429) {
+    return usable ? serverMsg : "Too many tries. Wait a minute and try again.";
+  }
+  if (status === 408 || status === 504) {
+    return usable ? serverMsg : "That took too long. Try again with a smaller PNG.";
+  }
+  if (status === 401 || status === 403) {
+    return usable ? serverMsg : "Sign in again to continue.";
+  }
+  if (usable) return serverMsg;
+  if (status >= 500) return "Studio hiccup. Try again in a moment — if it keeps happening, use a smaller PNG.";
+  return fallback || "Request failed";
+}
 async function api(url, opts = {}) {
   opts = Object.assign({ credentials: "include" }, opts);
-  const res = await fetch(url, opts);
+  let res;
+  try {
+    res = await fetch(url, opts);
+  } catch (e) {
+    const err = new Error("Network stalled. Check your connection and try again.");
+    err.code = "NETWORK";
+    throw err;
+  }
   const data = await res.json().catch(() => ({}));
-  if (!res.ok) throw new Error(data.error || "Request failed");
+  if (!res.ok) {
+    const err = new Error(shopHttpError(res.status, data, "Request failed"));
+    err.status = res.status;
+    if (res.status === 413) err.code = "PAYLOAD_TOO_LARGE";
+    else if (res.status === 429) err.code = "RATE_LIMIT";
+    throw err;
+  }
   return data;
 }
 function money(n) { return "$" + Number(n || 0).toFixed(2); }
 function escapeHtml(s) { return String(s || "").replace(/[&<>"']/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c])); }
 
 function showArtWorking(label) {
-  const drop = document.getElementById("artDrop");
+  const drop = document.getElementById("artDrop") || document.getElementById("makeDrop");
+  const makeErr = document.getElementById("makeErr");
+  if (makeErr && !document.getElementById("artDrop")) {
+    makeErr.textContent = label || "Working";
+  }
   if (!drop) return;
   let ov = document.getElementById("artWorking");
-  if (!ov) {
+  if (!ov || ov.parentElement !== drop) {
+    if (ov && ov.parentElement) ov.parentElement.removeChild(ov);
     ov = document.createElement("div");
     ov.id = "artWorking";
     ov.className = "art-working";
@@ -69,6 +109,10 @@ function showArtWorking(label) {
 function hideArtWorking() {
   const ov = document.getElementById("artWorking");
   if (ov) ov.hidden = true;
+  const makeErr = document.getElementById("makeErr");
+  if (makeErr && makeErr.textContent && /^(Uploading|Preparing|Working)/.test(makeErr.textContent)) {
+    makeErr.textContent = "";
+  }
 }
 
 /** Press-floor run-risk from layer count / alignment. Shop language only — never engine ids. */
@@ -175,12 +219,28 @@ async function boot() {
   const s = await api("/api/shop");
   shop = s.shop;
   cfg.billing = s.billing;
-  $("#who").textContent = user.name + " · " + user.role + " · " + user.plan + (entitled() ? "" : " · trial");
+  const whoEl = $("#who");
+  const logoutBtn = $("#logout");
+  if (user && user.name) {
+    let whoLine = user.name + " · " + user.role + " · " + user.plan;
+    if (!entitled() && user.plan !== "trial") whoLine += " · trial";
+    if (whoEl) whoEl.textContent = whoLine;
+    if (logoutBtn) {
+      logoutBtn.hidden = false;
+      logoutBtn.style.display = "";
+      logoutBtn.onclick = async () => { await api("/api/logout", { method: "POST" }); location.href = "/"; };
+    }
+  } else {
+    if (whoEl) whoEl.textContent = "";
+    if (logoutBtn) {
+      logoutBtn.hidden = true;
+      logoutBtn.onclick = null;
+    }
+  }
   if (shop) {
     $("#sideName").textContent = shop.name;
     if (shop.logo_path) $("#sideLogo").src = shop.logo_path;
   }
-  $("#logout").onclick = async () => { await api("/api/logout", { method: "POST" }); location.href = "/"; };
   const startMethod = consumeStartMethod();
   if (startMethod) makeMethod = startMethod;
   if (!canFloor()) view = "board";
@@ -259,17 +319,84 @@ function mustConvertToPng(file) {
   return typ === "image/jpeg" || typ === "image/jpg" || typ === "image/webp" || typ === "image/bmp" ||
     /\.(jpe?g|webp|bmp)$/i.test(n);
 }
+/** XHR upload with progress + timeout (fetch has no upload progress). */
+function uploadWithProgress(url, formData, opts) {
+  opts = opts || {};
+  const timeoutMs = opts.timeoutMs != null ? opts.timeoutMs : 120000;
+  const onProgress = typeof opts.onProgress === "function" ? opts.onProgress : null;
+  return new Promise((resolve, reject) => {
+    const xhr = new XMLHttpRequest();
+    let settled = false;
+    const timer = setTimeout(() => {
+      if (settled) return;
+      settled = true;
+      try { xhr.abort(); } catch (e) {}
+      const err = new Error("Upload timed out. Check your connection and try again.");
+      err.code = "UPLOAD_TIMEOUT";
+      reject(err);
+    }, timeoutMs);
+    xhr.open("POST", url);
+    xhr.withCredentials = true;
+    xhr.upload.onprogress = (ev) => {
+      if (!onProgress || !ev.lengthComputable) {
+        if (onProgress) onProgress(null);
+        return;
+      }
+      const pct = Math.max(0, Math.min(100, Math.round((ev.loaded / ev.total) * 100)));
+      onProgress(pct);
+    };
+    xhr.onerror = () => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timer);
+      const err = new Error("Network stalled. Check your connection and try again.");
+      err.code = "NETWORK";
+      reject(err);
+    };
+    xhr.onabort = () => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timer);
+      const err = new Error("Upload timed out. Check your connection and try again.");
+      err.code = "UPLOAD_TIMEOUT";
+      reject(err);
+    };
+    xhr.onload = () => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timer);
+      let data = {};
+      try { data = JSON.parse(xhr.responseText || "{}"); } catch (e) { data = {}; }
+      resolve({ ok: xhr.status >= 200 && xhr.status < 300, status: xhr.status, data: data });
+    };
+    xhr.send(formData);
+  });
+}
+function showUploadRetry(errEl, message, onRetry) {
+  if (!errEl) return;
+  errEl.textContent = "";
+  errEl.appendChild(document.createTextNode(message + " "));
+  if (typeof onRetry === "function") {
+    const btn = document.createElement("button");
+    btn.type = "button";
+    btn.className = "btn ghost small";
+    btn.textContent = "Retry";
+    btn.onclick = () => { errEl.textContent = ""; onRetry(); };
+    errEl.appendChild(btn);
+  }
+}
+
 async function fileToPng(file) {
   if (!file) return file;
   const n = file.name || "";
   const typ = file.type || "";
-  if (typ === "image/png" || /\.png$/i.test(n)) return file;
   if (typ === "application/pdf" || /\.pdf$/i.test(n)) throw new Error("Export the PDF as PNG or JPG first");
+  // Always normalize (incl. large Dirt-Devils-style PNGs) to max-2400 PNG before POST.
   try {
-    return await rasterToPngFile(file, n);
+    return await rasterToPngFile(file, n || "art.png");
   } catch (err) {
-    if (mustConvertToPng(file)) {
-      throw new Error("Could not convert that JPEG/WebP/BMP to PNG. Export a PNG from your design app and drop that.");
+    if (mustConvertToPng(file) || typ === "image/png" || /\.png$/i.test(n)) {
+      throw new Error("Could not prepare that artwork as PNG. Export a PNG from your design app and drop that.");
     }
     return file;
   }
@@ -282,27 +409,49 @@ async function ensurePngArtwork(job) {
   const fd = new FormData();
   fd.append("artwork", file);
   fd.append("remove_bg", "0");
-  const res = await fetch("/api/jobs/" + job.id + "/artwork", { method: "POST", credentials: "include", body: fd });
-  const data = await res.json().catch(() => ({}));
-  if (!res.ok) throw new Error(data.error || "Could not convert artwork");
-  return data.job || job;
+  showArtWorking("Uploading…");
+  try {
+    const res = await uploadWithProgress("/api/jobs/" + job.id + "/artwork", fd, {
+      onProgress: (pct) => showArtWorking(pct == null ? "Uploading…" : ("Uploading " + pct + "%…")),
+    });
+    if (!res.ok) throw new Error(shopHttpError(res.status, res.data, "Could not convert artwork"));
+    return res.data.job || job;
+  } finally {
+    hideArtWorking();
+  }
 }
 async function startJobFromFile(file, method) {
   if (!file) throw new Error("Pick a file first.");
-  file = await fileToPng(file);
-  const fd = new FormData();
-  fd.append("title", titleFromFile(file));
-  fd.append("method", METHODS.indexOf(method) !== -1 ? method : "apparel");
-  fd.append("width_in", "10");
-  fd.append("height_in", "10");
-  fd.append("qty", "1");
-  const rm = document.getElementById("rmbg");
-  fd.append("remove_bg", !rm || rm.checked ? "1" : "0");
-  fd.append("artwork", file);
-  const res = await fetch("/api/jobs", { method: "POST", credentials: "include", body: fd });
-  const data = await res.json().catch(() => ({}));
-  if (!res.ok) throw new Error(data.error || "Could not start");
-  openJob(data.job.id, "art");
+  const lastFile = file;
+  const lastMethod = method;
+  showArtWorking("Preparing art…");
+  try {
+    file = await fileToPng(file);
+    const fd = new FormData();
+    fd.append("title", titleFromFile(file));
+    fd.append("method", METHODS.indexOf(method) !== -1 ? method : "apparel");
+    fd.append("width_in", "10");
+    fd.append("height_in", "10");
+    fd.append("qty", "1");
+    const rm = document.getElementById("rmbg");
+    fd.append("remove_bg", !rm || rm.checked ? "1" : "0");
+    fd.append("artwork", file);
+    showArtWorking("Uploading…");
+    const res = await uploadWithProgress("/api/jobs", fd, {
+      onProgress: (pct) => showArtWorking(pct == null ? "Uploading…" : ("Uploading " + pct + "%…")),
+    });
+    if (!res.ok) throw new Error(shopHttpError(res.status, res.data, "Could not start"));
+    hideArtWorking();
+    openJob(res.data.job.id, "art");
+  } catch (err) {
+    hideArtWorking();
+    const box = document.getElementById("makeErr") || document.getElementById("err");
+    if (box && (err.code === "UPLOAD_TIMEOUT" || err.code === "NETWORK")) {
+      showUploadRetry(box, err.message || "Upload failed.", () => startJobFromFile(lastFile, lastMethod));
+      return;
+    }
+    throw err;
+  }
 }
 
 function processTileInner(m) {
@@ -692,8 +841,28 @@ async function fillArt(el, job, shopControls) {
         ${runRiskHtml(job)}
         <div class="art-actions">
           <button class="btn primary" id="vectorizeBtn" type="button">Vectorize</button>
+          <button class="btn primary" id="halftoneBtn" type="button" title="Real vector half-tones for DTF / screen / print">Halftones</button>
           <button class="btn ghost" id="greyBtn" type="button">Hi-res greyscale</button>
           <button class="btn ghost" id="invertBtn" type="button">Invert black &amp; white</button>
+        </div>
+        <div class="ht-panel" id="htPanel" hidden>
+          <div class="ht-panel-head">
+            <strong>Vector Halftones</strong>
+            <span class="muted">Real SVG dots / lines · DTF &amp; screen</span>
+          </div>
+          <div class="ht-styles" id="htStyles" role="listbox" aria-label="Halftone styles"></div>
+          <div class="ht-params">
+            <label>LPI <input type="number" id="htLpi" min="8" max="120" step="1" value="45" title="Lines per inch" /></label>
+            <label>Angle <input type="number" id="htAngle" min="0" max="90" step="1" value="45" title="Screen angle degrees" /></label>
+            <label>Contrast <input type="number" id="htContrast" min="0.25" max="2.5" step="0.05" value="1" title="Dot gain / punch" /></label>
+            <label>Ink <input type="color" id="htColor" value="#000000" title="Ink color" /></label>
+            <label class="ht-ko"><input type="checkbox" id="htKnockout" /> White knockout</label>
+          </div>
+          <div class="ht-actions">
+            <button class="btn primary" type="button" id="htApply">Apply halftone</button>
+            <button class="btn ghost" type="button" id="htCancel">Close</button>
+          </div>
+          <p class="muted ht-hint" id="htHint">Pick a shop style, then Apply. Output is real vector SVG.</p>
         </div>
         <p class="muted">Best on clean Canva / shop logos (smooth SVG/EPS for Corel). Soft junk JPEGs and busy posters improve, but are not Vectorizer.AI-class yet.</p>
         <div class="vz-options" id="vzOptions">
@@ -815,18 +984,33 @@ async function fillArt(el, job, shopControls) {
 
   async function uploadArtwork(file) {
     if (!file) return;
+    const lastFile = file;
+    const errEl = $("#err");
     try {
+      if (errEl) errEl.textContent = "";
+      showArtWorking("Preparing art…");
       file = await fileToPng(file);
       const fd = new FormData();
       fd.append("artwork", file);
       const rm = document.getElementById("rmbg");
       fd.append("remove_bg", !rm || rm.checked ? "1" : "0");
-      const res = await fetch("/api/jobs/" + job.id + "/artwork", { method: "POST", credentials: "include", body: fd });
-      const data = await res.json().catch(() => ({}));
-      if (!res.ok) { $("#err").textContent = data.error || "Could not upload artwork"; return; }
+      showArtWorking("Uploading…");
+      const res = await uploadWithProgress("/api/jobs/" + job.id + "/artwork", fd, {
+        onProgress: (pct) => showArtWorking(pct == null ? "Uploading…" : ("Uploading " + pct + "%…")),
+      });
+      hideArtWorking();
+      if (!res.ok) {
+        if (errEl) errEl.textContent = shopHttpError(res.status, res.data, "Could not upload artwork");
+        return;
+      }
       renderJob(job.id);
     } catch (err) {
-      $("#err").textContent = err.message;
+      hideArtWorking();
+      if (errEl && (err.code === "UPLOAD_TIMEOUT" || err.code === "NETWORK")) {
+        showUploadRetry(errEl, err.message || "Upload failed.", () => uploadArtwork(lastFile));
+        return;
+      }
+      if (errEl) errEl.textContent = err.message || "Could not upload artwork";
     }
   }
   const artFile = $("#artFile");
@@ -927,6 +1111,109 @@ async function fillArt(el, job, shopControls) {
       invertBtn.textContent = "Invert black & white";
     }
   };
+  // --- Vector Halftones (real SVG paths / circles) ---
+  const HALFTONE_STYLES = [
+    { id: "classic-round", name: "Classic Round", lpi: 45, angle: 45, contrast: 1 },
+    { id: "elliptical", name: "Elliptical", lpi: 45, angle: 45, contrast: 1 },
+    { id: "line", name: "Line", lpi: 40, angle: 45, contrast: 1 },
+    { id: "crosshatch", name: "Crosshatch", lpi: 35, angle: 45, contrast: 1 },
+    { id: "diamond", name: "Diamond", lpi: 45, angle: 45, contrast: 1 },
+    { id: "square", name: "Square", lpi: 45, angle: 45, contrast: 1 },
+    { id: "stochastic", name: "Stochastic / FM", lpi: 60, angle: 0, contrast: 1 },
+    { id: "coarse-spot", name: "Coarse Spot", lpi: 22, angle: 45, contrast: 1.1 },
+    { id: "fine-spot", name: "Fine Spot", lpi: 65, angle: 45, contrast: 0.95 },
+    { id: "dual-tone", name: "Dual Tone", lpi: 40, angle: 45, contrast: 1 },
+    { id: "soft-fade", name: "Soft Fade", lpi: 45, angle: 45, contrast: 0.65 },
+    { id: "hard-punch", name: "Hard Punch", lpi: 40, angle: 45, contrast: 1.55 },
+    { id: "newspaper", name: "Newspaper", lpi: 28, angle: 45, contrast: 1.15 },
+    { id: "comic-dot", name: "Comic Dot", lpi: 18, angle: 0, contrast: 1.25 },
+    { id: "cmyk-cyan", name: "CMYK Cyan angle", lpi: 45, angle: 15, contrast: 1 },
+    { id: "cmyk-magenta", name: "CMYK Magenta angle", lpi: 45, angle: 75, contrast: 1 },
+    { id: "cmyk-yellow", name: "CMYK Yellow angle", lpi: 45, angle: 0, contrast: 1 },
+    { id: "cmyk-black", name: "CMYK Black angle", lpi: 45, angle: 45, contrast: 1 },
+    { id: "horizontal-line", name: "Horizontal Line", lpi: 40, angle: 0, contrast: 1 },
+    { id: "vertical-line", name: "Vertical Line", lpi: 40, angle: 90, contrast: 1 },
+    { id: "mesh", name: "Mesh / Wire", lpi: 30, angle: 0, contrast: 1 },
+    { id: "triangle", name: "Triangle Spot", lpi: 40, angle: 30, contrast: 1 },
+    { id: "hex-spot", name: "Hex Spot", lpi: 38, angle: 30, contrast: 1 },
+    { id: "grain", name: "Grain / Mezzotint", lpi: 55, angle: 0, contrast: 1.1 },
+  ];
+  let htStyle = (job.halftone && job.halftone.style) || "classic-round";
+  function renderHtStyles() {
+    const box = $("#htStyles");
+    if (!box) return;
+    box.innerHTML = HALFTONE_STYLES.map((s) => {
+      const on = s.id === htStyle ? " on" : "";
+      return `<button type="button" class="ht-style${on}" data-ht="${escapeHtml(s.id)}" role="option" aria-selected="${s.id === htStyle ? "true" : "false"}">${escapeHtml(s.name)}</button>`;
+    }).join("");
+    box.querySelectorAll("[data-ht]").forEach((b) => {
+      b.onclick = () => {
+        htStyle = b.dataset.ht;
+        const def = HALFTONE_STYLES.find((x) => x.id === htStyle);
+        if (def) {
+          const lpi = $("#htLpi"); if (lpi) lpi.value = def.lpi;
+          const ang = $("#htAngle"); if (ang) ang.value = def.angle;
+          const con = $("#htContrast"); if (con) con.value = def.contrast;
+        }
+        renderHtStyles();
+      };
+    });
+  }
+  const htBtn = $("#halftoneBtn");
+  const htPanel = $("#htPanel");
+  if (htBtn && htPanel) {
+    renderHtStyles();
+    if (job.halftone) {
+      const lpi = $("#htLpi"); if (lpi && job.halftone.lpi != null) lpi.value = job.halftone.lpi;
+      const ang = $("#htAngle"); if (ang && job.halftone.angle != null) ang.value = job.halftone.angle;
+      const con = $("#htContrast"); if (con && job.halftone.contrast != null) con.value = job.halftone.contrast;
+      const col = $("#htColor"); if (col && job.halftone.color) col.value = job.halftone.color;
+      const ko = $("#htKnockout"); if (ko) ko.checked = !!job.halftone.knockout;
+      const hint = $("#htHint");
+      if (hint) hint.textContent = "Last · " + (job.halftone.styleName || job.halftone.style) + " · " + (job.halftone.elements || "?") + " marks";
+    }
+    htBtn.onclick = () => {
+      htPanel.hidden = !htPanel.hidden;
+      if (!htPanel.hidden) renderHtStyles();
+    };
+    const htCancel = $("#htCancel");
+    if (htCancel) htCancel.onclick = () => { htPanel.hidden = true; };
+    const htApply = $("#htApply");
+    if (htApply) htApply.onclick = async () => {
+      const errEl = $("#err");
+      const hint = $("#htHint");
+      try {
+        htApply.disabled = true;
+        htBtn.disabled = true;
+        showArtWorking("Halftone…");
+        if (hint) hint.textContent = "Building vector halftone…";
+        await ensurePngArtwork(job);
+        const payload = {
+          style: htStyle,
+          lpi: Number($("#htLpi") && $("#htLpi").value) || undefined,
+          angle: Number($("#htAngle") && $("#htAngle").value),
+          contrast: Number($("#htContrast") && $("#htContrast").value) || 1,
+          color: ($("#htColor") && $("#htColor").value) || "#000000",
+          knockout: !!($("#htKnockout") && $("#htKnockout").checked),
+        };
+        const data = await api("/api/jobs/" + job.id + "/halftone", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify(payload),
+        });
+        const meta = (data && data.meta) || {};
+        if (errEl) errEl.textContent = "Halftone · " + (meta.styleName || htStyle) + " · " + (meta.elements || "") + " vector marks";
+        renderJob(job.id);
+      } catch (err) {
+        hideArtWorking();
+        if (errEl) errEl.textContent = (err && err.message) || shopHttpError(err && err.status, null, "Halftone failed");
+        if (hint) hint.textContent = "Pick a shop style, then Apply. Output is real vector SVG.";
+        htApply.disabled = false;
+        htBtn.disabled = false;
+      }
+    };
+  }
+
   const ig = $("#imagineGo");
   if (ig) ig.onclick = async () => {
     const prompt = ($("#imaginePrompt") && $("#imaginePrompt").value || "").trim();
@@ -986,12 +1273,20 @@ async function fillArt(el, job, shopControls) {
   const vz = $("#vectorizeBtn");
   if (vz) vz.onclick = async () => {
     try { await runVectorize(); }
-    catch (err) { hideArtWorking(); const e = $("#err"); if (e) e.textContent = err.message; }
+    catch (err) {
+      hideArtWorking();
+      const e = $("#err");
+      if (e) e.textContent = (err && err.message) || shopHttpError(err && err.status, null, "Vectorize failed");
+    }
   };
   const pvz = $("#proVectorizeBtn");
   if (pvz) pvz.onclick = async () => {
     try { await runVectorize("vtracer"); }
-    catch (err) { hideArtWorking(); const e = $("#err"); if (e) e.textContent = err.message; }
+    catch (err) {
+      hideArtWorking();
+      const e = $("#err");
+      if (e) e.textContent = (err && err.message) || shopHttpError(err && err.status, null, "Vectorize failed");
+    }
   };
   async function recolorLayer(layer, body) {
     await api("/api/jobs/" + job.id + "/recolor", {

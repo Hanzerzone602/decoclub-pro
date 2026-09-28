@@ -105,9 +105,13 @@ def chroma_of_lab(lab) -> float:
 
 def _is_keyline_ink(c) -> bool:
     """True-black outline, not a chromatic dark fill (Imagine purple stripes)."""
-    if lum(c) >= 42:
-        return False
-    return chroma_of_lab(lab_of_rgb([c])[0]) < 20
+    lv = lum(c)
+    ch = chroma_of_lab(lab_of_rgb([c])[0])
+    if lv < 42 and ch < 20:
+        return True
+    # Cool near-black keylines (Dirt Devils #292b2f lum≈42.9, ch≈3).
+    # Narrow band: do not admit brown/orange darks in the raised ceiling.
+    return lv < 44 and ch < 10
 
 
 def hue_of_lab(lab) -> float:
@@ -932,6 +936,11 @@ def enforce_shared_edges(assign, palette, *, iters: int = 3):
     raster seam (fringe / double outline). After palette flatten we own the
     label map: majority-vote every boundary pixel among its 4-neighbors
     (darker wins ties) so both sides share one polyline when traced.
+
+    Paper counters (eye whites, letter holes) are not overwritten by the ink
+    vote. Light fills may only pull EXTERIOR paper (silhouette hairlines);
+    dark keylines may still tuck into paper. Soft AA that snaps to a wing/sky
+    ink otherwise grows concentric rings into interior paper holes.
     """
     if assign is None or not len(palette):
         return assign
@@ -962,6 +971,7 @@ def enforce_shared_edges(assign, palette, *, iters: int = 3):
         best_score = np.full((h, w), -1e18, dtype=np.float64)
         best_lab = c.copy()
         stack = [c] + list(nbs)
+        ink_pix = c >= 0
         # Unique labels that appear — bound work to palette size
         for lab in range(n_ink):
             cnt = np.zeros((h, w), dtype=np.float32)
@@ -972,19 +982,23 @@ def enforce_shared_edges(assign, palette, *, iters: int = 3):
             if not present.any():
                 continue
             score = cnt * 1000.0 - float(lums[lab])
-            better = differ & present & (score > best_score)
+            # Do not overwrite paper here — paper→ink is gated below.
+            better = differ & ink_pix & present & (score > best_score)
             best_score[better] = score[better]
             best_lab[better] = lab
         # Paper pixels at ink/paper fringe: if neighborhood ink majority exists, pull into that ink
         # (closes 1px hairlines). Only when >=3 of 5 votes are the same ink.
+        # Light fills: exterior paper only (keep eye/counter holes). Dark may tuck anywhere.
         paper = c < 0
         fringe = differ & paper
         if fringe.any():
+            ext = _exterior_paper_mask(out)
             for lab in range(n_ink):
                 cnt = np.zeros((h, w), dtype=np.float32)
                 for plane in stack:
                     cnt += (plane == lab).astype(np.float32)
-                strong = fringe & (cnt >= 3)
+                use = fringe if float(lums[lab]) < 72.0 else (fringe & ext)
+                strong = use & (cnt >= 3)
                 if strong.any():
                     best_lab[strong] = lab
         changed = int((best_lab != c).sum())
@@ -1014,6 +1028,65 @@ def _exterior_paper_mask(assign):
         if lab[y, w - 1] == 1:
             cv2.floodFill(lab, mask, (w - 1, y), 2)
     return lab == 2
+
+
+def protect_interior_light_holes(assign, palette, rgb, paper_rgb):
+    """Punch light-ink islands trapped inside interior paper (eye rings).
+
+    Soft AA midtones near a pupil/keyline can snap to a cool wing/sky ink;
+    shared-edge cleanup then grows concentric rings into eye whites. Any CC
+    that touches exterior/background paper is kept (wings, body flats).
+    """
+    if assign is None or not len(palette) or rgb is None:
+        return assign
+    a = np.asarray(assign, dtype=np.int32).copy()
+    h, w = a.shape
+    if h < 8 or w < 8 or rgb.shape[:2] != (h, w):
+        return a
+    if lum(paper_rgb) < 180:
+        return a
+    ext = _exterior_paper_mask(a)
+    ker = np.ones((3, 3), np.uint8)
+    p_lab = lab_of_rgb([paper_rgb])[0]
+    max_area = int(0.02 * h * w)
+    for i, col in enumerate(palette):
+        if lum(col) < 72.0:
+            continue
+        mask = (a == i).astype(np.uint8)
+        if int(mask.sum()) == 0:
+            continue
+        n, lab, st, _ = cv2.connectedComponentsWithStats(mask, connectivity=4)
+        i_lab = lab_of_rgb([col])[0]
+        for li in range(1, n):
+            area = int(st[li, cv2.CC_STAT_AREA])
+            if area < 6 or area > max_area:
+                continue
+            comp = lab == li
+            dil = cv2.dilate(comp.astype(np.uint8), ker) > 0
+            # Touches exterior paper → silhouette / wing; keep.
+            if bool((dil & ext).any()):
+                continue
+            border = dil & ~comp
+            neigh = a[border]
+            if neigh.size == 0:
+                continue
+            paper_b = float((neigh < 0).mean())
+            dark_b = 0.0
+            for j, cc in enumerate(palette):
+                if lum(cc) < 72.0:
+                    dark_b += float((neigh == j).mean())
+            if paper_b + dark_b < 0.65:
+                continue
+            cols = rgb[comp]
+            step = max(1, len(cols) // 80)
+            sample = cols[::step]
+            labs = lab_of_rgb(sample)
+            dp = float(np.sqrt(((labs - p_lab) ** 2).sum(-1)).mean())
+            di = float(np.sqrt(((labs - i_lab) ** 2).sum(-1)).mean())
+            mean_l = float(np.mean([lum(x) for x in sample]))
+            if mean_l >= 130.0 and (paper_b >= 0.30 or dp <= di + 15.0):
+                a[comp] = -1
+    return a
 
 
 def collapse_aa_rim(assign, palette, *, max_width=1.7):
@@ -10609,6 +10682,8 @@ def vectorize(path: str, inches: float = 10.0, colors=None, mode: str = "auto"):
     mw = max(3.2, 0.008 * max(assign.shape))
     if not keylined:
         assign = enforce_shared_edges(assign, palette, iters=2 if kind == "logo" else 3)
+        if kind == "logo" and lum(paper_rgb) >= 200:
+            assign = protect_interior_light_holes(assign, palette, up, paper_rgb)
         assign = collapse_aa_rim(assign, palette, max_width=mw)
         if kind == "logo":
             assign = split_dark_necks(assign, palette)

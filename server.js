@@ -10,6 +10,7 @@ const { writeMockups, BLANKS, searchBlanks, findBlank, blankPublicUrl } = requir
 const { loadCatalog, findSku, searchCatalog } = require("./lib/catalog");
 const { generateBadgePng } = require("./lib/demoart");
 const { processArtwork } = require("./lib/artops");
+const vectorHalftone = require("./lib/vectorHalftone");
 const { removeBackground } = require("./lib/matte");
 const { imagineConfigured, generateImage } = require("./lib/imagine");
 const { vectorize, svgFromLayers } = require("./lib/vectorize");
@@ -231,6 +232,12 @@ function tryAutoCorelImport(job, filePath, originalName) {
 function applyVectorResult(job, vec, svg) {
   if (!job || !vec) return;
   job.vector = vec;
+  // Ensure engine lands on job.vector.meta for store + QA (vai-trace / invent / etc.).
+  if (job.vector.meta && job.vector.meta.engine) {
+    /* already set by tracer */
+  } else if (job.vector.source) {
+    job.vector.meta = Object.assign({}, job.vector.meta || {}, { engine: String(job.vector.source) });
+  }
   if (job._pendingVzSettings) {
     job.vector.meta = Object.assign({}, job.vector.meta || {}, { settings: job._pendingVzSettings });
   }
@@ -283,7 +290,11 @@ function runVtracerVectorize(job, buf, body) {
   });
   applyVtracerResult(job, result);
   if (job.vector) {
-    job.vector.meta = Object.assign({}, job.vector.meta || {}, { settings: norm._vzSettings });
+    job.vector.meta = Object.assign({}, job.vector.meta || {}, {
+      settings: norm._vzSettings,
+      engine: (job.vector.meta && job.vector.meta.engine) || "vtracer",
+    });
+    if (!job.vector.source) job.vector.source = "vtracer";
   }
   return result;
 }
@@ -444,6 +455,60 @@ function normalizeVectorizeBody(body) {
   });
 }
 
+function attachVzSettings(resultOrJob, body) {
+  const settings = body && body._vzSettings;
+  if (!settings) return;
+  if (resultOrJob && resultOrJob.meta) {
+    resultOrJob.meta = Object.assign({}, resultOrJob.meta, { settings: settings });
+  }
+  if (resultOrJob && resultOrJob.vec) {
+    resultOrJob.vec.meta = Object.assign({}, resultOrJob.vec.meta || {}, { settings: settings });
+  }
+  if (resultOrJob && resultOrJob.vector) {
+    resultOrJob.vector.meta = Object.assign({}, resultOrJob.vector.meta || {}, { settings: settings });
+  }
+}
+
+/** vai-trace without blocking the event loop. Large jobs prefer worker; else async spawn. */
+async function runVaiTraceSafe(buf, job, body, sizeMeta) {
+  const timeoutMs = 180000;
+  const norm = body && body._vzSettings ? body : normalizeVectorizeBody(body || {});
+  const opts = {
+    colors: norm.colors,
+    mode: (norm && norm.mode) || "auto",
+    timeoutMs: timeoutMs,
+    epsilon: norm.epsilon,
+    fitError: norm.fitError,
+    cornerCos: norm.cornerCos,
+  };
+  const info = vectorizeGuard.inspect(buf);
+  const useWorker = !!(sizeMeta && sizeMeta.sizeGuard && sizeMeta.sizeGuard.downscaled) || info.needsDownscale || info.bytes > 6 * 1024 * 1024;
+  let result;
+  if (useWorker) {
+    const msg = await vectorizeInWorker(buf, job.width_in, job.height_in, opts, timeoutMs + 5000, "vai-trace");
+    result = { svg: msg.svg, vec: msg.vec, meta: msg.meta || (msg.vec && msg.vec.meta) || {} };
+  } else {
+    result = await vaiTrace.vectorizeBufferAsync(buf, {
+      widthIn: job.width_in,
+      heightIn: job.height_in,
+      colors: opts.colors,
+      mode: opts.mode,
+      timeoutMs: timeoutMs,
+      epsilon: opts.epsilon,
+      fitError: opts.fitError,
+      cornerCos: opts.cornerCos,
+    });
+  }
+  if (sizeMeta && sizeMeta.sizeGuard) {
+    result.meta = Object.assign({}, result.meta || {}, { sizeGuard: sizeMeta.sizeGuard });
+    if (result.vec) {
+      result.vec.meta = Object.assign({}, result.vec.meta || {}, { sizeGuard: sizeMeta.sizeGuard });
+    }
+  }
+  attachVzSettings(result, norm);
+  return result;
+}
+
 function scheduleVectorize(jobId) {
   /* Upload stays snappy: do NOT auto-vectorize. User clicks Vectorize. */
   return;
@@ -554,9 +619,23 @@ function seedDemoArt() {
   if (!fs.existsSync(pth)) fs.writeFileSync(pth, generateBadgePng());
   return "/uploads/demo-badge.png";
 }
+/** Drop expired session rows (cheap; store stays small). */
+function pruneExpiredSessions(db) {
+  if (!db || !Array.isArray(db.sessions)) return 0;
+  const now = Date.now();
+  const before = db.sessions.length;
+  db.sessions = db.sessions.filter(function (s) {
+    if (!s || !s.expires) return true;
+    const t = Date.parse(s.expires);
+    return !(t && now > t);
+  });
+  return before - db.sessions.length;
+}
 function save(db) {
+  pruneExpiredSessions(db);
   const tmp = DB_PATH + ".tmp." + process.pid + "." + Date.now();
-  fs.writeFileSync(tmp, JSON.stringify(db, null, 2));
+  // Compact JSON (no pretty indent) — smaller/faster writes; parse-compatible with prior stores.
+  fs.writeFileSync(tmp, JSON.stringify(db));
   fs.renameSync(tmp, DB_PATH);
 }
 function load() {
@@ -574,6 +653,7 @@ function load() {
   ensureSettings(db);
   if (JSON.stringify(db.settings) !== before) dirty = true;
   if (ensureAdmin(db)) dirty = true;
+  if (pruneExpiredSessions(db)) dirty = true;
   if (dirty) save(db);
   return db;
 }
@@ -628,7 +708,72 @@ function send(res, code, body, headers) {
   res.end(payload);
 }
 function json(res, code, obj) { send(res, code, JSON.stringify(obj), { "Content-Type": "application/json; charset=utf-8" }); }
-function clientError(err) { return IS_PROD ? "Server error" : (err && err.message) || "Server error"; }
+const SAFE_CLIENT_MSGS = [
+  "File too large",
+  "Artwork required",
+  "Drop artwork first",
+  "Sign in required",
+  "Shop login required",
+  "Invalid email or password",
+  "Account disabled",
+  "Too many sign-in tries. Wait a few minutes.",
+  "Could not vectorize",
+  "Vectorize timed out",
+  "Upload timed out",
+  "Network stalled",
+  "Membership or active trial required. Start free for 7 days, or use Shop / Studio.",
+  "Stitch packets (DST/EXP) and stone maps need a Shop or Studio plan. Vectorize and SVG/EPS stay free on trial.",
+];
+function clientError(err) {
+  const msg = (err && err.message) ? String(err.message) : "";
+  if (!IS_PROD) return msg || "Server error";
+  if (!msg) return "Server error";
+  const lower = msg.toLowerCase();
+  for (let i = 0; i < SAFE_CLIENT_MSGS.length; i++) {
+    if (msg === SAFE_CLIENT_MSGS[i] || lower.indexOf(SAFE_CLIENT_MSGS[i].toLowerCase()) !== -1) return SAFE_CLIENT_MSGS[i];
+  }
+  if (lower.indexOf("timeout") !== -1 || lower.indexOf("timed out") !== -1) return "That took too long. Try again with a smaller PNG.";
+  if (lower.indexOf("too large") !== -1 || lower.indexOf("file too large") !== -1) return "File too large. Export a smaller PNG (max ~18MB) and try again.";
+  if (lower.indexOf("artwork") !== -1 && lower.indexOf("required") !== -1) return "Artwork required";
+  return "Server error";
+}
+function clientFacingError(err, fallback) {
+  const safe = clientError(err);
+  if (safe && safe !== "Server error") return safe;
+  return fallback || safe;
+}
+
+/** Simple in-memory login brute-force guard (per IP). */
+const loginFailByIp = Object.create(null);
+const LOGIN_FAIL_WINDOW_MS = 15 * 60 * 1000;
+const LOGIN_FAIL_MAX = 8;
+function clientIp(req) {
+  const xff = String((req.headers && req.headers["x-forwarded-for"]) || "").split(",")[0].trim();
+  if (xff) return xff;
+  return (req.socket && req.socket.remoteAddress) || "unknown";
+}
+function loginFailRecord(ip) {
+  const now = Date.now();
+  let rec = loginFailByIp[ip];
+  if (!rec || now - rec.start > LOGIN_FAIL_WINDOW_MS) {
+    rec = { start: now, count: 0 };
+    loginFailByIp[ip] = rec;
+  }
+  rec.count += 1;
+  return rec;
+}
+function loginFailClear(ip) {
+  delete loginFailByIp[ip];
+}
+function loginFailBlocked(ip) {
+  const rec = loginFailByIp[ip];
+  if (!rec) return false;
+  if (Date.now() - rec.start > LOGIN_FAIL_WINDOW_MS) {
+    delete loginFailByIp[ip];
+    return false;
+  }
+  return rec.count >= LOGIN_FAIL_MAX;
+}
 function parseCookies(req) {
   const out = {};
   String(req.headers.cookie || "").split(";").forEach(function (p) {
@@ -817,8 +962,9 @@ function presentVzMeta(meta) {
   if (!meta || typeof meta !== "object") return meta;
   const m = Object.assign({}, meta);
   if (m.settings) m.settings = Object.assign({}, m.settings);
+  // Keep engine so live QA can prove vai-trace vs silent vtracer fallback.
+  // Still hide recipe/pipeline internals from client-facing payloads.
   delete m.recipe;
-  delete m.engine;
   delete m.winner;
   delete m.pipeline;
   return m;
@@ -836,7 +982,7 @@ function presentJob(job, req) {
   const copy = Object.assign({}, job);
   copy.proof_url = originOf(req) + "/proof.html?t=" + job.proof_token;
   copy.intake_url = originOf(req) + "/intake.html?t=" + job.proof_token;
-  // Keep settings for shop knobs; never leak recipe/engine ids in API payloads clients render.
+  // Keep settings + engine (QA); strip recipe/pipeline via presentVzMeta.
   if (copy.vector) copy.vector = presentVector(copy.vector);
   return copy;
 }
@@ -928,10 +1074,18 @@ async function handleApi(req, res, url) {
     return json(res, 200, { user: publicUser(u) });
   }
   if (pth === "/api/login" && method === "POST") {
+    const ip = clientIp(req);
+    if (loginFailBlocked(ip)) {
+      return json(res, 429, { error: "Too many sign-in tries. Wait a few minutes." });
+    }
     const body = parseJsonBody(await readBody(req));
     const u = db.users.find(function (x) { return x.email === String(body.email || "").toLowerCase(); });
-    if (!u || !checkPass(body.password || "", u.password_hash)) return json(res, 401, { error: "Invalid email or password" });
+    if (!u || !checkPass(body.password || "", u.password_hash)) {
+      loginFailRecord(ip);
+      return json(res, 401, { error: "Invalid email or password" });
+    }
     if (u.disabled) return json(res, 403, { error: "Account disabled" });
+    loginFailClear(ip);
     if (ensureAdminShop(db, u)) save(db);
     const remember = truthy(body.remember_me);
     const sess = sessionRecord(u.id, remember);
@@ -1179,7 +1333,83 @@ async function handleApi(req, res, url) {
       });
     } catch (err) { return json(res, 400, { error: IS_PROD ? "Could not process artwork" : err.message }); }
   }
-  const imgJob = pth.match(/^\/api\/jobs\/([^/]+)\/imagine$/);
+  const htStyles = pth === "/api/halftone/styles" && method === "GET";
+  if (htStyles) {
+    return json(res, 200, { styles: vectorHalftone.listStyles() });
+  }
+  const htJob = pth.match(/^\/api\/jobs\/([^/]+)\/halftone$/);
+  if (htJob && method === "POST") {
+    if (!canRunFloor(user)) return json(res, 403, { error: "Shop login required" });
+    const job = db.jobs.find(function (j) { return j.id === htJob[1] && j.shop_id === user.shop_id; });
+    if (!job) return json(res, 404, { error: "Job not found" });
+    if (!job.file_path) return json(res, 400, { error: "Artwork required for halftone" });
+    const body = parseJsonBody(await readBody(req));
+    const styleId = String(body.style || "classic-round");
+    if (!vectorHalftone.resolveStyle(styleId)) {
+      return json(res, 400, { error: "Unknown halftone style. Use GET /api/halftone/styles." });
+    }
+    const abs = path.join(UPLOADS, path.basename(job.file_path));
+    if (!fs.existsSync(abs)) return json(res, 404, { error: "Artwork missing" });
+    let srcBuf = fs.readFileSync(abs);
+    if (srcBuf[0] !== 0x89 || srcBuf[1] !== 0x50) {
+      try {
+        srcBuf = vaiTrace.decodeRasterToPng(srcBuf);
+        const converted = Date.now() + "-" + uid() + ".png";
+        fs.writeFileSync(path.join(UPLOADS, converted), srcBuf);
+        job.file_path = "/uploads/" + converted;
+      } catch (convErr) {
+        return json(res, 400, { error: "Could not convert art to PNG for halftone — export a PNG and drop that" });
+      }
+    }
+    try {
+      const packed = vectorHalftone.halftoneToSvg(srcBuf, {
+        style: styleId,
+        lpi: body.lpi,
+        angle: body.angle,
+        contrast: body.contrast,
+        color: body.color || "#000000",
+        knockout: !!(body.knockout || body.knockoutWhite || body.whiteBg),
+        widthIn: job.width_in || 10,
+        heightIn: job.height_in || job.width_in || 10,
+        maxEdge: body.maxEdge,
+      });
+      const svgName = Date.now() + "-" + uid() + "-halftone.svg";
+      fs.writeFileSync(path.join(UPLOADS, svgName), packed.svg);
+      job.vector_svg = "/uploads/" + svgName;
+      delete job.vector_eps;
+      job.vector = {
+        widthIn: packed.widthIn,
+        heightIn: packed.heightIn,
+        layers: packed.layers,
+        source: "vector-halftone",
+        svg: packed.svg,
+        meta: packed.meta,
+      };
+      job.halftone = {
+        style: packed.meta.style,
+        styleName: packed.meta.styleName,
+        lpi: packed.meta.lpi,
+        angle: packed.meta.angle,
+        contrast: packed.meta.contrast,
+        color: packed.meta.color,
+        knockout: packed.meta.knockout,
+        elements: packed.meta.elements,
+        svg: job.vector_svg,
+      };
+      if (STATUSES.indexOf(job.status) < STATUSES.indexOf("art_in")) job.status = "art_in";
+      applyMockup(job);
+      event(db, job, "Halftone · " + packed.meta.styleName + " · " + packed.meta.elements + " marks");
+      save(db);
+      return json(res, 200, {
+        job: presentJob(job, req),
+        halftone: job.halftone,
+        meta: packed.meta,
+      });
+    } catch (err) {
+      return json(res, 400, { error: clientFacingError(err, "Could not build halftone") });
+    }
+  }
+    const imgJob = pth.match(/^\/api\/jobs\/([^/]+)\/imagine$/);
   if (imgJob && method === "POST") {
     if (!canRunFloor(user)) return json(res, 403, { error: "Shop login required" });
     if (!requireProduce(user, res)) return;
@@ -1584,7 +1814,7 @@ async function handleApi(req, res, url) {
         throw bezErr;
       }
     } catch (err) {
-      return json(res, 400, { error: IS_PROD ? "Could not vectorize" : err.message });
+      return json(res, 400, { error: clientFacingError(err, "Could not vectorize") });
     }
   }
   const recPath = pth.match(/^\/api\/jobs\/([^/]+)\/recolor$/);
@@ -2050,16 +2280,29 @@ async function handleApi(req, res, url) {
 function serveStatic(req, res, url) {
   let rel = decodeURIComponent(url.pathname);
   if (rel === "/") rel = "/index.html";
+  // Trailing slash → bare path so /admin/ and /login/ match aliases like /admin and /login.
+  if (rel.length > 1 && rel.charAt(rel.length - 1) === "/") rel = rel.slice(0, -1);
+  const ALIAS = { "/login": "/login.html", "/app": "/app.html", "/admin": "/admin.html", "/signup": "/signup.html", "/start": "/start.html" };
+  if (ALIAS[rel]) rel = ALIAS[rel];
   if (rel.indexOf("/uploads/") === 0) {
     const file = path.join(UPLOADS, path.basename(rel));
     if (!fs.existsSync(file)) return send(res, 404, "Not found");
     const ext = path.extname(file).toLowerCase();
-    return send(res, 200, fs.readFileSync(file), { "Content-Type": MIME[ext] || "application/octet-stream" });
+    return send(res, 200, fs.readFileSync(file), { "Content-Type": MIME[ext] || "application/octet-stream", "Cache-Control": "private, no-store" });
   }
   const file = path.normalize(path.join(PUBLIC, rel));
   if (file.indexOf(PUBLIC) !== 0) return send(res, 403, "Forbidden");
   if (!fs.existsSync(file) || fs.statSync(file).isDirectory()) return send(res, 404, "Not found");
-  send(res, 200, fs.readFileSync(file), { "Content-Type": MIME[path.extname(file).toLowerCase()] || "application/octet-stream" });
+  const ext = path.extname(file).toLowerCase();
+  const headers = { "Content-Type": MIME[ext] || "application/octet-stream" };
+  if (ext === ".html") {
+    headers["Cache-Control"] = "no-cache";
+  } else if (rel === "/brand.jpg" || rel === "/logo.png" || rel === "/logo.svg" || ext === ".css" || ext === ".jpg" || ext === ".jpeg" || ext === ".png" || ext === ".webp" || ext === ".gif" || ext === ".svg") {
+    headers["Cache-Control"] = "public, max-age=86400";
+  } else if (ext === ".js") {
+    headers["Cache-Control"] = "public, max-age=3600";
+  }
+  send(res, 200, fs.readFileSync(file), headers);
 }
 
 const server = http.createServer(async function (req, res) {
