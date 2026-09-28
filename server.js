@@ -2336,12 +2336,10 @@ function serveStatic(req, res, url) {
   if (!fs.existsSync(file) || fs.statSync(file).isDirectory()) return send(res, 404, "Not found");
   const ext = path.extname(file).toLowerCase();
   const headers = { "Content-Type": MIME[ext] || "application/octet-stream" };
-  if (ext === ".html") {
+  if (ext === ".html" || ext === ".js" || ext === ".css") {
     headers["Cache-Control"] = "no-cache";
-  } else if (rel === "/brand.jpg" || rel === "/logo.png" || rel === "/logo.svg" || ext === ".css" || ext === ".jpg" || ext === ".jpeg" || ext === ".png" || ext === ".webp" || ext === ".gif" || ext === ".svg") {
+  } else if (rel === "/brand.jpg" || rel === "/logo.png" || rel === "/logo.svg" || ext === ".jpg" || ext === ".jpeg" || ext === ".png" || ext === ".webp" || ext === ".gif" || ext === ".svg") {
     headers["Cache-Control"] = "public, max-age=86400";
-  } else if (ext === ".js") {
-    headers["Cache-Control"] = "public, max-age=3600";
   }
   send(res, 200, fs.readFileSync(file), headers);
 }
