@@ -534,11 +534,18 @@ th { color: var(--muted); font-weight: 600; font-size: 11px; letter-spacing: .06
 .ht-thumb-wrap {
   display: block;
   width: 100%;
-  min-height: 44px;
+  min-height: 46px;
   border-radius: 5px;
   overflow: hidden;
-  background: #eef1f5;
-  border: 1px solid rgba(0,0,0,0.12);
+  background: #e8ecf2;
+  background-image:
+    linear-gradient(45deg, #d5dbe5 25%, transparent 25%),
+    linear-gradient(-45deg, #d5dbe5 25%, transparent 25%),
+    linear-gradient(45deg, transparent 75%, #d5dbe5 75%),
+    linear-gradient(-45deg, transparent 75%, #d5dbe5 75%);
+  background-size: 8px 8px;
+  background-position: 0 0, 0 4px, 4px -4px, -4px 0;
+  border: 1px solid rgba(0,0,0,0.14);
   line-height: 0;
 }
 .ht-style .ht-thumb,
@@ -551,6 +558,16 @@ th { color: var(--muted); font-weight: 600; font-size: 11px; letter-spacing: .06
   shape-rendering: geometricPrecision;
 }
 .ht-style.on .ht-thumb-wrap { border-color: rgba(255,255,255,0.35); }
+/* ht thumbs always paint */
+.ht-style .ht-thumb-wrap svg,
+.ht-style .ht-thumb { visibility: visible !important; opacity: 1 !important; }
+.ht-styles:empty::before {
+  content: "Loading styles…";
+  display: block;
+  padding: 8px;
+  color: var(--muted);
+  font-size: 12px;
+}
 .ht-style-name {
   display: block;
   padding: 0 2px 2px;

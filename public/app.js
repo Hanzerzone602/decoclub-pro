@@ -1117,7 +1117,7 @@ async function fillArt(el, job, shopControls) {
       invertBtn.textContent = "Invert black & white";
     }
   };
-  // --- Vector Halftones (real SVG paths / circles) ---
+  // --- Vector Halftones (real SVG paths / circles) --- ht-onpoint-v3
   const HALFTONE_STYLES = [
     { id: "classic-round", name: "Classic Round", kind: "am-round", lpi: 45, angle: 45, contrast: 1 },
     { id: "elliptical", name: "Elliptical", kind: "am-ellipse", lpi: 45, angle: 45, contrast: 1 },
@@ -1170,7 +1170,7 @@ async function fillArt(el, job, shopControls) {
           const sw = 0.55 + t * 2.6;
           parts.push('<path d="M ' + (ox - dx * 40).toFixed(1) + " " + (oy - dy * 40).toFixed(1) +
             " L " + (ox + dx * 40).toFixed(1) + " " + (oy + dy * 40).toFixed(1) +
-            '" fill="none" stroke="#000" stroke-width="' + sw.toFixed(2) + '"/>');
+            '" fill="none" stroke="#0a0a0a" stroke-width="' + sw.toFixed(2) + '"/>');
         }
       });
     } else if (kind === "fm" || kind === "grain") {
@@ -1180,7 +1180,7 @@ async function fillArt(el, job, shopControls) {
           const rnd = ((Math.sin(x * 12.9898 + y * 78.233) * 43758.5453) % 1 + 1) % 1;
           if (rnd > t) continue;
           const r = kind === "grain" ? (0.85 + t * 1.7 * rnd) : 1.35;
-          parts.push('<circle cx="' + x.toFixed(1) + '" cy="' + y.toFixed(1) + '" r="' + r.toFixed(2) + '" fill="#000"/>');
+          parts.push('<circle cx="' + x.toFixed(1) + '" cy="' + y.toFixed(1) + '" r="' + r.toFixed(2) + '" fill="#0a0a0a"/>');
         }
       }
     } else {
@@ -1192,14 +1192,14 @@ async function fillArt(el, job, shopControls) {
           if (r < 0.4) continue;
           if (kind === "am-ellipse") {
             parts.push('<ellipse cx="' + x.toFixed(1) + '" cy="' + y.toFixed(1) + '" rx="' + (r * 0.75).toFixed(2) +
-              '" ry="' + (r * 1.15).toFixed(2) + '" transform="rotate(' + ang + " " + x.toFixed(1) + " " + y.toFixed(1) + ')" fill="#000"/>');
+              '" ry="' + (r * 1.15).toFixed(2) + '" transform="rotate(' + ang + " " + x.toFixed(1) + " " + y.toFixed(1) + ')" fill="#0a0a0a"/>');
           } else if (kind === "am-diamond") {
             parts.push('<path d="M ' + x.toFixed(1) + " " + (y - r).toFixed(1) + " L " + (x + r).toFixed(1) + " " + y.toFixed(1) +
-              " L " + x.toFixed(1) + " " + (y + r).toFixed(1) + " L " + (x - r).toFixed(1) + " " + y.toFixed(1) + ' Z" fill="#000"/>');
+              " L " + x.toFixed(1) + " " + (y + r).toFixed(1) + " L " + (x - r).toFixed(1) + " " + y.toFixed(1) + ' Z" fill="#0a0a0a"/>');
           } else if (kind === "am-square") {
             const s = r * 0.85;
             parts.push('<rect x="' + (x - s).toFixed(1) + '" y="' + (y - s).toFixed(1) + '" width="' + (s * 2).toFixed(1) +
-              '" height="' + (s * 2).toFixed(1) + '" transform="rotate(' + ang + " " + x.toFixed(1) + " " + y.toFixed(1) + ')" fill="#000"/>');
+              '" height="' + (s * 2).toFixed(1) + '" transform="rotate(' + ang + " " + x.toFixed(1) + " " + y.toFixed(1) + ')" fill="#0a0a0a"/>');
           } else if (kind === "am-triangle") {
             const a0 = (ang * Math.PI) / 180;
             const pts = [];
@@ -1207,7 +1207,7 @@ async function fillArt(el, job, shopControls) {
               const a = a0 + (i * 2 * Math.PI) / 3 - Math.PI / 2;
               pts.push((x + Math.cos(a) * r).toFixed(1) + "," + (y + Math.sin(a) * r).toFixed(1));
             }
-            parts.push('<polygon points="' + pts.join(" ") + '" fill="#000"/>');
+            parts.push('<polygon points="' + pts.join(" ") + '" fill="#0a0a0a"/>');
           } else if (kind === "am-hex") {
             const a0 = (ang * Math.PI) / 180;
             const pts = [];
@@ -1215,21 +1215,21 @@ async function fillArt(el, job, shopControls) {
               const a = a0 + (i * Math.PI) / 3;
               pts.push((x + Math.cos(a) * r).toFixed(1) + "," + (y + Math.sin(a) * r).toFixed(1));
             }
-            parts.push('<polygon points="' + pts.join(" ") + '" fill="#000"/>');
+            parts.push('<polygon points="' + pts.join(" ") + '" fill="#0a0a0a"/>');
           } else if (kind === "dual") {
-            parts.push('<circle cx="' + x.toFixed(1) + '" cy="' + y.toFixed(1) + '" r="' + r.toFixed(2) + '" fill="#000"/>');
+            parts.push('<circle cx="' + x.toFixed(1) + '" cy="' + y.toFixed(1) + '" r="' + r.toFixed(2) + '" fill="#0a0a0a"/>');
             if (t > 0.45) {
               parts.push('<circle cx="' + (x + pitch * 0.28).toFixed(1) + '" cy="' + (y + pitch * 0.1).toFixed(1) +
-                '" r="' + (r * 0.35).toFixed(2) + '" fill="#000"/>');
+                '" r="' + (r * 0.35).toFixed(2) + '" fill="#0a0a0a"/>');
             }
           } else {
-            parts.push('<circle cx="' + x.toFixed(1) + '" cy="' + y.toFixed(1) + '" r="' + r.toFixed(2) + '" fill="#000"/>');
+            parts.push('<circle cx="' + x.toFixed(1) + '" cy="' + y.toFixed(1) + '" r="' + r.toFixed(2) + '" fill="#0a0a0a"/>');
           }
         }
       }
     }
     return '<svg class="ht-thumb" viewBox="0 0 ' + W + " " + H + '" width="56" height="40" aria-hidden="true">' +
-      '<rect width="' + W + '" height="' + H + '" fill="#eef1f5"/>' + parts.join("") + "</svg>";
+      '<rect width="' + W + '" height="' + H + '" fill="#e8ecf2"/>' + parts.join("") + "</svg>";
   }
 
   function htPayload() {
