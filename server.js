@@ -5,7 +5,7 @@ const path = require("path");
 const crypto = require("crypto");
 const { URL } = require("url");
 const { priceJob, priceQuote } = require("./lib/price");
-const { writeExports, intakePosterSvg } = require("./lib/exports");
+const { writeExports, intakePosterSvg, stripPaperUnderlaySvg } = require("./lib/exports");
 const { writeMockups, BLANKS, searchBlanks, findBlank, blankPublicUrl } = require("./lib/mockup");
 const { loadCatalog, findSku, searchCatalog } = require("./lib/catalog");
 const { generateBadgePng } = require("./lib/demoart");
@@ -176,7 +176,8 @@ function applyUploadMatte(publicPath, fields) {
   const buf = fs.readFileSync(abs);
   if (buf[0] !== 0x89 || buf[1] !== 0x50) return publicPath;
   try {
-    const out = removeBackground(buf);
+    // Professional background removal: try AI rembg, fall back to flood (never silent no-op).
+    const out = removeBackground(buf, { mode: "ai" });
     const name = Date.now() + "-" + uid() + ".png";
     fs.writeFileSync(path.join(UPLOADS, name), out);
     return "/uploads/" + name;
@@ -191,7 +192,7 @@ function saveImaginePng(buf) {
 
 function applyCorelImportResult(job, result) {
   const svgName = Date.now() + "-" + uid() + "-corel.svg";
-  fs.writeFileSync(path.join(UPLOADS, svgName), result.svg);
+  fs.writeFileSync(path.join(UPLOADS, svgName), stripPaperUnderlaySvg(result.svg));
   job.vector_svg = "/uploads/" + svgName;
   delete job.vector_eps;
   job.vector = result.vec;
@@ -204,7 +205,7 @@ function runCorelImportOnJob(job, buf, body) {
   const opts = {
     sizeIn: sizeIn,
     pad: body.pad != null ? Number(body.pad) : 40,
-    paperUnderlay: body.paperUnderlay !== false,
+    paperUnderlay: body.paperUnderlay === true,
   };
   if (body.bbox && body.bbox.minx != null) opts.bbox = body.bbox;
   const result = corelImport.transfer(buf, opts);
@@ -242,7 +243,7 @@ function applyVectorResult(job, vec, svg) {
     job.vector.meta = Object.assign({}, job.vector.meta || {}, { settings: job._pendingVzSettings });
   }
   const name = Date.now() + "-" + uid() + "-vector.svg";
-  fs.writeFileSync(path.join(UPLOADS, name), svg);
+  fs.writeFileSync(path.join(UPLOADS, name), stripPaperUnderlaySvg(svg));
   job.vector_svg = "/uploads/" + name;
   delete job.vector_eps;
 }
@@ -257,7 +258,7 @@ function stampVzSettings(job, body) {
 
 function applyVtracerResult(job, result) {
   const svgName = Date.now() + "-" + uid() + "-vtracer.svg";
-  fs.writeFileSync(path.join(UPLOADS, svgName), result.svg);
+  fs.writeFileSync(path.join(UPLOADS, svgName), stripPaperUnderlaySvg(result.svg));
   job.vector_svg = "/uploads/" + svgName;
   if (result.eps && result.eps.length) {
     const epsName = Date.now() + "-" + uid() + "-vtracer.eps";
@@ -559,7 +560,7 @@ function invertJobVector(job) {
   if (job.vector_svg) {
     const abs = path.join(UPLOADS, path.basename(job.vector_svg));
     if (fs.existsSync(abs)) {
-      const svg = invertSvgMarkup(fs.readFileSync(abs, "utf8"));
+      const svg = stripPaperUnderlaySvg(invertSvgMarkup(fs.readFileSync(abs, "utf8")));
       const name = Date.now() + "-" + uid() + "-vector.svg";
       fs.writeFileSync(path.join(UPLOADS, name), svg);
       job.vector_svg = "/uploads/" + name;
@@ -583,7 +584,7 @@ function rewriteVectorSvg(job) {
   if (job.vector_svg && !vectorHasRealPaths(job.vector)) {
     const abs = path.join(UPLOADS, path.basename(job.vector_svg));
     if (fs.existsSync(abs)) {
-      const svg = fs.readFileSync(abs, "utf8");
+      const svg = stripPaperUnderlaySvg(fs.readFileSync(abs, "utf8"));
       const name = Date.now() + "-" + uid() + "-vector.svg";
       fs.writeFileSync(path.join(UPLOADS, name), svg);
       job.vector_svg = "/uploads/" + name;
@@ -591,7 +592,7 @@ function rewriteVectorSvg(job) {
     }
   }
   if (vectorHasRealPaths(job.vector)) {
-    const svg = svgFromLayers(job.vector.layers, job.vector.widthIn || job.width_in, job.vector.heightIn || job.height_in);
+    const svg = stripPaperUnderlaySvg(svgFromLayers(job.vector.layers, job.vector.widthIn || job.width_in, job.vector.heightIn || job.height_in));
     const name = Date.now() + "-" + uid() + "-vector.svg";
     fs.writeFileSync(path.join(UPLOADS, name), svg);
     job.vector_svg = "/uploads/" + name;
@@ -599,7 +600,7 @@ function rewriteVectorSvg(job) {
     return;
   }
   // File missing and no path data ΓÇö last resort (may be empty)
-  const svg = svgFromLayers(job.vector.layers, job.vector.widthIn || job.width_in, job.vector.heightIn || job.height_in);
+  const svg = stripPaperUnderlaySvg(svgFromLayers(job.vector.layers, job.vector.widthIn || job.width_in, job.vector.heightIn || job.height_in));
   const name = Date.now() + "-" + uid() + "-vector.svg";
   fs.writeFileSync(path.join(UPLOADS, name), svg);
   job.vector_svg = "/uploads/" + name;
@@ -1895,7 +1896,7 @@ async function handleApi(req, res, url) {
         const from = String(prevHex);
         const to = String(body.hex);
         const esc = from.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
-        svg = svg.replace(new RegExp(esc, "gi"), to);
+        svg = stripPaperUnderlaySvg(svg.replace(new RegExp(esc, "gi"), to));
         const name = Date.now() + "-" + uid() + "-vector.svg";
         fs.writeFileSync(path.join(UPLOADS, name), svg);
         job.vector_svg = "/uploads/" + name;
@@ -1988,7 +1989,8 @@ async function handleApi(req, res, url) {
     if (expFile[2] === "art.svg" && job.vector_svg) {
       const abs = path.join(UPLOADS, path.basename(job.vector_svg));
       if (fs.existsSync(abs)) {
-        return download(res, "decoclub-" + job.id.slice(0, 8) + "-art.svg", fs.readFileSync(abs), "image/svg+xml");
+        const svgOut = stripPaperUnderlaySvg(fs.readFileSync(abs, "utf8"));
+        return download(res, "decoclub-" + job.id.slice(0, 8) + "-art.svg", svgOut, "image/svg+xml");
       }
     }
     if (expFile[2] === "art.png" && job.file_path) {
