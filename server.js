@@ -31,6 +31,7 @@ const { stonesForJob } = require("./lib/stones");
 const {
   loadEnvFile, createCheckoutSession, billingConfigured,
   verifyStripeSignature, applyStripeEvent,
+  isHalftoneProduct, isKnownProduct, grantHalftoneCredits, creditsForProduct, PRODUCTS,
 } = require("./lib/stripe");
 
 const ROOT = __dirname;
@@ -80,18 +81,27 @@ function checkPass(pw, stored) {
 function emptyStore() {
   return {
     shops: [], users: [], sessions: [], jobs: [], events: [],
-    settings: { trial_days: 7, shop_price_cents: 7900, studio_price_cents: 14900 },
+    settings: { trial_days: 7, shop_price_cents: 7900, studio_price_cents: 14900, halftone_single_cents: 300, halftone_pack10_cents: 2000 },
   };
 }
 function defaultSettings() {
-  return { trial_days: 7, shop_price_cents: 7900, studio_price_cents: 14900 };
+  return { trial_days: 7, shop_price_cents: 7900, studio_price_cents: 14900, halftone_single_cents: 300, halftone_pack10_cents: 2000 };
 }
 function ensureSettings(db) {
   if (!db.settings) db.settings = defaultSettings();
   if (db.settings.trial_days == null) db.settings.trial_days = 7;
   if (db.settings.shop_price_cents == null) db.settings.shop_price_cents = 7900;
   if (db.settings.studio_price_cents == null) db.settings.studio_price_cents = 14900;
+  if (db.settings.halftone_single_cents == null) db.settings.halftone_single_cents = 300;
+  if (db.settings.halftone_pack10_cents == null) db.settings.halftone_pack10_cents = 2000;
   return db.settings;
+}
+function ensureUserHalftoneCredits(db) {
+  let dirty = false;
+  (db.users || []).forEach(function (u) {
+    if (u && u.halftone_credits == null) { u.halftone_credits = 0; dirty = true; }
+  });
+  return dirty;
 }
 function ensureAdminShop(db, user) {
   if (!user || user.role !== "admin") return false;
@@ -111,7 +121,7 @@ function ensureAdmin(db) {
     db.users.push({
       id: uid(), email: email, name: (email === "davidhanes2@yahoo.com" || email === "david@coreltrainer.com") ? "David Hanes" : "Admin",
       password_hash: hashPass(password), role: "admin", shop_id: null,
-      plan: "studio", plan_expires: null, created_at: now,
+      plan: "studio", plan_expires: null, halftone_credits: 0, created_at: now,
     });
     dirty = true;
   } else {
@@ -150,6 +160,68 @@ function isActiveTrial(user) {
 function canProduce(user) { return isComped(user) || isPaidMember(user) || isActiveTrial(user); }
 
 function canProducePackets(user) { return isComped(user) || isPaidMember(user); }
+
+function isStudioMember(user) {
+  if (!user) return false;
+  if (user.plan !== "studio") return false;
+  if (!user.plan_expires) return true;
+  return Date.parse(user.plan_expires) > Date.now();
+}
+
+/** Halftones Apply included for active Studio membership or admin/comped. */
+function halftoneIncluded(user) {
+  return isComped(user) || isStudioMember(user);
+}
+
+function halftoneCreditBalance(user) {
+  return Math.max(0, Math.floor(Number(user && user.halftone_credits) || 0));
+}
+
+function canApplyHalftone(user) {
+  return !!(user && (halftoneIncluded(user) || halftoneCreditBalance(user) > 0));
+}
+
+function halftoneBuyOptions(settings) {
+  const st = settings || {};
+  return {
+    single: { product: "halftone_single", cents: st.halftone_single_cents != null ? st.halftone_single_cents : 300, credits: 1, label: "$3 per image" },
+    pack10: { product: "halftone_pack10", cents: st.halftone_pack10_cents != null ? st.halftone_pack10_cents : 2000, credits: 10, label: "$20 for 10" },
+  };
+}
+
+function requireHalftoneApply(user, res, settings) {
+  if (canApplyHalftone(user)) return true;
+  json(res, 402, {
+    error: "Halftones Apply needs Studio membership or credits. Preview stays free — buy $3 / image or $20 for 10.",
+    code: "halftone_credits_required",
+    buy: halftoneBuyOptions(settings),
+    halftoneCredits: 0,
+    halftoneIncluded: false,
+  });
+  return false;
+}
+
+/** Decrement one credit when Apply succeeds and user is not Studio/admin. */
+function consumeHalftoneCredit(user) {
+  if (halftoneIncluded(user)) return { ok: true, consumed: false, included: true, remaining: halftoneCreditBalance(user) };
+  const bal = halftoneCreditBalance(user);
+  if (bal < 1) return { ok: false, consumed: false, included: false, remaining: 0 };
+  user.halftone_credits = bal - 1;
+  return { ok: true, consumed: true, included: false, remaining: user.halftone_credits };
+}
+
+function serviceEntitlements(u) {
+  return {
+    vectorize: { entitled: canProduce(u) },
+    digitize: { entitled: canProduce(u) },
+    halftones: {
+      included: halftoneIncluded(u),
+      credits: halftoneCreditBalance(u),
+      canApply: canApplyHalftone(u),
+      canPreview: true,
+    },
+  };
+}
 
 function requireProduce(user, res) {
   if (canProduce(user)) return true;
@@ -653,6 +725,7 @@ function load() {
   const before = JSON.stringify(db.settings || null);
   ensureSettings(db);
   if (JSON.stringify(db.settings) !== before) dirty = true;
+  if (ensureUserHalftoneCredits(db)) dirty = true;
   if (ensureAdmin(db)) dirty = true;
   if (pruneExpiredSessions(db)) dirty = true;
   if (dirty) save(db);
@@ -675,8 +748,8 @@ function seedDemoUsers(db) {
   const now = new Date().toISOString();
   const shopId = uid();
   db.shops.push({ id: shopId, name: "Hearth & Horn Co.", logo_path: null, brand_color: "#017ece", created_at: now, margin_pct: 20 });
-  db.users.push({ id: uid(), email: "owner@anvil.local", name: "Shop Owner", password_hash: hashPass("anvil123"), role: "shop", shop_id: shopId, plan: "studio", plan_expires: null, created_at: now });
-  db.users.push({ id: uid(), email: "client@anvil.local", name: "Jordan Client", password_hash: hashPass("anvil123"), role: "client", shop_id: shopId, plan: "client", plan_expires: null, created_at: now });
+  db.users.push({ id: uid(), email: "owner@anvil.local", name: "Shop Owner", password_hash: hashPass("anvil123"), role: "shop", shop_id: shopId, plan: "studio", plan_expires: null, halftone_credits: 0, created_at: now });
+  db.users.push({ id: uid(), email: "client@anvil.local", name: "Jordan Client", password_hash: hashPass("anvil123"), role: "client", shop_id: shopId, plan: "client", plan_expires: null, halftone_credits: 0, created_at: now });
 }
 function ensureDemoJob(db) {
   if (!allowDemo()) return;
@@ -724,6 +797,7 @@ const SAFE_CLIENT_MSGS = [
   "Network stalled",
   "Membership or active trial required. Start free for 7 days, or use Shop / Studio.",
   "Stitch packets (DST/EXP) and stone maps need a Shop or Studio plan. Vectorize and SVG/EPS stay free on trial.",
+  "Halftones Apply needs Studio membership or credits. Preview stays free — buy $3 / image or $20 for 10.",
 ];
 function clientError(err) {
   const msg = (err && err.message) ? String(err.message) : "";
@@ -793,7 +867,13 @@ function currentUser(req, db) {
 }
 function publicUser(u) {
   if (!u) return null;
-  return { id: u.id, email: u.email, name: u.name, role: u.role, shopId: u.shop_id, plan: u.plan, planExpires: u.plan_expires, entitled: canProduce(u) };
+  return {
+    id: u.id, email: u.email, name: u.name, role: u.role, shopId: u.shop_id,
+    plan: u.plan, planExpires: u.plan_expires, entitled: canProduce(u),
+    halftoneCredits: halftoneCreditBalance(u),
+    halftoneIncluded: halftoneIncluded(u),
+    services: serviceEntitlements(u),
+  };
 }
 function readBody(req) {
   return new Promise(function (resolve, reject) {
@@ -1009,7 +1089,26 @@ async function handleApi(req, res, url) {
   const pth = url.pathname;
 
   if (pth === "/api/config" && method === "GET") {
-    return json(res, 200, { demo: allowDemo(), billing: billingConfigured(), imagine: imagineConfigured(), imagineModel: "latest", vectorizerAi: vectorizerAi.configured(), vtracer: vtracer.available(), vaiTrace: vaiTrace.available(), inventVectorize: true, inventWinner: null, rasterCorel: true, inventWarp: inventWarp.available(), inventWarpReason: inventWarp.available() ? null : (inventWarp.unavailableReason && inventWarp.unavailableReason()), corelImport: true, name: "DecoClub Pro", statuses: STATUSES, methods: METHODS, blanks: BLANKS, seed: allowDemo() ? { owner: "owner@anvil.local", client: "client@anvil.local", password: "anvil123" } : null });
+    const st = ensureSettings(db);
+    return json(res, 200, { demo: allowDemo(), billing: billingConfigured(), imagine: imagineConfigured(), imagineModel: "latest", vectorizerAi: vectorizerAi.configured(), vtracer: vtracer.available(), vaiTrace: vaiTrace.available(), inventVectorize: true, inventWinner: null, rasterCorel: true, inventWarp: inventWarp.available(), inventWarpReason: inventWarp.available() ? null : (inventWarp.unavailableReason && inventWarp.unavailableReason()), corelImport: true, name: "DecoClub Pro", statuses: STATUSES, methods: METHODS, blanks: BLANKS, seed: allowDemo() ? { owner: "owner@anvil.local", client: "client@anvil.local", password: "anvil123" } : null, services: { vectorize: true, digitize: true, halftones: true }, halftonePricing: halftoneBuyOptions(st) });
+  }
+  if (pth === "/api/services" && method === "GET") {
+    const st = ensureSettings(db);
+    return json(res, 200, {
+      billing_configured: billingConfigured(),
+      services: {
+        vectorize: { name: "Vectorize", included_with: ["trial", "shop", "studio", "admin"], description: "Clean logos / Canva → SVG/EPS" },
+        digitize: { name: "Digitize", included_with: ["trial", "shop", "studio", "admin"], description: "Stitch preview · draft DST/EXP" },
+        halftones: {
+          name: "Halftones",
+          included_with: ["studio", "admin"],
+          preview: "free",
+          apply: "studio_unlimited_or_credit",
+          description: "Real vector half-tones for DTF / screen / print",
+          pricing: halftoneBuyOptions(st),
+        },
+      },
+    });
   }
   if (pth === "/api/quote" && (method === "POST" || method === "GET")) {
     const body = method === "GET" ? { method: url.searchParams.get("method"), width_in: url.searchParams.get("width_in"), height_in: url.searchParams.get("height_in"), qty: url.searchParams.get("qty"), margin_pct: url.searchParams.get("margin_pct") } : parseJsonBody(await readBody(req));
@@ -1066,7 +1165,7 @@ async function handleApi(req, res, url) {
       db.shops.push({ id: shop_id, name: body.shopName || (body.name + "'s Shop"), logo_path: null, brand_color: "#017ece", margin_pct: 20, created_at: now });
     }
     const trialDays = Number((db.settings && db.settings.trial_days) || 7);
-    const u = { id: uid(), email: email, name: body.name, password_hash: hashPass(body.password), role: role, shop_id: shop_id, plan: role === "shop" ? "trial" : "client", plan_expires: role === "shop" ? new Date(Date.now() + trialDays * 864e5).toISOString() : null, created_at: now };
+    const u = { id: uid(), email: email, name: body.name, password_hash: hashPass(body.password), role: role, shop_id: shop_id, plan: role === "shop" ? "trial" : "client", plan_expires: role === "shop" ? new Date(Date.now() + trialDays * 864e5).toISOString() : null, halftone_credits: 0, created_at: now };
     db.users.push(u);
     const remember = body.remember_me == null ? true : truthy(body.remember_me);
     const sess = sessionRecord(u.id, remember);
@@ -1120,11 +1219,11 @@ async function handleApi(req, res, url) {
     if (!billingConfigured()) return json(res, 501, { error: "Billing not configured" });
     if (pth === "/api/plan") return json(res, 400, { error: "Use checkout. Plan updates after Stripe webhook." });
     const body = parseJsonBody(await readBody(req));
-    const plan = body.plan || "shop";
-    if (["trial", "shop", "studio"].indexOf(plan) === -1) return json(res, 400, { error: "Unknown plan" });
+    const product = body.product || body.plan || "shop";
+    if (!isKnownProduct(product)) return json(res, 400, { error: "Unknown plan or product" });
     try {
-      const session = await createCheckoutSession(plan, user, originOf(req));
-      return json(res, 200, { user: publicUser(user), checkoutUrl: session.checkoutUrl, mode: session.mode, message: "Redirecting to Stripe Checkout" });
+      const session = await createCheckoutSession(product, user, originOf(req));
+      return json(res, 200, { user: publicUser(user), checkoutUrl: session.checkoutUrl, mode: session.mode, product: session.product, plan: session.plan, message: "Redirecting to Stripe Checkout" });
     } catch (err) {
       const code = err.status || 502;
       return json(res, code, { error: code === 501 ? "Billing not configured" : (IS_PROD ? "Billing error" : err.message) });
@@ -1151,7 +1250,7 @@ async function handleApi(req, res, url) {
     if (!body.email || !body.name) return json(res, 400, { error: "Name and email required" });
     const email = String(body.email).toLowerCase();
     if (db.users.some(function (u) { return u.email === email; })) return json(res, 409, { error: "Email already registered" });
-    const c = { id: uid(), email: email, name: body.name, password_hash: hashPass(body.password || "welcome123"), role: "client", shop_id: user.shop_id, plan: "client", plan_expires: null, created_at: new Date().toISOString() };
+    const c = { id: uid(), email: email, name: body.name, password_hash: hashPass(body.password || "welcome123"), role: "client", shop_id: user.shop_id, plan: "client", plan_expires: null, halftone_credits: 0, created_at: new Date().toISOString() };
     db.users.push(c); save(db);
     return json(res, 200, { client: { id: c.id, email: c.email, name: c.name, role: c.role, created_at: c.created_at } });
   }
@@ -1382,6 +1481,7 @@ async function handleApi(req, res, url) {
   const htJob = pth.match(/^\/api\/jobs\/([^/]+)\/halftone$/);
   if (htJob && method === "POST") {
     if (!canRunFloor(user)) return json(res, 403, { error: "Shop login required" });
+    if (!requireHalftoneApply(user, res, ensureSettings(db))) return;
     const job = db.jobs.find(function (j) { return j.id === htJob[1] && j.shop_id === user.shop_id; });
     if (!job) return json(res, 404, { error: "Job not found" });
     if (!job.file_path) return json(res, 400, { error: "Artwork required for halftone" });
@@ -1440,12 +1540,24 @@ async function handleApi(req, res, url) {
       };
       if (STATUSES.indexOf(job.status) < STATUSES.indexOf("art_in")) job.status = "art_in";
       applyMockup(job);
-      event(db, job, "Halftone · " + packed.meta.styleName + " · " + packed.meta.elements + " marks");
+      const creditUse = consumeHalftoneCredit(user);
+      if (!creditUse.ok) {
+        return json(res, 402, {
+          error: "Halftones Apply needs Studio membership or credits. Preview stays free — buy $3 / image or $20 for 10.",
+          code: "halftone_credits_required",
+          buy: halftoneBuyOptions(ensureSettings(db)),
+        });
+      }
+      event(db, job, "Halftone · " + packed.meta.styleName + " · " + packed.meta.elements + " marks" + (creditUse.consumed ? (" · −1 credit (" + creditUse.remaining + " left)") : " · Studio included"));
       save(db);
       return json(res, 200, {
         job: presentJob(job, req),
         halftone: job.halftone,
         meta: packed.meta,
+        user: publicUser(user),
+        halftoneCredits: halftoneCreditBalance(user),
+        halftoneIncluded: halftoneIncluded(user),
+        creditConsumed: !!creditUse.consumed,
       });
     } catch (err) {
       return json(res, 400, { error: clientFacingError(err, "Could not build halftone") });
@@ -2029,6 +2141,8 @@ async function handleApi(req, res, url) {
     return {
       id: u.id, email: u.email, name: u.name, role: u.role, shop_id: u.shop_id,
       shop_name: shop ? shop.name : null, plan: u.plan, plan_expires: u.plan_expires,
+      halftone_credits: halftoneCreditBalance(u),
+      halftone_included: halftoneIncluded(u),
       disabled: !!u.disabled, created_at: u.created_at,
       jobs: (db.jobs || []).filter(function (j) { return j.owner_id === u.id || j.client_id === u.id; }).length,
     };
@@ -2100,6 +2214,9 @@ async function handleApi(req, res, url) {
         trial_days: settings.trial_days,
         shop_price_cents: settings.shop_price_cents,
         studio_price_cents: settings.studio_price_cents,
+        halftone_single_cents: settings.halftone_single_cents,
+        halftone_pack10_cents: settings.halftone_pack10_cents,
+        services: ["vectorize", "digitize", "halftones"],
       },
       billing_configured: billingConfigured(),
       stripe_configured: billingConfigured(),
@@ -2217,6 +2334,27 @@ async function handleApi(req, res, url) {
       }
     }
     if (body.name) u.name = String(body.name).trim();
+    if (body.halftone_credits != null) {
+      u.halftone_credits = Math.max(0, Math.floor(Number(body.halftone_credits) || 0));
+    }
+    save(db);
+    return json(res, 200, { user: publicAdminUser(u) });
+  }
+  const htCreditPath = pth.match(/^\/api\/admin\/users\/([^/]+)\/halftone-credits$/);
+  if (htCreditPath && method === "POST") {
+    if (!requireAdmin(user, res)) return;
+    const u = db.users.find(function (x) { return x.id === htCreditPath[1]; });
+    if (!u) return json(res, 404, { error: "User not found" });
+    const body = parseJsonBody(await readBody(req));
+    if (body.credits != null) {
+      u.halftone_credits = Math.max(0, Math.floor(Number(body.credits) || 0));
+    } else if (body.add != null) {
+      grantHalftoneCredits(u, body.add);
+    } else if (body.set != null) {
+      u.halftone_credits = Math.max(0, Math.floor(Number(body.set) || 0));
+    } else {
+      return json(res, 400, { error: "Pass credits, set, or add" });
+    }
     save(db);
     return json(res, 200, { user: publicAdminUser(u) });
   }
@@ -2312,6 +2450,8 @@ async function handleApi(req, res, url) {
     if (body.trial_days != null) st.trial_days = Math.max(0, Number(body.trial_days) || 0);
     if (body.shop_price_cents != null) st.shop_price_cents = Math.max(0, Math.round(Number(body.shop_price_cents)));
     if (body.studio_price_cents != null) st.studio_price_cents = Math.max(0, Math.round(Number(body.studio_price_cents)));
+    if (body.halftone_single_cents != null) st.halftone_single_cents = Math.max(0, Math.round(Number(body.halftone_single_cents)));
+    if (body.halftone_pack10_cents != null) st.halftone_pack10_cents = Math.max(0, Math.round(Number(body.halftone_pack10_cents)));
     db.settings = st; save(db);
     return json(res, 200, { settings: st, billing_configured: billingConfigured() });
   }
@@ -2359,6 +2499,7 @@ const server = http.createServer(async function (req, res) {
         imagine: false,
         vectorizerAi: false,
         vaiTrace: vaiTrace.available(),
+        services: ["vectorize", "digitize", "halftones"],
       });
     }
     if (url.pathname.indexOf("/api/") === 0) return await handleApi(req, res, url);

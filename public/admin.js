@@ -103,6 +103,25 @@ async function grant(id, months) {
   });
   render();
 }
+async function grantHtCredits(id, n) {
+  await api("/api/admin/users/" + id + "/halftone-credits", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ add: n }),
+  });
+  render();
+}
+async function setHtCredits(id) {
+  const v = prompt("Set Halftone credits (integer ≥ 0):");
+  if (v === null) return;
+  const n = Math.max(0, Math.floor(Number(v) || 0));
+  await api("/api/admin/users/" + id + "/halftone-credits", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ credits: n }),
+  });
+  render();
+}
 async function revokePlan(id) {
   if (!confirm("Revoke plan for this user?")) return;
   await api("/api/admin/users/" + id + "/plan", {
@@ -145,23 +164,30 @@ async function renderUsers() {
       <input id="userq" type="search" class="field" placeholder="Search name, email, shop…" value="${escapeHtml(q)}" />
       <button class="btn ghost small" id="userSearch">Search</button>
     </div>
-    <p class="muted">Grant / revoke plans, set role, assign shop, reset temp password, disable, or delete non-admins. Password hashes are never shown.</p>
+    <p class="muted">Grant / revoke plans, set Halftone credits, set role, assign shop, reset temp password, disable, or delete non-admins. Password hashes are never shown.</p>
     <table>
-      <thead><tr><th>Name</th><th>Email</th><th>Role</th><th>Shop</th><th>Plan</th><th>Expires</th><th>Status</th><th>Actions</th></tr></thead>
+      <thead><tr><th>Name</th><th>Email</th><th>Role</th><th>Shop</th><th>Plan</th><th>HT credits</th><th>Expires</th><th>Status</th><th>Actions</th></tr></thead>
       <tbody>${users.map((u) => `<tr>
         <td>${escapeHtml(u.name)}</td>
         <td>${escapeHtml(u.email)}</td>
         <td>${escapeHtml(u.role)}</td>
         <td>${escapeHtml(u.shop_name || "—")}</td>
-        <td>${escapeHtml(u.plan || "—")}</td>
+        <td>${escapeHtml(u.plan || "—")}${u.halftone_included ? ' <span class="pill ok">HT∞</span>' : ""}</td>
+        <td class="mono">${u.halftone_included ? "∞" : (u.halftone_credits != null ? u.halftone_credits : 0)}</td>
         <td class="mono">${u.plan_expires ? fmtDay(u.plan_expires) : "—"}</td>
         <td>${u.disabled ? '<span class="pill warn">disabled</span>' : '<span class="pill ok">active</span>'}</td>
         <td class="actions">
-          ${u.role === "admin" ? "" : `
+          ${u.role === "admin" ? `
+            <button class="btn ghost small" data-htadd="${u.id}" data-n="1">+1 HT</button>
+            <button class="btn ghost small" data-htadd="${u.id}" data-n="10">+10 HT</button>
+            <button class="btn ghost small" data-htset="${u.id}">Set HT…</button>` : `
             <button class="btn ghost small" data-grant="${u.id}" data-m="1">+1 mo</button>
             <button class="btn ghost small" data-grant="${u.id}" data-m="3">+3 mo</button>
             <button class="btn ghost small" data-grant="${u.id}" data-m="12">+12 mo</button>
             <button class="btn ghost small" data-revoke="${u.id}">Revoke</button>
+            <button class="btn ghost small" data-htadd="${u.id}" data-n="1">+1 HT</button>
+            <button class="btn ghost small" data-htadd="${u.id}" data-n="10">+10 HT</button>
+            <button class="btn ghost small" data-htset="${u.id}">Set HT…</button>
             <button class="btn ghost small" data-role="${u.id}" data-next="${u.role === "shop" ? "client" : "shop"}">→ ${u.role === "shop" ? "client" : "shop"}</button>
             <button class="btn ghost small" data-shop="${u.id}">Shop…</button>
             <button class="btn ghost small" data-pw="${u.id}" data-email="${escapeHtml(u.email)}">Temp pw</button>
@@ -173,6 +199,8 @@ async function renderUsers() {
   $("#userSearch").onclick = () => renderUsers();
   $("#userq").onkeydown = (e) => { if (e.key === "Enter") renderUsers(); };
   main.querySelectorAll("[data-grant]").forEach((b) => { b.onclick = () => grant(b.dataset.grant, Number(b.dataset.m)); });
+  main.querySelectorAll("[data-htadd]").forEach((b) => { b.onclick = () => grantHtCredits(b.dataset.htadd, Number(b.dataset.n)); });
+  main.querySelectorAll("[data-htset]").forEach((b) => { b.onclick = () => setHtCredits(b.dataset.htset); });
   main.querySelectorAll("[data-revoke]").forEach((b) => { b.onclick = () => revokePlan(b.dataset.revoke); });
   main.querySelectorAll("[data-role]").forEach((b) => {
     b.onclick = () => patchUser(b.dataset.role, { role: b.dataset.next });
@@ -319,9 +347,10 @@ async function renderSettings() {
   const data = await api("/api/admin/settings");
   const settings = data.settings;
   main.innerHTML = `
-    <h1 style="font-size:28px;margin-top:0">Membership pricing</h1>
-    <p class="muted">Trial length applies to new shop signups. Prices are display/admin figures in cents (Shop default $79, Studio $149). Stripe checkout only works when billing env is configured — we do not invent fake Stripe.</p>
+    <h1 style="font-size:28px;margin-top:0">Membership &amp; services pricing</h1>
+    <p class="muted">Trial length applies to new shop signups. Membership prices in cents (Shop $79, Studio $149). Halftones is a separate service — included with Studio / admin, or buy standalone ($3 / image · $20 for 10). Stripe checkout only works when billing env is configured — we do not invent fake Stripe. Credits are always grantable here for testing.</p>
     <p><span class="pill ${data.billing_configured ? "ok" : "off"}">Stripe ${data.billing_configured ? "configured" : "not configured"}</span>
+       <span class="pill ok">Halftones service</span>
        <span class="pill off">Imagine off</span>
        <span class="pill off">Vectorizer.AI off</span></p>
     <form class="form" id="pf" style="max-width:420px">
@@ -331,7 +360,12 @@ async function renderSettings() {
       <input name="shop_price_cents" type="number" min="0" value="${settings.shop_price_cents}" />
       <label>Studio price (cents)</label>
       <input name="studio_price_cents" type="number" min="0" value="${settings.studio_price_cents}" />
-      <p class="muted">Shop ${moneyCents(settings.shop_price_cents)} · Studio ${moneyCents(settings.studio_price_cents)}</p>
+      <h3 style="margin:20px 0 8px;font-size:16px">Halftones packs</h3>
+      <label>Single image (cents) · grants 1 credit</label>
+      <input name="halftone_single_cents" type="number" min="0" value="${settings.halftone_single_cents != null ? settings.halftone_single_cents : 300}" />
+      <label>Pack of 10 (cents) · grants 10 credits</label>
+      <input name="halftone_pack10_cents" type="number" min="0" value="${settings.halftone_pack10_cents != null ? settings.halftone_pack10_cents : 2000}" />
+      <p class="muted">Shop ${moneyCents(settings.shop_price_cents)} · Studio ${moneyCents(settings.studio_price_cents)} · HT single ${moneyCents(settings.halftone_single_cents != null ? settings.halftone_single_cents : 300)} · HT pack10 ${moneyCents(settings.halftone_pack10_cents != null ? settings.halftone_pack10_cents : 2000)}</p>
       <button class="btn" type="submit">Save settings</button>
       <p class="ok" id="ok"></p>
     </form>`;
@@ -345,6 +379,8 @@ async function renderSettings() {
         trial_days: Number(fd.trial_days),
         shop_price_cents: Number(fd.shop_price_cents),
         studio_price_cents: Number(fd.studio_price_cents),
+        halftone_single_cents: Number(fd.halftone_single_cents),
+        halftone_pack10_cents: Number(fd.halftone_pack10_cents),
       }),
     });
     $("#ok").textContent = "Saved.";
@@ -371,6 +407,8 @@ async function renderSystem() {
         <tr><td>VTracer</td><td><span class="pill ${data.vtracer ? "ok" : "off"}">${data.vtracer ? "available" : "unavailable"}</span></td></tr>
         <tr><td>Trial days</td><td class="mono">${data.feature_flags && data.feature_flags.trial_days}</td></tr>
         <tr><td>Shop / Studio cents</td><td class="mono">${data.feature_flags && data.feature_flags.shop_price_cents} / ${data.feature_flags && data.feature_flags.studio_price_cents}</td></tr>
+        <tr><td>Halftones single / pack10 cents</td><td class="mono">${data.feature_flags && data.feature_flags.halftone_single_cents} / ${data.feature_flags && data.feature_flags.halftone_pack10_cents}</td></tr>
+        <tr><td>Services</td><td class="mono">${(data.feature_flags && data.feature_flags.services || []).join(", ") || "—"}</td></tr>
       </tbody>
     </table>`;
 }

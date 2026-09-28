@@ -662,3 +662,9 @@ th { color: var(--muted); font-weight: 600; font-size: 11px; letter-spacing: .06
   filter: grayscale(0.4);
 }
 .art-drop.ht-previewing .ht-preview-frame { pointer-events: none; }
+
+
+/* Halftones service chip / buy row (ht4) */
+.ht-panel-head { display: flex; flex-wrap: wrap; align-items: center; gap: 8px; }
+.ht-status { font-size: 11px; }
+.ht-buy { display: flex; flex-wrap: wrap; align-items: center; gap: 8px; margin: 8px 0 4px; }

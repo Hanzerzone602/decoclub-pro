@@ -229,6 +229,8 @@ async function boot() {
   if (user && user.name) {
     let whoLine = user.name + " · " + user.role + " · " + user.plan;
     if (!entitled() && user.plan !== "trial") whoLine += " · trial";
+    if (user.halftoneIncluded) whoLine += " · HT∞";
+    else if (user.halftoneCredits > 0) whoLine += " · HT×" + user.halftoneCredits;
     if (whoEl) whoEl.textContent = whoLine;
     if (logoutBtn) {
       logoutBtn.hidden = false;
@@ -855,6 +857,12 @@ async function fillArt(el, job, shopControls) {
           <div class="ht-panel-head">
             <strong>Vector Halftones</strong>
             <span class="muted">Real SVG dots / lines · DTF &amp; screen</span>
+            <span class="pill ht-status" id="htStatus" title="Halftones entitlement"></span>
+          </div>
+          <div class="ht-buy" id="htBuy" hidden>
+            <button class="btn ghost small" type="button" id="htBuySingle" data-ht-product="halftone_single">Buy $3 / image</button>
+            <button class="btn ghost small" type="button" id="htBuyPack" data-ht-product="halftone_pack10">Buy $20 for 10</button>
+            <span class="muted" id="htBuyNote"></span>
           </div>
           <div class="ht-styles" id="htStyles" role="listbox" aria-label="Halftone styles"></div>
           <div class="ht-params">
@@ -1117,7 +1125,7 @@ async function fillArt(el, job, shopControls) {
       invertBtn.textContent = "Invert black & white";
     }
   };
-  // --- Vector Halftones (real SVG paths / circles) --- ht-onpoint-v3
+  // --- Vector Halftones (real SVG paths / circles) --- ht-service-v4
   const HALFTONE_STYLES = [
     { id: "classic-round", name: "Classic Round", kind: "am-round", lpi: 45, angle: 45, contrast: 1 },
     { id: "elliptical", name: "Elliptical", kind: "am-ellipse", lpi: 45, angle: 45, contrast: 1 },
@@ -1362,6 +1370,56 @@ async function fillArt(el, job, shopControls) {
   const htBtn = $("#halftoneBtn");
   const htPanel = $("#htPanel");
   if (htBtn && htPanel) {
+    function refreshHtStatus() {
+      const chip = $("#htStatus");
+      const buy = $("#htBuy");
+      const note = $("#htBuyNote");
+      const included = !!(user && user.halftoneIncluded);
+      const credits = (user && user.halftoneCredits != null) ? Number(user.halftoneCredits) : 0;
+      if (chip) {
+        if (included) {
+          chip.textContent = "Included with Studio";
+          chip.className = "pill ht-status ok";
+        } else if (credits > 0) {
+          chip.textContent = credits + " credit" + (credits === 1 ? "" : "s") + " left";
+          chip.className = "pill ht-status ok";
+        } else {
+          chip.textContent = "Buy: $3 / image · $20 for 10";
+          chip.className = "pill ht-status warn";
+        }
+      }
+      if (buy) buy.hidden = !!included;
+      if (note) {
+        note.textContent = cfg.billing
+          ? (included ? "" : "Checkout grants credits after payment webhook.")
+          : (included ? "" : "Billing off — ask admin to grant credits, or wait for Stripe.");
+      }
+    }
+    async function buyHalftoneProduct(product) {
+      const note = $("#htBuyNote");
+      const errEl = $("#err");
+      try {
+        if (!cfg.billing) {
+          if (note) note.textContent = "Billing not configured — checkout returns 501. Admin can grant Halftone credits.";
+          if (errEl) errEl.textContent = "Billing not configured for Halftone packs.";
+          return;
+        }
+        const data = await api("/api/billing/checkout", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ product: product }),
+        });
+        if (data.checkoutUrl) location.href = data.checkoutUrl;
+      } catch (err) {
+        if (note) note.textContent = (err && err.message) || "Checkout failed";
+        if (errEl) errEl.textContent = (err && err.message) || "Halftone checkout failed";
+      }
+    }
+    refreshHtStatus();
+    const buySingle = $("#htBuySingle");
+    const buyPack = $("#htBuyPack");
+    if (buySingle) buySingle.onclick = () => buyHalftoneProduct("halftone_single");
+    if (buyPack) buyPack.onclick = () => buyHalftoneProduct("halftone_pack10");
     renderHtStyles();
     if (job.halftone) {
       const lpi = $("#htLpi"); if (lpi && job.halftone.lpi != null) lpi.value = job.halftone.lpi;
@@ -1416,10 +1474,19 @@ async function fillArt(el, job, shopControls) {
           headers: { "Content-Type": "application/json" },
           body: JSON.stringify(htPayload()),
         });
+        if (data && data.user) user = data.user;
+        else if (data && data.halftoneCredits != null) {
+          user = Object.assign({}, user || {}, {
+            halftoneCredits: data.halftoneCredits,
+            halftoneIncluded: !!data.halftoneIncluded,
+          });
+        }
+        refreshHtStatus();
         const meta = (data && data.meta) || {};
-        if (errEl) errEl.textContent = "Halftone · " + (meta.styleName || htStyle) + " · " + (meta.elements || "") + " vector marks";
+        const creditNote = data && data.creditConsumed ? (" · " + (data.halftoneCredits != null ? data.halftoneCredits : "?") + " credits left") : (data && data.halftoneIncluded ? " · Studio included" : "");
+        if (errEl) errEl.textContent = "Halftone · " + (meta.styleName || htStyle) + " · " + (meta.elements || "") + " vector marks" + creditNote;
         htPanelWantOpen = true;
-        if (hint) hint.textContent = "Applied · " + (meta.styleName || htStyle) + " · " + (meta.elements || "") + " marks — panel stays open to tweak";
+        if (hint) hint.textContent = "Applied · " + (meta.styleName || htStyle) + " · " + (meta.elements || "") + " marks" + creditNote + " — panel stays open to tweak";
         renderJob(job.id);
       } catch (err) {
         hideArtWorking();
@@ -1984,9 +2051,11 @@ async function renderClients() {
   });
 }
 
-async function checkout(plan) {
+async function checkout(planOrProduct) {
   try {
-    const data = await api("/api/billing/checkout", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ plan }) });
+    const isPack = planOrProduct === "halftone_single" || planOrProduct === "halftone_pack10";
+    const body = isPack ? { product: planOrProduct } : { plan: planOrProduct };
+    const data = await api("/api/billing/checkout", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(body) });
     if (data.checkoutUrl) location.href = data.checkoutUrl;
   } catch (err) {
     const note = $("#billnote");
@@ -2014,11 +2083,18 @@ async function renderSettings() {
       </form>
       <h3>Billing</h3>
       ${paywallNote()}
-      <p class="muted" id="billnote">${cfg.billing ? "Stripe is configured. Checkout does not mark the shop paid until the webhook." : "Billing not configured — STRIPE_SECRET_KEY is unset. Checkout returns 501. We will not fake a paid plan. Admin still runs the floor for free."}</p>
+      <p class="muted" id="billnote">${cfg.billing ? "Stripe is configured. Checkout does not mark the shop paid until the webhook. Halftone packs grant credits (not a plan change)." : "Billing not configured — STRIPE_SECRET_KEY is unset. Checkout returns 501. We will not fake a paid plan. Admin still runs the floor for free and can grant Halftone credits."}</p>
       <div class="cta-row">
         <button class="btn ghost" data-plan="trial">Trial</button>
         <button class="btn ghost" data-plan="shop">Shop $79</button>
         <button class="btn" data-plan="studio">Studio $149</button>
+      </div>
+      <h3>Halftones (standalone)</h3>
+      <p class="muted">Studio includes unlimited Halftones. Others: $3 / image or $20 for 10 credits. Preview stays free.</p>
+      <p class="muted">Credits: <strong>${user.halftoneIncluded ? "Included with Studio" : ((user.halftoneCredits != null ? user.halftoneCredits : 0) + " left")}</strong></p>
+      <div class="cta-row">
+        <button class="btn ghost" data-plan="halftone_single">Buy $3 / image</button>
+        <button class="btn ghost" data-plan="halftone_pack10">Buy $20 for 10</button>
       </div>` : `<p>Client accounts only see assigned jobs and proofs.</p>`}`;
   const sf = $("#sf");
   if (sf) sf.onsubmit = async (e) => {
