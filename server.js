@@ -1465,11 +1465,15 @@ async function handleApi(req, res, url) {
         angle: body.angle,
         contrast: body.contrast,
         color: body.color || "#000000",
-        knockout: !!(body.knockout || body.knockoutWhite || body.whiteBg),
+        knockout: body.knockout != null || body.knockoutWhite != null
+          ? !!(body.knockout || body.knockoutWhite)
+          : true,
+        paperUnderlay: !!(body.paperUnderlay || body.whitePlate),
         widthIn: job.width_in || 10,
         heightIn: job.height_in || job.width_in || 10,
         preview: true,
-        previewPlate: true,
+        // Transparent SVG + CSS checker — match Apply (no baked white plate).
+        previewPlate: false,
         maxEdge: body.maxEdge,
         maxCells: body.maxCells,
       });
@@ -1510,7 +1514,10 @@ async function handleApi(req, res, url) {
         angle: body.angle,
         contrast: body.contrast,
         color: body.color || "#000000",
-        knockout: !!(body.knockout || body.knockoutWhite || body.whiteBg),
+        knockout: body.knockout != null || body.knockoutWhite != null
+          ? !!(body.knockout || body.knockoutWhite)
+          : true,
+        paperUnderlay: !!(body.paperUnderlay || body.whitePlate),
         widthIn: job.width_in || 10,
         heightIn: job.height_in || job.width_in || 10,
         maxEdge: body.maxEdge,

@@ -870,7 +870,7 @@ async function fillArt(el, job, shopControls) {
             <label>Angle <input type="number" id="htAngle" min="0" max="90" step="1" value="45" title="Screen angle degrees" /></label>
             <label>Contrast <input type="number" id="htContrast" min="0.25" max="2.5" step="0.05" value="1" title="Dot gain / punch" /></label>
             <label>Ink <input type="color" id="htColor" value="#000000" title="Ink color" /></label>
-            <label class="ht-ko"><input type="checkbox" id="htKnockout" /> White knockout</label>
+            <label class="ht-ko" title="Print knockout — transparent plate, ink marks only (true HT / DTF)"><input type="checkbox" id="htKnockout" checked /> Knockout (transparent)</label>
           </div>
           <div class="ht-actions">
             <button class="btn primary" type="button" id="htApply">Apply halftone</button>
@@ -1125,7 +1125,7 @@ async function fillArt(el, job, shopControls) {
       invertBtn.textContent = "Invert black & white";
     }
   };
-  // --- Vector Halftones (real SVG paths / circles) --- ht-service-v4
+  // --- Vector Halftones (real SVG paths / circles) --- ht-transparent-v5
   const HALFTONE_STYLES = [
     { id: "classic-round", name: "Classic Round", kind: "am-round", lpi: 45, angle: 45, contrast: 1 },
     { id: "elliptical", name: "Elliptical", kind: "am-ellipse", lpi: 45, angle: 45, contrast: 1 },
@@ -1236,8 +1236,9 @@ async function fillArt(el, job, shopControls) {
         }
       }
     }
+    // Transparent SVG — CSS .ht-thumb-wrap checkerboard provides contrast
     return '<svg class="ht-thumb" viewBox="0 0 ' + W + " " + H + '" width="56" height="40" aria-hidden="true">' +
-      '<rect width="' + W + '" height="' + H + '" fill="#e8ecf2"/>' + parts.join("") + "</svg>";
+      parts.join("") + "</svg>";
   }
 
   function htPayload() {
@@ -1426,7 +1427,7 @@ async function fillArt(el, job, shopControls) {
       const ang = $("#htAngle"); if (ang && job.halftone.angle != null) ang.value = job.halftone.angle;
       const con = $("#htContrast"); if (con && job.halftone.contrast != null) con.value = job.halftone.contrast;
       const col = $("#htColor"); if (col && job.halftone.color) col.value = job.halftone.color;
-      const ko = $("#htKnockout"); if (ko) ko.checked = !!job.halftone.knockout;
+      const ko = $("#htKnockout"); if (ko) ko.checked = job.halftone.knockout != null ? !!job.halftone.knockout : true;
       const hint = $("#htHint");
       if (hint) hint.textContent = "Last · " + (job.halftone.styleName || job.halftone.style) + " · " + (job.halftone.elements || "?") + " marks · tweak for live preview";
     }
