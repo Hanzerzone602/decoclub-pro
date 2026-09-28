@@ -8562,6 +8562,349 @@ def potrace_paths(
     return ds
 
 
+def capped_iso_mask(mask, *, sigma=0.8, cap_px=0.8):
+    """0.5-iso of a sigma<=1 blur, restricted to cap_px of the hard contour.
+
+    Pixels farther than cap_px from the unblurred boundary stay as in `mask`.
+    This is a bounded seam smoother, not a free fairing pass.
+    """
+    m = (np.asarray(mask) > 0).astype(np.uint8)
+    if int(m.sum()) < 8:
+        return m
+    sigma = float(min(1.0, max(0.0, sigma)))
+    cap = float(min(0.8, max(0.0, cap_px)))
+    if sigma <= 1e-6 or cap <= 1e-6:
+        return m
+    dist_in = cv2.distanceTransform(m, cv2.DIST_L2, 3)
+    dist_out = cv2.distanceTransform((1 - m).astype(np.uint8), cv2.DIST_L2, 3)
+    dist_c = np.where(m > 0, dist_in, dist_out)
+    blur = cv2.GaussianBlur(m.astype(np.float32), (0, 0), sigma)
+    iso = blur >= 0.50
+    out = m.astype(bool)
+    out[dist_c <= cap] = iso[dist_c <= cap]
+    return out.astype(np.uint8)
+
+
+def _marching_squares_rings(field, level=0.5):
+    """Subpixel 0.5-iso rings of a scalar field. Pixel centers are integer coords.
+
+    The field is padded with zeros so a component that touches the image
+    border still closes (the pad is outside the bitmap).
+    """
+    f0 = np.asarray(field, dtype=np.float32)
+    if f0.shape[0] < 2 or f0.shape[1] < 2:
+        return []
+    f = np.pad(f0, 1, mode="constant", constant_values=0.0)
+    h, w = f.shape
+
+    def interp(p1, v1, p2, v2):
+        den = float(v2) - float(v1)
+        t = 0.5 if abs(den) < 1e-8 else (float(level) - float(v1)) / den
+        if t < 0.0:
+            t = 0.0
+        elif t > 1.0:
+            t = 1.0
+        return (p1[0] + t * (p2[0] - p1[0]), p1[1] + t * (p2[1] - p1[1]))
+
+    segs = []
+    for y in range(h - 1):
+        r0 = f[y]
+        r1 = f[y + 1]
+        for x in range(w - 1):
+            v00 = float(r0[x])
+            v10 = float(r0[x + 1])
+            v11 = float(r1[x + 1])
+            v01 = float(r1[x])
+            idx = 0
+            if v00 >= level:
+                idx |= 1
+            if v10 >= level:
+                idx |= 2
+            if v11 >= level:
+                idx |= 4
+            if v01 >= level:
+                idx |= 8
+            if idx == 0 or idx == 15:
+                continue
+            t = interp((x, y), v00, (x + 1, y), v10)
+            r = interp((x + 1, y), v10, (x + 1, y + 1), v11)
+            b = interp((x, y + 1), v01, (x + 1, y + 1), v11)
+            l = interp((x, y), v00, (x, y + 1), v01)
+            # Saddle (5, 10): split by the cell-center value.
+            if idx == 5 or idx == 10:
+                center = 0.25 * (v00 + v10 + v11 + v01)
+                if (idx == 5 and center >= level) or (idx == 10 and center < level):
+                    segs.append((l, t))
+                    segs.append((r, b))
+                else:
+                    segs.append((t, r))
+                    segs.append((l, b))
+                continue
+            pairs = {
+                1: (l, t),
+                2: (t, r),
+                3: (l, r),
+                4: (r, b),
+                6: (t, b),
+                7: (l, b),
+                8: (b, l),
+                9: (b, t),
+                11: (b, r),
+                12: (r, l),
+                13: (r, t),
+                14: (t, l),
+            }
+            pair = pairs.get(idx)
+            if pair is not None:
+                segs.append(pair)
+    if not segs:
+        return []
+
+    def qk(p):
+        return (int(round(p[0] * 100.0)), int(round(p[1] * 100.0)))
+
+    coord = {}
+    edges = []
+    for a, b in segs:
+        ka, kb = qk(a), qk(b)
+        if ka == kb:
+            continue
+        coord[ka] = a
+        coord[kb] = b
+        edges.append((ka, kb))
+    adj = {}
+    for i, (a, b) in enumerate(edges):
+        adj.setdefault(a, []).append(i)
+        adj.setdefault(b, []).append(i)
+    used = set()
+    rings = []
+    for i0 in range(len(edges)):
+        if i0 in used:
+            continue
+        a0, b0 = edges[i0]
+        used.add(i0)
+        ring = [a0, b0]
+        cur = b0
+        guard = 0
+        closed = False
+        while guard < len(edges) + 2:
+            guard += 1
+            nxt_e = None
+            nxt_p = None
+            for ei in adj.get(cur, ()):
+                if ei in used:
+                    continue
+                u, v = edges[ei]
+                nxt_e = ei
+                nxt_p = v if u == cur else u
+                break
+            if nxt_e is None:
+                break
+            used.add(nxt_e)
+            if nxt_p == a0:
+                closed = True
+                break
+            ring.append(nxt_p)
+            cur = nxt_p
+        if closed and len(ring) >= 3:
+            rings.append([(coord[k][0] - 1.0, coord[k][1] - 1.0) for k in ring])
+    return rings
+
+
+def _clamp_ring_to_contour(ring, mask, cap=0.8):
+    """Project ring vertices back inside the cap band around the hard contour."""
+    pts = np.asarray(ring, dtype=np.float32)
+    if len(pts) < 3:
+        return pts
+    m = (np.asarray(mask) > 0).astype(np.uint8)
+    h, w = m.shape
+    din = cv2.distanceTransform(m, cv2.DIST_L2, 3)
+    dout = cv2.distanceTransform((1 - m).astype(np.uint8), cv2.DIST_L2, 3)
+    sd_img = din - dout
+    gx = cv2.Sobel(sd_img, cv2.CV_32F, 1, 0, ksize=3)
+    gy = cv2.Sobel(sd_img, cv2.CV_32F, 0, 1, ksize=3)
+
+    def sample(img, xs, ys):
+        x0 = np.floor(xs).astype(np.int32)
+        y0 = np.floor(ys).astype(np.int32)
+        x1 = np.clip(x0 + 1, 0, w - 1)
+        y1 = np.clip(y0 + 1, 0, h - 1)
+        x0c = np.clip(x0, 0, w - 1)
+        y0c = np.clip(y0, 0, h - 1)
+        fx = np.clip(xs - x0, 0.0, 1.0)
+        fy = np.clip(ys - y0, 0.0, 1.0)
+        return (
+            img[y0c, x0c] * (1 - fx) * (1 - fy)
+            + img[y0c, x1] * fx * (1 - fy)
+            + img[y1, x0c] * (1 - fx) * fy
+            + img[y1, x1] * fx * fy
+        )
+
+    xs = np.clip(pts[:, 0], 0.0, w - 1.001)
+    ys = np.clip(pts[:, 1], 0.0, h - 1.001)
+    sd = sample(sd_img, xs, ys)
+    dist = np.abs(sd)
+    over = dist - float(cap)
+    move = np.where(over > 0.0, over, 0.0)
+    if float(move.max()) <= 0.0:
+        return pts
+    gxv = sample(gx, xs, ys)
+    gyv = sample(gy, xs, ys)
+    mag = np.hypot(gxv, gyv) + 1e-6
+    direction = np.where(sd >= 0.0, -1.0, 1.0)
+    pts = pts.copy()
+    pts[:, 0] = xs + direction * move * (gxv / mag)
+    pts[:, 1] = ys + direction * move * (gyv / mag)
+    return pts
+
+
+def _rings_to_evenodd_d(rings, sx, sy):
+    parts = []
+    for ring in rings:
+        if ring is None or len(ring) < 3:
+            continue
+        x0, y0 = float(ring[0][0]) * sx, float(ring[0][1]) * sy
+        parts.append(f"M {fmt(x0, 4)} {fmt(y0, 4)}")
+        for p in ring[1:]:
+            parts.append(f"L {fmt(float(p[0]) * sx, 4)} {fmt(float(p[1]) * sy, 4)}")
+        parts.append("Z")
+    return " ".join(parts)
+
+
+def _iso_capped_paths(mask, sx, sy, *, sigma=0.8, cap_px=0.8):
+    """Marching-squares 0.5-iso, hard-capped, one evenodd compound."""
+    m = (np.asarray(mask) > 0).astype(np.uint8)
+    sigma = float(min(1.0, max(0.0, sigma)))
+    cap = float(min(0.8, max(0.0, cap_px)))
+    field = cv2.GaussianBlur(m.astype(np.float32), (0, 0), sigma if sigma > 0 else 0.01)
+    # Cap the field itself so the iso cannot leave the 0.8px band, then trace it.
+    capped = capped_iso_mask(m, sigma=sigma, cap_px=cap).astype(np.float32)
+    # Blend: use the blur only where the cap mask agrees, so the level set
+    # stays on the capped contour. Hard capped mask's boundary is the limit.
+    field = np.where(capped > 0.5, np.maximum(field, 0.5), np.minimum(field, 0.499))
+    rings = _marching_squares_rings(field, 0.5)
+    if not rings:
+        return []
+    kept = []
+    for ring in rings:
+        pts = np.asarray(ring, dtype=np.float32).reshape(-1, 1, 2)
+        approx = cv2.approxPolyDP(pts, 0.35, True).reshape(-1, 2)
+        if len(approx) < 3:
+            continue
+        clamped = _clamp_ring_to_contour(approx, m, cap=cap)
+        if len(clamped) >= 3:
+            kept.append(clamped)
+    if not kept:
+        return []
+    d = _rings_to_evenodd_d(kept, sx, sy)
+    if not d or "M" not in d:
+        return []
+    return [d]
+
+
+def _boundary_curve_gap_px(mask, paths, sx, sy):
+    """p75 distance (px) from the hard mask edge to the traced curve.
+
+    A hug of the pixel crack sits near 0.5–1px. Larger values mean the cubic
+    retreated and a shared seam can open onto paper.
+    """
+    try:
+        from geom import sample_path_d
+    except Exception:
+        from lib.geom import sample_path_d
+    m = (np.asarray(mask) > 0).astype(np.uint8)
+    h, w = m.shape
+    if h < 2 or w < 2 or sx <= 0 or sy <= 0:
+        return 0.0
+    er = cv2.erode(m, np.ones((3, 3), np.uint8))
+    edge = (m > 0) & (er == 0)
+    ys, xs = np.nonzero(edge)
+    if len(xs) < 30:
+        return 0.0
+    if len(xs) > 6000:
+        step = int(len(xs) // 6000) + 1
+        xs = xs[::step]
+        ys = ys[::step]
+    canvas = np.zeros((h, w), np.uint8)
+    drew = False
+    for d in paths or []:
+        try:
+            rings = sample_path_d(d, curve_samples=4)
+        except Exception:
+            continue
+        for ring in rings:
+            if len(ring) < 2:
+                continue
+            pts = np.array([[p[0] / float(sx), p[1] / float(sy)] for p in ring], dtype=np.float32)
+            pi = np.round(pts).astype(np.int32)
+            pi[:, 0] = np.clip(pi[:, 0], 0, w - 1)
+            pi[:, 1] = np.clip(pi[:, 1], 0, h - 1)
+            if len(pi) >= 2:
+                cv2.polylines(canvas, [pi], True, 1, 1, cv2.LINE_8)
+                drew = True
+    if not drew:
+        return 99.0
+    dist = cv2.distanceTransform((1 - canvas).astype(np.uint8), cv2.DIST_L2, 3)
+    return float(np.percentile(dist[ys, xs], 75))
+
+
+def logo_potrace_mask_layers(assign, palette, sx, sy, *, min_area_px=10):
+    """Per-ink potrace of the assign mask. Evenodd compounds, no shared-crack Schneider.
+
+    alphamax/opttol are potrace's own defaults so corners that are actually
+    sharp stay corners and the cubic stays on the bitmap. If a fit retreats
+    off the shared seam, that ink is replaced by a marching-squares 0.5-iso
+    of a sigma<=1 blur, hard-capped to 0.8px from the unblurred contour.
+    """
+    a = np.asarray(assign, dtype=np.int32)
+    order = list(range(len(palette)))
+    order.sort(key=lambda i: (-lum(palette[i]), -int((a == i).sum())))
+    layers = []
+    iso_n = 0
+    # p75 gap above this (px) means the cubic left the pixel crack.
+    gap_trigger = 1.8
+    for ink in order:
+        area = int((a == ink).sum())
+        if area < int(min_area_px):
+            continue
+        mask = (a == ink).astype(np.uint8)
+        paths = potrace_paths(
+            mask,
+            sx,
+            sy,
+            scale=1,
+            alphamax=1.0,
+            opttol=0.2,
+            turdsize=0,
+            smooth=0.0,
+        )
+        if paths:
+            try:
+                gap = _boundary_curve_gap_px(mask, paths, sx, sy)
+            except Exception:
+                gap = 0.0
+            if gap > gap_trigger:
+                iso_paths = _iso_capped_paths(mask, sx, sy, sigma=0.8, cap_px=0.8)
+                if iso_paths:
+                    paths = iso_paths
+                    iso_n += 1
+        if not paths:
+            continue
+        rec = {
+            "hex": to_hex(palette[ink]),
+            "name": layer_name(palette[ink]),
+            "paths": paths,
+            "lum": lum(palette[ink]),
+            "n": area,
+        }
+        layers.append(rec)
+    return layers, {
+        "vector_graph": "logo-potrace-mask",
+        "iso_fallback": iso_n,
+        "colors": len(layers),
+    }
+
+
 def svg_from_layers(layers, width_in, height_in, paper_hex=None):
     w = fmt(width_in, 4)
     h = fmt(height_in, 4)
@@ -10756,61 +11099,36 @@ def vectorize(path: str, inches: float = 10.0, colors=None, mode: str = "auto"):
     sx = width_in / assign.shape[1]
     sy = height_in / assign.shape[0]
 
-    # Path-level Vector Graph (shared seams / knockout).
-    # Keylined junk mascots: keyline is already unioned into the dark ink;
-    # try the graph first (no primitive swap on whiskers). Fall through to
-    # potrace plates if coverage fails so finger/whiskers survive.
+    # Logo plates: potrace each assign-mask ink (evenodd). Shared-crack
+    # Schneider is what dropped thin inlets on clean marks. The keyline
+    # mask (whisker ridges included) is traced as-is. Busy-type plate-lock
+    # returns before this branch.
     if kind == "logo" and glyph is None and ov_mask is None:
         try:
-            dleg = 6.0
-            if (not noisy) and kind == "logo" and up_scale >= 4:
-                # Match upsample so 1px original stairs collapse; larger
-                # legs melt designed corners and zero graph coverage.
-                dleg = max(6.0, float(up_scale) + 1.5)
-            glayers, gaux = vector_graph_layers(
+            glayers, gaux = logo_potrace_mask_layers(
                 assign.astype(np.int32),
                 palette,
                 sx,
                 sy,
-                rgb=rgb_edge_up if rgb_edge_up is not None else up,
-                logo=True,
-                try_primitives=(not keylined),
                 min_area_px=max(4 if keylined else 10, int(0.00003 * assign.size)),
-                gap_fill=True,
-                destair_leg=dleg,
             )
-            gpaths = sum(len(L["paths"]) for L in glayers)
-            cov = float(gaux.get("coverage") or 0.0)
-            if (
-                glayers
-                and gpaths >= 2
-                and cov >= (0.55 if keylined else 0.62)
-                and not gaux.get("too_sharded")
-            ):
+            gpaths = sum(len(L.get("paths") or []) for L in glayers)
+            if glayers and gpaths >= 1:
                 paper_hex = to_hex(paper_rgb)
-                overlay = []
-                if keylined and kmeta:
-                    di = kmeta.get("dark_i")
-                    dark_hex = to_hex(palette[di]) if di is not None else "#000000"
-                    overlay = _overlay_strokes_from_polylines(
-                        kmeta.get("whisk_polylines") or [],
-                        sx,
-                        sy,
-                        dark_hex,
-                        kmeta.get("whisk_thick") or 2,
-                    )
+                # Whisker ridges are already in the keyline assign mask.
+                # A second Schneider stroke on top doubles them.
                 svg = svg_from_layers_with_gaps(
                     glayers,
                     width_in,
                     height_in,
                     paper_hex,
-                    gap_strokes=gaux.get("gap_strokes") or [],
-                    overlay_strokes=overlay,
+                    gap_strokes=[],
+                    overlay_strokes=[],
                 )
                 n_paths = len(re.findall(r"<path\b", svg, re.I)) or gpaths
                 meta = {
                     "engine": "decoclub-vector",
-                    "backend": "vector-graph",
+                    "backend": "potrace",
                     "mode": kind,
                     "paths": n_paths,
                     "colors": len(glayers),
@@ -10821,21 +11139,17 @@ def vectorize(path: str, inches: float = 10.0, colors=None, mode: str = "auto"):
                     "inches": [width_in, height_in],
                     "ms": int((time.time() - t0) * 1000),
                     "paper": paper_hex,
-                    "overlay": bool(overlay is not None),
+                    "overlay": False,
                     "rec_err": round(rec_err, 2),
                     "keyline": bool(keylined),
-                    "shared_edge": True,
-                    "cracks": gaux.get("cracks"),
-                    "loops": gaux.get("loops"),
-                    "coverage": gaux.get("coverage"),
-                    "vector_graph": "shared-seams",
-                    "primitives": gaux.get("primitives"),
-                    "shared_seams": gaux.get("shared_seams"),
+                    "shared_edge": False,
+                    "vector_graph": "logo-potrace-mask",
+                    "iso_fallback": gaux.get("iso_fallback", 0),
                     "polish": {},
                 }
                 return svg, meta
         except Exception as e:
-            sys.stderr.write(f"vector_graph logo failed: {e}\n")
+            sys.stderr.write(f"logo potrace mask failed: {e}\n")
             pass
 
     def emit(mask, rgb_c, *, alphamax=1.0, opttol=0.2, turdsize=2, smooth=0.55, opacity=None, suffix=""):
