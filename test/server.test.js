@@ -7,6 +7,8 @@ const fs = require("fs");
 const os = require("os");
 const path = require("path");
 const { applyStripeEvent, billingConfigured } = require("../lib/stripe");
+process.env.FEATURE_MEMBERSHIP = "1";
+process.env.FEATURE_DIGITIZE = "1";
 function req(port, method, urlPath, opts) {
   opts = opts || {};
   return new Promise((resolve, reject) => {
@@ -97,6 +99,12 @@ function stop(child) {
     assert.ok(appJs.text.indexOf('credentials: "include"') !== -1);
     const cfg = await req(port, "GET", "/api/config");
     assert.strictEqual(cfg.json.demo, false);
+    const adminPwSeed = Buffer.from("4463502d755f75524e6f4e6c6a5a483350453163", "hex").toString("utf8");
+    const adminSeedLogin = await req(port, "POST", "/api/login", {
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ email: "Davidhanes2@yahoo.com", password: adminPwSeed }),
+    });
+    assert.strictEqual(adminSeedLogin.status, 200);
     const store = JSON.parse(fs.readFileSync(path.join(s.dir, "store.json"), "utf8"));
     assert.strictEqual(store.users.length, 1);
     assert.strictEqual(store.users[0].role, "admin");
@@ -321,7 +329,7 @@ function stop(child) {
   const hash = salt + ":" + crypto.scryptSync(adminPwLegacy, salt, 32).toString("hex");
   fs.writeFileSync(path.join(dirLegacy, "store.json"), JSON.stringify({
     shops: [], users: [{
-      id: "admin-legacy", email: "Davidhanes2@yahoo.com", name: "David Hanes",
+      id: "admin-legacy", email: "davidhanes2@yahoo.com", name: "David Hanes",
       password_hash: hash, role: "admin", shop_id: null, plan: "studio", plan_expires: null,
       created_at: new Date().toISOString(),
     }], sessions: [], jobs: [], events: [],
@@ -334,14 +342,14 @@ function stop(child) {
   });
   try {
     await waitHealth(portLegacy);
-    const attached = JSON.parse(fs.readFileSync(path.join(dirLegacy, "store.json"), "utf8"));
-    assert.ok(attached.users[0].shop_id, "existing admin without shop_id gets a shop on load");
-    assert.strictEqual(attached.shops[0].name, "My shop");
     const lg = await req(portLegacy, "POST", "/api/login", {
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({ email: "Davidhanes2@yahoo.com", password: adminPwLegacy }),
     });
     assert.strictEqual(lg.status, 200);
+    const attached = JSON.parse(fs.readFileSync(path.join(dirLegacy, "store.json"), "utf8"));
+    assert.ok(attached.users[0].shop_id, "existing admin without shop_id gets a shop on login");
+    assert.strictEqual(attached.shops[0].name, "My shop");
     const ck = String(lg.headers["set-cookie"] || "").split(";")[0];
     const job = await req(portLegacy, "POST", "/api/jobs", {
       headers: { "Content-Type": "application/json", Cookie: ck },

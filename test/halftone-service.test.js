@@ -6,6 +6,8 @@ const fs = require("fs");
 const os = require("os");
 const path = require("path");
 const { applyStripeEvent, grantHalftoneCredits, creditsForProduct, isHalftoneProduct } = require("../lib/stripe");
+process.env.FEATURE_MEMBERSHIP = "1";
+process.env.FEATURE_DIGITIZE = "1";
 
 const HT_CRED = "halftone_credits";
 
@@ -158,10 +160,14 @@ function stop(child) {
     assert.strictEqual(me0.json.user.services.halftones.canApply, false);
     console.log("ok trial/shop signup: 0 credits, not included");
 
-    // Need a job + artwork to hit Apply — create job then try Apply without art → 400; with gate first
-    // Force plan to shop (not studio) and 0 credits, then call Apply on a fake job id → 404 after gate
-    // Better: create job, then Apply — gate returns 402 before job lookup? Order is: canRunFloor, requireHalftoneApply, then job.
-    const gated = await req(port, "POST", "/api/jobs/nope/halftone", {
+    // Credit gate runs after job lookup. A real job with 0 credits is 402; a missing id is 404.
+    const jobRes = await req(port, "POST", "/api/jobs", {
+      headers: { Cookie: shopCk },
+      body: JSON.stringify({ title: "HT test", method: "apparel", width_in: 10, height_in: 10 }),
+    });
+    assert.strictEqual(jobRes.status, 200, JSON.stringify(jobRes.json));
+    const jobId = jobRes.json.job.id;
+    const gated = await req(port, "POST", "/api/jobs/" + jobId + "/halftone", {
       headers: { Cookie: shopCk },
       body: JSON.stringify({ style: "classic-round" }),
     });
@@ -169,15 +175,6 @@ function stop(child) {
     assert.strictEqual(gated.json.code, "halftone_credits_required");
     assert.ok(gated.json.buy && gated.json.buy.single);
     console.log("ok zero-credit Apply returns 402 with buy options");
-
-    // Preview stays free (job may 404 but not 402)
-    // Create a job first
-    const jobRes = await req(port, "POST", "/api/jobs", {
-      headers: { Cookie: shopCk },
-      body: JSON.stringify({ title: "HT test", method: "apparel", width_in: 10, height_in: 10 }),
-    });
-    assert.strictEqual(jobRes.status, 200, JSON.stringify(jobRes.json));
-    const jobId = jobRes.json.job.id;
     const prev = await req(port, "POST", "/api/jobs/" + jobId + "/halftone/preview", {
       headers: { Cookie: shopCk },
       body: JSON.stringify({ style: "classic-round" }),
