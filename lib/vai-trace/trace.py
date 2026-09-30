@@ -11418,25 +11418,37 @@ def vectorize(path: str, inches: float = 10.0, colors=None, mode: str = "auto"):
 
     if up_scale > 1:
         # Linear on junk (not nearest) so silhouette stairs don't get 2× blockier.
-        # Tiny clean mascots: nearest keeps hard edges. Cubic on 225px palette
-        # logos invents wobble destaircase cannot kill (not H/V stairs).
+        # Clean logos ≤260px used to nearest-upscale 4×, so potrace traced the
+        # pixel blocks (bee 225px: grid-steps ~76%). Cubic-upsample the soft AA
+        # image, then a light bilateral, and re-detect paper on that smooth
+        # upsample. Never nearest-upscale the hard paper mask on this path.
+        smooth_small = (not noisy) and kind == "logo" and max(h, w) <= 260
         if noisy:
             interp = cv2.INTER_LINEAR
-        elif kind == "logo" and max(h, w) <= 260:
-            interp = cv2.INTER_NEAREST
         else:
             interp = cv2.INTER_CUBIC
         up = cv2.resize(
             rgb_q, (w * up_scale, h * up_scale), interpolation=interp
         )
-        paper_up = (
-            cv2.resize(
-                paper_q.astype(np.uint8),
-                (up.shape[1], up.shape[0]),
-                interpolation=cv2.INTER_NEAREST,
+        if smooth_small:
+            # ~1 source pixel at 4×. Stops cubic overshoot thresholding into a halo.
+            up = cv2.bilateralFilter(up, 5, 16, 4)
+            au = alpha
+            if au.shape[:2] != (h, w):
+                au = cv2.resize(alpha, (w, h), interpolation=cv2.INTER_LINEAR)
+            au = cv2.resize(
+                au, (up.shape[1], up.shape[0]), interpolation=cv2.INTER_LINEAR
             )
-            > 0
-        )
+            paper_up, _paper_rgb_s = detect_paper(up, au)
+        else:
+            paper_up = (
+                cv2.resize(
+                    paper_q.astype(np.uint8),
+                    (up.shape[1], up.shape[0]),
+                    interpolation=cv2.INTER_NEAREST,
+                )
+                > 0
+            )
         grad_up = gradient_mag(up)
         rgb_edge_up = cv2.resize(
             rgb_edge, (up.shape[1], up.shape[0]), interpolation=cv2.INTER_CUBIC
