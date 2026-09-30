@@ -7,6 +7,8 @@ General pipeline (no per-artwork paste / no filename branches):
   2. Paper flood, true-alpha flatten; junk-JPEG dens score gates stronger
      denoise / upsample / sheet-dirt merge / warm-flat collapse.
   3. Logo: Lab palette snap, color-preserving upsample, evenodd holes, potrace.
+     Crumb-noisy JPEGs are solidified first (fringe dissolved, crumbs dropped,
+     bulky edges snapped). Clean marks and keylined mascots are unchanged.
      Junk light-sheet mascots: Lanczos upsample + edge-preserve, then an
      even distance-field keyline (no JPEG stairs), muzzle ridges for
      whiskers, and assigned-dark specks folded away. White chests are fills.
@@ -8848,6 +8850,489 @@ def _boundary_curve_gap_px(mask, paths, sx, sy):
     return float(np.percentile(dist[ys, xs], 75))
 
 
+def _neighbor_mode(assign, comp, banned):
+    """Majority label in the 8-ring around a component. Paper wins when it outnumbers ink."""
+    dil = cv2.dilate(comp.astype(np.uint8), np.ones((3, 3), np.uint8))
+    ring = (dil > 0) & ~comp
+    if not np.any(ring):
+        return None
+    vals = np.asarray(assign)[ring]
+    vals = vals[vals != banned]
+    if vals.size == 0:
+        return None
+    shifted = vals.astype(np.int32) + 1
+    if int(shifted.min()) < 0:
+        return None
+    bc = np.bincount(shifted)
+    paper_n = int(bc[0]) if bc.size else 0
+    ink_n = int(bc[1:].sum()) if bc.size > 1 else 0
+    if paper_n > ink_n:
+        return -1
+    if ink_n <= 0:
+        return -1
+    return int(np.argmax(bc[1:]))
+
+
+def _drop_small_components(assign, n_labels, max_area, protect=None):
+    """Reassign connected crumbs under max_area to the surrounding label."""
+    a = assign
+    for lab in range(int(n_labels)):
+        m = a == lab
+        if not np.any(m):
+            continue
+        _n, labels, stats, _ = cv2.connectedComponentsWithStats(m.astype(np.uint8), 8)
+        for i in range(1, _n):
+            area = int(stats[i, cv2.CC_STAT_AREA])
+            if area <= 0 or area >= max_area:
+                continue
+            comp = labels == i
+            pick = _neighbor_mode(a, comp, lab)
+            if pick is None:
+                continue
+            bw = int(stats[i, cv2.CC_STAT_WIDTH])
+            bh = int(stats[i, cv2.CC_STAT_HEIGHT])
+            aspect = max(bw, bh) / float(max(1, min(bw, bh)))
+            # Keep a locked vein tip (long). Round crumbs are mosquito noise,
+            # including ones sitting on a fill.
+            if (
+                protect is not None
+                and pick != -1
+                and area >= 8
+                and aspect >= 3.5
+                and float(protect[comp].mean()) >= 0.5
+            ):
+                continue
+            a[comp] = pick
+    return a
+
+
+def _long_thin_stroke_mask(mask, unit):
+    """Long, narrow components. Stairs and round crumbs fail the gates.
+
+    Half-width is the median distance-transform radius. Whiskers pass;
+    a bulky fill does not, even when its outline is jagged.
+    """
+    m = (np.asarray(mask) > 0).astype(np.uint8)
+    lock = np.zeros(m.shape, bool)
+    if int(m.sum()) < 24:
+        return lock
+    dist = cv2.distanceTransform(m, cv2.DIST_L2, 3)
+    half_max = max(1.35, 2.2 * float(unit))
+    len_min = max(24.0, 32.0 * float(unit))
+    n, labels, stats, _ = cv2.connectedComponentsWithStats(m, 8)
+    for i in range(1, n):
+        area = int(stats[i, cv2.CC_STAT_AREA])
+        if area < 20:
+            continue
+        bw = int(stats[i, cv2.CC_STAT_WIDTH])
+        bh = int(stats[i, cv2.CC_STAT_HEIGHT])
+        long = float(max(bw, bh))
+        short = float(max(1, min(bw, bh)))
+        if long < len_min or (long / short) < 4.0:
+            continue
+        comp = labels == i
+        if float(np.median(dist[comp])) <= half_max:
+            lock[comp] = True
+    return lock
+
+
+def solidify_jpeg_logo_assign(assign, palette):
+    """Solidify a crumb-noisy JPEG logo mask before potrace.
+
+    Canva JPEGs leave a low-chroma fringe plate and a cloud of dark crumbs,
+    and bulky edges stay sawtoothed so potrace hugs the stairs. When the dark
+    plate has many disconnected crumbs: dissolve that fringe into the nearest
+    real plate, delete the crumbs, and snap bulky boundaries onto a Gaussian
+    isocontour. Thin dark strokes (wing veins) stay locked. A clean mark with
+    few crumbs is returned unchanged, so its potrace output stays put.
+
+    Whisker-dense logos (long-narrow stroke mass on any ink) skip the whole
+    pass even when crumbs pass the floor — snap eats those strokes.
+    """
+    a0 = np.asarray(assign, dtype=np.int32)
+    if a0.size == 0 or not len(palette):
+        return a0, {"applied": False, "crumbs": 0}
+    h, w = a0.shape
+    unit = float(max(h, w)) / 1422.0
+    crumb_area = max(12, int(round(48.0 * unit * unit)))
+    dark = []
+    for i, c in enumerate(palette):
+        if lum(c) < 42 and chroma_of_lab(lab_of_rgb([c])[0]) < 28:
+            dark.append(i)
+    crumbs = 0
+    for di in dark:
+        _n, _labels, stats, _ = cv2.connectedComponentsWithStats((a0 == di).astype(np.uint8), 8)
+        for i in range(1, _n):
+            area = int(stats[i, cv2.CC_STAT_AREA])
+            if 0 < area < crumb_area:
+                crumbs += 1
+    if crumbs < 12 or not dark:
+        return a0, {"applied": False, "crumbs": int(crumbs)}
+
+    whisker = np.zeros(a0.shape, bool)
+    for lab in range(len(palette)):
+        whisker |= _long_thin_stroke_mask(a0 == lab, unit)
+    whisker_px = int(whisker.sum())
+    ink_px = int((a0 >= 0).sum())
+    whisker_frac = (whisker_px / float(ink_px)) if ink_px else 0.0
+    whisker_px_min = max(1500, int(round(2000.0 * unit * unit)))
+    if whisker_px >= whisker_px_min:
+        return a0, {
+            "applied": False,
+            "crumbs": int(crumbs),
+            "whisker_gate": True,
+            "thin": whisker_px,
+            "thin_frac": round(whisker_frac, 5),
+        }
+
+    a = a0.copy()
+    med_lim = 4.5 * unit
+    fringe = []
+    for i, c in enumerate(palette):
+        if i in dark:
+            continue
+        lv = lum(c)
+        ch = chroma_of_lab(lab_of_rgb([c])[0])
+        m = a == i
+        n = int(m.sum())
+        if n < 30 or not (ch < 24.0 and 50.0 < lv < 190.0):
+            continue
+        er = cv2.erode(m.astype(np.uint8), np.ones((3, 3), np.uint8))
+        edge_frac = float((m & (er == 0)).sum()) / float(n)
+        if edge_frac < 0.22:
+            continue
+        dist = cv2.distanceTransform(m.astype(np.uint8), cv2.DIST_L2, 3)
+        if float(np.median(dist[m])) <= med_lim:
+            fringe.append(i)
+    if fringe:
+        best_d = np.full(a.shape, np.float32(1e9), np.float32)
+        best_l = np.full(a.shape, -1, np.int32)
+        targets = [-1] + [i for i in range(len(palette)) if i not in fringe]
+        for lab in targets:
+            src_u = ((a < 0) if lab < 0 else (a == lab)).astype(np.uint8)
+            if int(src_u.sum()) == 0:
+                continue
+            d = cv2.distanceTransform((1 - src_u).astype(np.uint8), cv2.DIST_L2, 3)
+            d[src_u > 0] = 0
+            better = d < best_d
+            best_d[better] = d[better]
+            best_l[better] = lab
+        fm = np.zeros(a.shape, bool)
+        for i in fringe:
+            fm |= a == i
+        a[fm] = best_l[fm]
+
+    a = _drop_small_components(a, len(palette), crumb_area)
+
+    ksize = int(round(7.0 * unit))
+    if ksize < 5:
+        ksize = 5
+    if ksize % 2 == 0:
+        ksize += 1
+    kern = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (ksize, ksize))
+    thin = np.zeros(a.shape, bool)
+    for di in dark:
+        m = (a == di).astype(np.uint8)
+        if int(m.sum()) == 0:
+            continue
+        opened = cv2.morphologyEx(m, cv2.MORPH_OPEN, kern)
+        # Pixels farther than a 1px ring from the bulky core are the vein.
+        # The ring itself stays unlocked so outline sawteeth can be snapped.
+        near = cv2.dilate(opened, np.ones((3, 3), np.uint8))
+        thin |= (m > 0) & (near == 0)
+
+    sigma = max(0.8, 4.5 * unit)
+    cap = sigma * 1.35
+    src = a.copy()
+    src[thin] = -2
+    fields = []
+    for lab in range(len(palette)):
+        fields.append(cv2.GaussianBlur((src == lab).astype(np.float32), (0, 0), sigma))
+    idx = np.argmax(np.stack(fields, 0), 0).astype(np.int32)
+    sil = a >= 0
+    din = cv2.distanceTransform(sil.astype(np.uint8), cv2.DIST_L2, 3)
+    dout = cv2.distanceTransform((~sil).astype(np.uint8), cv2.DIST_L2, 3)
+    sil_iso = cv2.GaussianBlur(sil.astype(np.float32), (0, 0), sigma) >= 0.50
+    sil_new = sil.copy()
+    band_in = (din <= cap) & (din > 0)
+    band_out = (dout <= cap) & (dout > 0) & (~sil)
+    sil_new[band_in] = sil_iso[band_in]
+    sil_new[band_out] = sil_iso[band_out]
+    out = np.full(a.shape, -1, np.int32)
+    out[sil_new] = idx[sil_new]
+    out[thin] = a[thin]
+    # A locked vein can lose its neck to the isocontour. Close 1–2px gaps
+    # only where that ink already was, so the vein stays attached and the
+    # shaved sawteeth stay shaved.
+    bridge = np.ones((3, 3), np.uint8)
+    for di in dark:
+        orig = a == di
+        cur = (out == di).astype(np.uint8)
+        if int(cur.sum()) == 0 or not np.any(orig):
+            continue
+        closed = cv2.morphologyEx(cur, cv2.MORPH_CLOSE, bridge)
+        out[(closed > 0) & orig] = di
+    # Snap can pinch off a round stub larger than the original crumb floor.
+    out = _drop_small_components(
+        out, len(palette), max(crumb_area, int(round(100.0 * unit * unit))), protect=thin
+    )
+    return out, {
+        "applied": True,
+        "crumbs": int(crumbs),
+        "fringe": len(fringe),
+        "sigma": round(float(sigma), 2),
+        "thin": int(thin.sum()),
+    }
+
+
+def _cie_lab(rgb):
+    """CIE L*a*b* (D65, sRGB). rgb is (..., 3) in 0..255."""
+    x = np.asarray(rgb, dtype=np.float64)
+    flat = np.clip(x.reshape(-1, 3), 0.0, 255.0) / 255.0
+    lin = np.where(flat <= 0.04045, flat / 12.92, ((flat + 0.055) / 1.055) ** 2.4)
+    mat = np.array(
+        [
+            [0.4124564, 0.3575761, 0.1804375],
+            [0.2126729, 0.7151522, 0.0721750],
+            [0.0193339, 0.1191920, 0.9503041],
+        ],
+        dtype=np.float64,
+    )
+    xyz = lin @ mat.T
+    t = xyz / np.array([0.95047, 1.0, 1.08883], dtype=np.float64)
+    eps = 216.0 / 24389.0
+    kappa = 24389.0 / 27.0
+    f = np.where(t > eps, np.cbrt(t), (kappa * t + 16.0) / 116.0)
+    lab = np.stack(
+        [116.0 * f[:, 1] - 16.0, 500.0 * (f[:, 0] - f[:, 1]), 200.0 * (f[:, 1] - f[:, 2])],
+        axis=1,
+    )
+    return lab.reshape(x.shape[:-1] + (3,))
+
+
+def _de76(a, b):
+    d = np.asarray(a, dtype=np.float64) - np.asarray(b, dtype=np.float64)
+    return np.sqrt(np.sum(d * d, axis=-1))
+
+
+def drop_invented_jpeg_slivers(assign, palette, src_rgb, paper_rgb):
+    """Reassign thin chromatic ink the source does not support.
+
+    JPEG anti-alias fringe lands in the nearest palette slot (mauve hairlines
+    on pale fur, and the same ink ghosting along white whiskers) even when no
+    source pixel under the stroke is that colour. A component is invented when
+    it is thin (median distance-transform radius <= ~2px at the 1422 reference),
+    small (a hairline, not a plate-sized web), and CIE76 to its own ink is high
+    (median >= 22 and under 10% of pixels within 18). Only dusty chromatic inks
+    are donors (CIE C* 8–36). Saturated gold, orange, and yellow stay even when
+    a thin sample's source ΔE is high — those strokes are the art. Pixels go to
+    the neighbour label closest to the source under the stroke. Solid regions
+    (the nose) and source-backed thin fur stay. Black is never a donor or a
+    target, so a fringe cannot become a new speck.
+
+    A component that passes those gates is still kept when it is a neutral
+    grey hairline on white: under 30% of its outline touches black, at least
+    70% of that outline touches paper, the source under it is at least 10 L*
+    darker than the paper-labelled pixels in a 2px ring, that ring itself is
+    white (median L* >= 89), and the source median is near-neutral (RGB
+    channel spread <= 12). That is a real whisker drawn in the wrong dusty
+    ink. Those kept components are recoloured to one grey ink: the rounded
+    median RGB of their darker core (centerline pixels at or below the
+    component's median L*). Fringe that hugs a black edge, and ghost arcs on
+    blue-grey fur, still drop.
+    """
+    a0 = np.asarray(assign, dtype=np.int32)
+    empty = {"applied": False, "components": 0, "dropped_px": 0}
+    if a0.size == 0 or not len(palette):
+        return a0, empty
+    src = np.asarray(src_rgb)
+    if src.ndim != 3 or src.shape[2] < 3:
+        return a0, empty
+    src = src[:, :, :3]
+    if src.shape[:2] != a0.shape[:2]:
+        src = cv2.resize(src, (a0.shape[1], a0.shape[0]), interpolation=cv2.INTER_CUBIC)
+    if src.dtype != np.uint8:
+        src = np.clip(np.round(src), 0, 255).astype(np.uint8)
+    h, w = a0.shape
+    unit = float(max(h, w)) / 1422.0
+    half_max = max(1.5, 2.0 * float(unit))
+    min_area = max(20, int(round(20.0 * unit * unit)))
+    src_lab = _cie_lab(src)
+    pr = np.clip(np.round(np.asarray(paper_rgb, dtype=np.float64).reshape(-1)[:3]), 0, 255)
+    paper_lab = _cie_lab(pr.reshape(1, 3))[0]
+    pal_u8 = np.clip(np.round(np.stack([np.asarray(c, dtype=np.float64).reshape(-1)[:3] for c in palette], 0)), 0, 255)
+    ink_lab = _cie_lab(pal_u8.astype(np.uint8))
+    is_black = []
+    for c in palette:
+        is_black.append(bool(lum(c) < 42 and chroma_of_lab(lab_of_rgb([c])[0]) < 28))
+    # CIE C* of each ink. Fringe slots are dusty; saturated brand inks are not.
+    ink_chroma = [float(np.hypot(ink_lab[i][1], ink_lab[i][2])) for i in range(len(palette))]
+    max_area = max(700, int(round(800.0 * unit * unit)))
+    color_of = {-1: paper_lab}
+    for i in range(len(palette)):
+        color_of[i] = ink_lab[i]
+    out = a0.copy()
+    n_comp = 0
+    dropped_px = 0
+    to_paper = 0
+    to_black = 0
+    n_kept = 0
+    kept_px = 0
+    kept_comps = []
+    core_chunks = []
+    # Grey hairline on white. Gaps on the 45 mauve components of
+    # OIP-981884430 at 1422: outer whiskers are black-adj 0.01–0.04,
+    # paper-adj 0.99–1.00, ΔL 26–39, paper-ring L* 91–95, source spread 0.
+    # Cheek-channel ghosts that are also low-black sit at paper-adj 0.51–0.56
+    # or, when paper-adj is high, ring L* 86–87 and source spread 18–21.
+    # Black-edge fringe is black-adj >= 0.42.
+    black_adj_max = 0.30
+    paper_adj_min = 0.70
+    dl_min = 10.0
+    ground_L_min = 89.0
+    spread_max = 12.0
+    kern = np.ones((3, 3), np.uint8)
+    ring_k = np.ones((5, 5), np.uint8)
+    black_m = np.zeros(a0.shape, bool)
+    for i, ib in enumerate(is_black):
+        if ib:
+            black_m |= a0 == i
+    paper_m = a0 < 0
+    black_touch = cv2.dilate(black_m.astype(np.uint8), kern) > 0
+    paper_touch = cv2.dilate(paper_m.astype(np.uint8), kern) > 0
+    Lch = src_lab[:, :, 0]
+    for ink in range(len(palette)):
+        if is_black[ink]:
+            continue
+        if not (8.0 <= ink_chroma[ink] <= 36.0):
+            continue
+        m = (a0 == ink).astype(np.uint8)
+        if int(m.sum()) < min_area:
+            continue
+        dist = cv2.distanceTransform(m, cv2.DIST_L2, 3)
+        n, labels, stats, _ = cv2.connectedComponentsWithStats(m, 8)
+        own = ink_lab[ink]
+        for ci in range(1, n):
+            area = int(stats[ci, cv2.CC_STAT_AREA])
+            if area < min_area or area > max_area:
+                continue
+            comp = labels == ci
+            if float(np.median(dist[comp])) > half_max:
+                continue
+            de = _de76(src_lab[comp], own)
+            med = float(np.median(de))
+            frac_close = float(np.mean(de < 18.0))
+            # Unsupported: the ink is not in the source under this stroke.
+            # Real thin fur still has a core within ΔE 18 (brown chin on 981
+            # stays above 0.30). Invented mauve fringe sits at 0.00 / median ~30.
+            if not (med >= 22.0 and frac_close < 0.10):
+                continue
+            er = cv2.erode(comp.astype(np.uint8), kern)
+            boundary = comp & (er == 0)
+            nb = int(boundary.sum())
+            if nb:
+                black_adj = float((boundary & black_touch).sum()) / float(nb)
+                paper_adj = float((boundary & paper_touch).sum()) / float(nb)
+                ring_dil = cv2.dilate(comp.astype(np.uint8), ring_k)
+                pring = (ring_dil > 0) & (~comp) & paper_m
+                if int(pring.sum()) >= 12:
+                    ground_L = float(np.median(Lch[pring]))
+                    dL = ground_L - float(np.median(Lch[comp]))
+                else:
+                    ground_L = 0.0
+                    dL = 0.0
+                src_med = np.median(src[comp], axis=0)
+                spread = float(src_med.max() - src_med.min())
+                if (
+                    black_adj < black_adj_max
+                    and paper_adj >= paper_adj_min
+                    and dL >= dl_min
+                    and ground_L >= ground_L_min
+                    and spread <= spread_max
+                ):
+                    n_kept += 1
+                    kept_px += area
+                    # Darker core: centerline (dist >= median) and at or below
+                    # the component's median L*. Pale JPEG halo stays out of
+                    # the sample so the flat ink matches the hair, not the fade.
+                    Ls = Lch[comp]
+                    sel = (dist[comp] >= float(np.median(dist[comp]))) & (Ls <= float(np.median(Ls)))
+                    if int(sel.sum()) < 8:
+                        sel = Ls <= float(np.median(Ls))
+                    if int(sel.sum()) < 8:
+                        sel = np.ones(int(comp.sum()), dtype=bool)
+                    core_chunks.append(src[comp][sel])
+                    kept_comps.append(comp)
+                    continue
+            dil = cv2.dilate(comp.astype(np.uint8), kern)
+            ring = (dil > 0) & (~comp)
+            if not np.any(ring):
+                continue
+            neigh = a0[ring]
+            vals = np.unique(neigh)
+            med_src = np.median(src_lab[comp], axis=0)
+            cands = []
+            for v in vals:
+                v = int(v)
+                d = float(np.linalg.norm(med_src - color_of[v]))
+                cands.append((d, v))
+            cands.sort()
+            chosen = None
+            for _d, v in cands:
+                # Never paint the fringe into black. That is a new speck.
+                if v >= 0 and is_black[v]:
+                    continue
+                chosen = v
+                break
+            if chosen is None or chosen == ink:
+                continue
+            out[comp] = chosen
+            n_comp += 1
+            dropped_px += area
+            if chosen < 0:
+                to_paper += area
+            elif is_black[chosen]:
+                to_black += area
+    grey_hex = None
+    if kept_comps:
+        pooled = np.concatenate(core_chunks, axis=0)
+        grey = np.clip(np.round(np.median(pooled, axis=0)), 0, 255).astype(np.float64)
+        grey_idx = None
+        for i, c in enumerate(palette):
+            if np.all(np.round(np.asarray(c, dtype=np.float64).reshape(-1)[:3]) == grey):
+                grey_idx = i
+                break
+        if grey_idx is None:
+            palette.append(grey)
+            grey_idx = len(palette) - 1
+        for comp in kept_comps:
+            out[comp] = grey_idx
+        grey_hex = to_hex(grey)
+    if n_comp == 0 and grey_hex is None:
+        return a0, {
+            "applied": False,
+            "components": 0,
+            "dropped_px": 0,
+            "kept": int(n_kept),
+            "kept_px": int(kept_px),
+            "half_max": round(float(half_max), 3),
+        }
+    meta = {
+        "applied": True,
+        "components": int(n_comp),
+        "dropped_px": int(dropped_px),
+        "to_paper": int(to_paper),
+        "to_black": int(to_black),
+        "kept": int(n_kept),
+        "kept_px": int(kept_px),
+        "half_max": round(float(half_max), 3),
+    }
+    if grey_hex is not None:
+        meta["grey"] = grey_hex
+        meta["recolored"] = int(n_kept)
+    return out, meta
+
+
 def logo_potrace_mask_layers(assign, palette, sx, sy, *, min_area_px=10):
     """Per-ink potrace of the assign mask. Evenodd compounds, no shared-crack Schneider.
 
@@ -11102,7 +11587,25 @@ def vectorize(path: str, inches: float = 10.0, colors=None, mode: str = "auto"):
     # Logo plates: potrace each assign-mask ink (evenodd). Shared-crack
     # Schneider is what dropped thin inlets on clean marks. The keyline
     # mask (whisker ridges included) is traced as-is. Busy-type plate-lock
-    # returns before this branch.
+    # returns before this branch. Crumb-noisy JPEG logos are solidified
+    # first; keylined mascots and clean marks are not.
+    solid_meta = None
+    sliver_meta = None
+    if kind == "logo" and glyph is None and ov_mask is None and not keylined:
+        assign, solid_meta = solidify_jpeg_logo_assign(assign, palette)
+    if kind == "logo" and glyph is None and ov_mask is None:
+        # Original raster, not the denoised working image: denoise pulls JPEG
+        # fringe toward the palette and would hide an invented sliver.
+        src_support = rgb0
+        if src_support.shape[:2] != assign.shape[:2]:
+            src_support = cv2.resize(
+                rgb0,
+                (assign.shape[1], assign.shape[0]),
+                interpolation=cv2.INTER_CUBIC,
+            )
+        assign, sliver_meta = drop_invented_jpeg_slivers(
+            assign, palette, src_support, paper_rgb
+        )
     if kind == "logo" and glyph is None and ov_mask is None:
         try:
             glayers, gaux = logo_potrace_mask_layers(
@@ -11145,6 +11648,8 @@ def vectorize(path: str, inches: float = 10.0, colors=None, mode: str = "auto"):
                     "shared_edge": False,
                     "vector_graph": "logo-potrace-mask",
                     "iso_fallback": gaux.get("iso_fallback", 0),
+                    "jpeg_solidify": solid_meta or {"applied": False},
+                    "jpeg_invented_sliver": sliver_meta or {"applied": False},
                     "polish": {},
                 }
                 return svg, meta
