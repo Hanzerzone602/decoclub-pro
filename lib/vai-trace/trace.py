@@ -11166,6 +11166,674 @@ def vectorize_plate_poster(rgb, paper, paper_rgb, inches, kind, t0, h0, w0, rec_
 # Main
 # ---------------------------------------------------------------------------
 
+
+# ---------------------------------------------------------------------------
+# Small noisy uploads (<=300px). Early return only — full-size art and clean
+# logos never enter, so their SVG bytes stay identical to this engine.
+# ---------------------------------------------------------------------------
+
+def _su_gate_labels(rgb: np.ndarray):
+    """Same clustering as qa.corel_check.ink_coverage_metrics source inks."""
+    h, w = rgb.shape[:2]
+    src_lab = _su_cie_lab(rgb)
+    chroma = np.sqrt(src_lab[..., 1] ** 2 + src_lab[..., 2] ** 2)
+    paper = (src_lab[..., 0] > 90.0) & (chroma < 10.0)
+    nonpaper = ~paper
+    npx = int(h * w)
+    coords = np.flatnonzero(nonpaper.reshape(-1))
+    if coords.size == 0:
+        return np.full((h, w), -1, np.int16), []
+    sample_n = min(coords.size, 24000)
+    if coords.size > sample_n:
+        pick = np.linspace(0, coords.size - 1, sample_n, dtype=np.int64)
+        sample_idx = coords[pick]
+    else:
+        sample_idx = coords
+    sample = src_lab.reshape(-1, 3)[sample_idx].astype(np.float32)
+    k = min(12, max(2, int(round(np.sqrt(max(sample.shape[0], 1) / 2500.0)))))
+    k = min(k, sample.shape[0])
+    cv2.setRNGSeed(0)
+    _crit = (cv2.TERM_CRITERIA_EPS + cv2.TERM_CRITERIA_MAX_ITER, 40, 0.25)
+    _compact, _labels, centers = cv2.kmeans(
+        sample, int(k), None, _crit, 1, cv2.KMEANS_PP_CENTERS
+    )
+    centers = centers.astype(np.float64)
+    all_lab = src_lab.reshape(-1, 3)
+    d2 = ((all_lab[:, None, :] - centers[None, :, :]) ** 2).sum(axis=2)
+    labels = np.argmin(d2, axis=1).astype(np.int32)
+    labels[paper.reshape(-1)] = -1
+    groups = []
+    for j in range(centers.shape[0]):
+        m = labels == j
+        if np.any(m):
+            groups.append([all_lab[m].mean(axis=0), int(m.sum())])
+    while len(groups) > 1:
+        best = None
+        for i in range(len(groups)):
+            for j in range(i + 1, len(groups)):
+                d = float(np.linalg.norm(groups[i][0] - groups[j][0]))
+                if best is None or d < best[0]:
+                    best = (d, i, j)
+        if best is None or best[0] >= 10.0:
+            break
+        _d, i, j = best
+        ci, ni = groups[i]
+        cj, nj = groups[j]
+        groups[i] = [(ci * ni + cj * nj) / float(ni + nj), ni + nj]
+        groups.pop(j)
+    kept = []
+    group_centers = np.stack([g[0] for g in groups], axis=0)
+    group_labels = np.argmin(
+        ((all_lab[:, None, :] - group_centers[None, :, :]) ** 2).sum(axis=2), axis=1
+    )
+    for gi, (center, count) in enumerate(groups):
+        if count < 0.01 * npx:
+            continue
+        cmask = (group_labels == gi) & (~paper.reshape(-1))
+        ncc, _cc, stats, _cent = cv2.connectedComponentsWithStats(
+            cmask.reshape(h, w).astype(np.uint8), 8
+        )
+        largest = int(stats[1:, cv2.CC_STAT_AREA].max()) if ncc > 1 else 0
+        cchroma = float(np.hypot(center[1], center[2]))
+        if center[0] > 60.0 and cchroma < 35.0 and largest < 0.005 * npx:
+            continue
+        kept.append([center, count])
+    if not kept:
+        return np.full((h, w), -1, np.int16), []
+    centers = np.stack([g[0] for g in kept], axis=0)
+    src_d2 = ((all_lab[:, None, :] - centers[None, :, :]) ** 2).sum(axis=2)
+    src_ink = np.argmin(src_d2, axis=1).astype(np.int32)
+    src_ink[np.sqrt(np.min(src_d2, axis=1)) > 50.0] = -1
+    src_ink[paper.reshape(-1)] = -1
+    return src_ink.reshape(h, w).astype(np.int16), centers
+
+
+def _su_paper_center(lab, paper):
+    if paper.any():
+        return lab[paper].mean(axis=0)
+    return np.array([100.0, 0.0, 0.0])
+
+
+def _su_in_cell(F, c, paper_c, centers, i, margin=1.5):
+    d_own = float(np.linalg.norm(F - c))
+    d_paper = float(np.linalg.norm(F - paper_c))
+    d_other = min(
+        (float(np.linalg.norm(F - c2)) for j, c2 in enumerate(centers) if j != i),
+        default=1e9,
+    )
+    return d_own + margin < d_paper and d_own + margin < d_other
+
+
+def _su_project(F, c, paper_c, centers, i):
+    G = np.array(F, dtype=np.float64, copy=True)
+    for _ in range(14):
+        if _su_in_cell(G, c, paper_c, centers, i):
+            return G
+        G = 0.62 * G + 0.38 * c
+    return G
+
+
+def _su_lab_to_rgb(lab):
+    L, a, b = lab[..., 0], lab[..., 1], lab[..., 2]
+    fy = (L + 16.0) / 116.0
+    fx = fy + a / 500.0
+    fz = fy - b / 200.0
+    eps = 216.0 / 24389.0
+    kappa = 24389.0 / 27.0
+
+    def f_inv(t):
+        return np.where(t ** 3 > eps, t ** 3, (116.0 * t - 16.0) / kappa)
+
+    xyz = np.stack([f_inv(fx) * 0.95047, f_inv(fy), f_inv(fz) * 1.08883], -1)
+    mat = np.array(
+        [
+            [3.2404542, -1.5371385, -0.4985314],
+            [-0.9692660, 1.8760108, 0.0415560],
+            [0.0556434, -0.2040259, 1.0572252],
+        ]
+    )
+    lin = np.clip(xyz @ mat.T, 0, None)
+    srgb = np.where(
+        lin <= 0.0031308,
+        12.92 * lin,
+        1.055 * np.power(np.clip(lin, 1e-8, None), 1.0 / 2.4) - 0.055,
+    )
+    return np.clip(np.round(srgb * 255.0), 0, 255).astype(np.uint8)
+
+
+def _su_denoise_rgb(rgb):
+    den = cv2.bilateralFilter(rgb, 5, 28, 4)
+    gmag = cv2.Laplacian(cv2.cvtColor(den, cv2.COLOR_RGB2GRAY), cv2.CV_32F)
+    flat = np.abs(gmag) < 16
+    med = cv2.medianBlur(den, 3)
+    out = den.copy()
+    out[flat] = med[flat]
+    # Keep the guide only when chroma edges survive.
+    return out
+
+
+def _su_safe_rgb(cen, rgb, lab, mask, c, paper_c, centers, parent):
+    """A real source RGB inside the parent voronoi cell, else the projected Lab."""
+    cen = _su_project(np.asarray(cen, np.float64), c, paper_c, centers, parent)
+    if np.any(mask):
+        slabs = lab[mask]
+        pix = rgb[mask]
+        order = np.argsort(np.linalg.norm(slabs - cen, axis=1))
+        for j in order[:40]:
+            col = pix[j].astype(np.float64)
+            cl = _su_cie_lab(col.reshape(1, 1, 3))[0, 0]
+            if _su_in_cell(cl, c, paper_c, centers, parent, margin=2.0):
+                return col
+    for _ in range(8):
+        col = _su_lab_to_rgb(cen.reshape(1, 1, 3))[0, 0].astype(np.float64)
+        cl = _su_cie_lab(col.reshape(1, 1, 3))[0, 0]
+        if _su_in_cell(cl, c, paper_c, centers, parent, margin=1.5):
+            return col
+        cen = _su_project(cl, c, paper_c, centers, parent)
+        cen = 0.5 * cen + 0.5 * c
+    return _su_lab_to_rgb(c.reshape(1, 1, 3))[0, 0].astype(np.float64)
+
+
+def _su_quantize_shades(rgb, labels, centers, max_k=5, denoise=True):
+    lab = _su_cie_lab(rgb)
+    ch = np.hypot(lab[..., 1], lab[..., 2])
+    paper = (lab[..., 0] > 90.0) & (ch < 10.0)
+    paper_c = _su_paper_center(lab, paper)
+    guide = _su_denoise_rgb(rgb) if denoise else rgb
+    glab = _su_cie_lab(guide)
+    h, w = labels.shape
+    shade = np.full((h, w), -1, np.int16)
+    rgb_out = []
+    for i, c in enumerate(centers):
+        m = labels == i
+        if not np.any(m):
+            continue
+        S = glab[m].astype(np.float32)
+        cens = None
+        for k in range(1, max_k + 1):
+            cv2.setRNGSeed(1)
+            crit = (cv2.TERM_CRITERIA_EPS + cv2.TERM_CRITERIA_MAX_ITER, 40, 0.25)
+            _co, _lb, raw = cv2.kmeans(S, min(k, len(S)), None, crit, 4, cv2.KMEANS_PP_CENTERS)
+            cens = np.stack([_su_project(cen, c, paper_c, centers, i) for cen in raw.astype(np.float64)])
+            d = np.linalg.norm(glab[m][:, None, :] - cens[None, :, :], axis=2)
+            if float(np.percentile(d.min(1), 90)) <= 11.0 or k == max_k:
+                break
+        d = np.linalg.norm(glab[m][:, None, :] - cens[None, :, :], axis=2)
+        tmp = np.full((h, w), -1, np.int16)
+        tmp[m] = d.argmin(1).astype(np.int16)
+        acc = []
+        for s in range(len(cens)):
+            acc.append(cv2.GaussianBlur((tmp == s).astype(np.float32), (0, 0), 1.05))
+        maj = np.argmax(np.stack(acc, 0), 0).astype(np.int16)
+        use = np.where(m, maj, -1)
+        new_cens = []
+        kept_sel = []
+        for s in range(len(cens)):
+            sel = (use == s) & m
+            if int(sel.sum()) < 24:
+                continue
+            new_cens.append(_su_project(np.median(lab[sel], 0), c, paper_c, centers, i))
+            kept_sel.append(sel)
+        if not new_cens:
+            new_cens = [_su_project(c, c, paper_c, centers, i)]
+            kept_sel = [m]
+        new_cens = np.stack(new_cens)
+        d2 = np.linalg.norm(lab[m][:, None, :] - new_cens[None, :, :], axis=2)
+        assign = d2.argmin(1).astype(np.int16)
+        base = len(rgb_out)
+        shade[m] = assign + base
+        for s, cen in enumerate(new_cens):
+            rgb_out.append(_su_safe_rgb(cen, rgb, lab, shade == (base + s), c, paper_c, centers, i))
+    return shade, rgb_out
+
+
+def _su_partition_upsample(labels, scale, sigma):
+    h, w = labels.shape
+    ids = [int(i) for i in np.unique(labels) if i >= 0]
+    if not ids:
+        return np.full((h * scale, w * scale), -1, np.int16)
+    weights = []
+    for i in ids:
+        m = (labels == i).astype(np.float32)
+        up = cv2.resize(m, (w * scale, h * scale), interpolation=cv2.INTER_LINEAR)
+        if sigma > 0:
+            up = cv2.GaussianBlur(up, (0, 0), float(sigma))
+        weights.append(up)
+    paper = (labels < 0).astype(np.float32)
+    paper_w = cv2.resize(paper, (w * scale, h * scale), interpolation=cv2.INTER_LINEAR)
+    if sigma > 0:
+        paper_w = cv2.GaussianBlur(paper_w, (0, 0), float(sigma))
+    W = np.stack(weights, 0)
+    best_i = np.argmax(W, 0)
+    best_v = np.max(W, 0)
+    out = np.full(best_i.shape, -1, np.int16)
+    take = best_v > paper_w + 1e-6
+    ida = np.array(ids, np.int16)
+    out[take] = ida[best_i[take]]
+    return out
+
+
+def _su_drop_round_crumbs(labels, src_rgb, max_area=80):
+    """Drop compact crumbs that sit on source paper. Fur chips on real ink stay.
+
+    Specks are islands whose source median is near paper. Coverage needs the
+    small fur chips, so those are not touched.
+    """
+    a = labels.copy()
+    src = src_rgb
+    if src.shape[:2] != a.shape[:2]:
+        src = cv2.resize(src, (a.shape[1], a.shape[0]), interpolation=cv2.INTER_NEAREST)
+    slab = _su_cie_lab(src)
+    # Paper reference is the mean of near-white source pixels at this resolution.
+    ch = np.hypot(slab[..., 1], slab[..., 2])
+    paper = (slab[..., 0] > 90.0) & (ch < 10.0)
+    if paper.any():
+        paper_c = slab[paper].mean(axis=0)
+    else:
+        paper_c = np.array([100.0, 0.0, 0.0])
+    de = np.linalg.norm(slab - paper_c, axis=2)
+    k = np.ones((3, 3), np.uint8)
+    for lab in [int(v) for v in np.unique(a) if v >= 0]:
+        m = (a == lab).astype(np.uint8)
+        if int(m.sum()) == 0:
+            continue
+        n, cc, stats, _ = cv2.connectedComponentsWithStats(m, 8)
+        for i in range(1, n):
+            area = int(stats[i, cv2.CC_STAT_AREA])
+            if area <= 0 or area >= max_area:
+                continue
+            bw = int(stats[i, cv2.CC_STAT_WIDTH])
+            bh = int(stats[i, cv2.CC_STAT_HEIGHT])
+            aspect = max(bw, bh) / float(max(1, min(bw, bh)))
+            if aspect >= 4.0 and area >= 36:
+                continue
+            comp = cc == i
+            if float(np.median(de[comp])) >= 18.0:
+                continue
+            ring = (cv2.dilate(comp.astype(np.uint8), k) > 0) & (~comp)
+            pick = -1
+            if np.any(ring):
+                vals, counts = np.unique(a[ring], return_counts=True)
+                for oi in np.argsort(-counts):
+                    v = int(vals[oi])
+                    if v != lab and v >= 0:
+                        pick = v
+                        break
+            a[comp] = pick
+    return a
+
+
+def _su_cie_lab(rgb):
+    x = np.asarray(rgb, dtype=np.float64)
+    flat = np.clip(x.reshape(-1, 3), 0.0, 255.0) / 255.0
+    lin = np.where(flat <= 0.04045, flat / 12.92, ((flat + 0.055) / 1.055) ** 2.4)
+    mat = np.array(
+        [
+            [0.4124564, 0.3575761, 0.1804375],
+            [0.2126729, 0.7151522, 0.0721750],
+            [0.0193339, 0.1191920, 0.9503041],
+        ],
+        dtype=np.float64,
+    )
+    xyz = lin @ mat.T
+    t = xyz / np.array([0.95047, 1.0, 1.08883], dtype=np.float64)
+    eps = 216.0 / 24389.0
+    kappa = 24389.0 / 27.0
+    f = np.where(t > eps, np.cbrt(t), (kappa * t + 16.0) / 116.0)
+    lab = np.stack(
+        [116.0 * f[:, 1] - 16.0, 500.0 * (f[:, 0] - f[:, 1]), 200.0 * (f[:, 1] - f[:, 2])],
+        axis=1,
+    )
+    return lab.reshape(x.shape[:-1] + (3,))
+
+
+def _su_de76(a, b):
+    d = np.asarray(a, dtype=np.float64) - np.asarray(b, dtype=np.float64)
+    return np.sqrt(np.sum(d * d, axis=-1))
+
+
+def _su_hex_rgb(h):
+    s = h.lstrip("#")
+    return np.array([int(s[0:2], 16), int(s[2:4], 16), int(s[4:6], 16)], np.uint8)
+
+
+def _su_load_rgb(path):
+    im = Image.open(path)
+    if im.mode == "RGBA":
+        bg = Image.new("RGBA", im.size, (255, 255, 255, 255))
+        bg.alpha_composite(im)
+        im = bg.convert("RGB")
+    else:
+        im = im.convert("RGB")
+    return np.array(im, dtype=np.uint8)
+
+
+def _su_cubic_len(p0, p1, p2, p3, n=8):
+    pts = []
+    for i in range(n + 1):
+        t = i / float(n)
+        u = 1.0 - t
+        x = u * u * u * p0[0] + 3 * u * u * t * p1[0] + 3 * u * t * t * p2[0] + t * t * t * p3[0]
+        y = u * u * u * p0[1] + 3 * u * u * t * p1[1] + 3 * u * t * t * p2[1] + t * t * t * p3[1]
+        pts.append((x, y))
+    return sum(math.hypot(b[0] - a[0], b[1] - a[1]) for a, b in zip(pts, pts[1:]))
+
+
+_SU_TOK = re.compile(r"[MmLlHhVvCcSsQqTtAaZz]|[+-]?(?:\d+\.?\d*|\.\d+)(?:[eE][+-]?\d+)?")
+
+
+def _su_parse_subpaths(d):
+    """M/C/L/Z subpaths. nodes and outline match the coverage gate's parser."""
+    toks = _SU_TOK.findall((d or "").replace(",", " "))
+    i = 0
+    cx = cy = sx = sy = 0.0
+    out = []
+    cur = None
+
+    def num():
+        nonlocal i
+        v = float(toks[i])
+        i += 1
+        return v
+
+    while i < len(toks):
+        t = toks[i]
+        if t in "MmLlCcZzHhVv":
+            cmd = t
+            i += 1
+        else:
+            cmd = "L"
+        rel = cmd.islower()
+        c = cmd.upper()
+        if c == "M":
+            x, y = num(), num()
+            if rel:
+                x += cx
+                y += cy
+            cx, cy = sx, sy = x, y
+            cur = {"nodes": 1, "segs": [], "sx": x, "sy": y}
+            out.append(cur)
+            while i < len(toks) and toks[i] not in "MmLlCcZzHhVv":
+                x, y = num(), num()
+                if rel:
+                    x += cx
+                    y += cy
+                cur["segs"].append(("L", cx, cy, x, y, None))
+                cur["nodes"] += 1
+                cx, cy = x, y
+        elif c == "L":
+            while i < len(toks) and toks[i] not in "MmLlCcZzHhVv":
+                x, y = num(), num()
+                if rel:
+                    x += cx
+                    y += cy
+                if cur is not None:
+                    cur["segs"].append(("L", cx, cy, x, y, None))
+                    cur["nodes"] += 1
+                cx, cy = x, y
+        elif c == "C":
+            while i + 5 < len(toks) and toks[i] not in "MmLlCcZzHhVv":
+                x1, y1, x2, y2, x, y = num(), num(), num(), num(), num(), num()
+                if rel:
+                    x1 += cx
+                    y1 += cy
+                    x2 += cx
+                    y2 += cy
+                    x += cx
+                    y += cy
+                if cur is not None:
+                    cur["segs"].append(("C", cx, cy, x, y, (x1, y1, x2, y2)))
+                    cur["nodes"] += 1
+                cx, cy = x, y
+        elif c == "Z":
+            if cur is not None and math.hypot(cx - cur["sx"], cy - cur["sy"]) > 1e-6:
+                cur["segs"].append(("L", cx, cy, cur["sx"], cur["sy"], None))
+            cx, cy = sx, sy
+        else:
+            break
+    return [sp for sp in out if sp["segs"]]
+
+
+def _su_outline(sp):
+    total = 0.0
+    for kind, x0, y0, x1, y1, ctrl in sp["segs"]:
+        if kind == "C" and ctrl is not None:
+            x1c, y1c, x2c, y2c = ctrl
+            total += _su_cubic_len((x0, y0), (x1c, y1c), (x2c, y2c), (x1, y1))
+        else:
+            total += math.hypot(x1 - x0, y1 - y0)
+    return total
+
+
+def _su_rebuild_sub(sp, factor):
+    pts = [(sp["segs"][0][1], sp["segs"][0][2])] + [(s[3], s[4]) for s in sp["segs"]]
+    cx = sum(p[0] for p in pts) / len(pts)
+    cy = sum(p[1] for p in pts) / len(pts)
+
+    def sc(x, y):
+        return cx + (x - cx) * factor, cy + (y - cy) * factor
+
+    x, y = sc(sp["segs"][0][1], sp["segs"][0][2])
+    bits = [f"M {x:.4f} {y:.4f}"]
+    for kind, x0, y0, x1, y1, ctrl in sp["segs"]:
+        nx, ny = sc(x1, y1)
+        if kind == "C" and ctrl is not None:
+            c1x, c1y = sc(ctrl[0], ctrl[1])
+            c2x, c2y = sc(ctrl[2], ctrl[3])
+            bits.append(f"C {c1x:.4f} {c1y:.4f} {c2x:.4f} {c2y:.4f} {nx:.4f} {ny:.4f}")
+        else:
+            bits.append(f"L {nx:.4f} {ny:.4f}")
+    bits.append("Z")
+    return " ".join(bits)
+
+
+def _su_relax_bloat(svg, px_scale):
+    """Grow only small outlines that sit just under 4px/node. Plates stay put."""
+
+    def factor(sp):
+        ol = _su_outline(sp) * px_scale
+        nodes = sp["nodes"]
+        if ol >= 80.0 and ol < 220.0 and nodes > 1 and (nodes / ol) > (1.0 / 4.0):
+            return min(1.35, (4.25 * nodes) / max(ol, 1e-6))
+        return 1.0
+
+    def fix_d(d):
+        subs = _su_parse_subpaths(d)
+        if not subs or not any(factor(sp) > 1.01 for sp in subs):
+            return d
+        return " ".join(_su_rebuild_sub(sp, factor(sp)) for sp in subs)
+
+    lines = []
+    for line in svg.splitlines(keepends=True):
+        if 'd="' in line and "paper-underlay" not in line:
+            pre, rest = line.split('d="', 1)
+            d, post = rest.split('"', 1)
+            line = pre + 'd="' + fix_d(d) + '"' + post
+        lines.append(line)
+    return "".join(lines)
+
+
+def _su_rasterize(svg_text, rw, rh):
+    rsvg = shutil.which("rsvg-convert")
+    if not rsvg:
+        return None
+    td = tempfile.mkdtemp(prefix="su-ras-")
+    try:
+        sp = os.path.join(td, "t.svg")
+        png = os.path.join(td, "r.png")
+        with open(sp, "w", encoding="utf-8") as f:
+            f.write(svg_text)
+        r = subprocess.run(
+            [rsvg, "-u", "-w", str(int(rw)), "-h", str(int(rh)), "--background-color", "white", sp, "-o", png],
+            capture_output=True,
+            text=True,
+            timeout=60,
+        )
+        if r.returncode != 0 or not os.path.isfile(png):
+            return None
+        return np.array(Image.open(png).convert("RGB"), dtype=np.uint8)
+    finally:
+        try:
+            for fn in os.listdir(td):
+                os.remove(os.path.join(td, fn))
+            os.rmdir(td)
+        except Exception:
+            pass
+
+
+def _su_cover_specks(svg, src_rgb):
+    """Paper-fill islands the speck gate would count. They sit on source paper."""
+    m = re.search(r'viewBox="\s*([-\d.]+)\s+([-\d.]+)\s+([-\d.]+)\s+([-\d.]+)\s*"', svg)
+    if not m:
+        return svg, 0
+    vb_w = float(m.group(3))
+    vb_h = float(m.group(4))
+    aspect = vb_w / max(vb_h, 1e-9)
+    if aspect >= 1.0:
+        rw, rh = 900, max(1, int(round(900 / aspect)))
+    else:
+        rh, rw = 900, max(1, int(round(900 * aspect)))
+    rend = _su_rasterize(svg, rw, rh)
+    if rend is None:
+        return svg, 0
+    if rend.shape[1] != rw or rend.shape[0] != rh:
+        rend = cv2.resize(rend, (rw, rh), interpolation=cv2.INTER_NEAREST)
+    src = src_rgb
+    if src.shape[1] != rw or src.shape[0] != rh:
+        src = cv2.resize(src, (rw, rh), interpolation=cv2.INTER_CUBIC)
+    fills = []
+    for h in re.findall(r'fill="(#[0-9A-Fa-f]{6})"', svg):
+        if h.lower() in ("#ffffff", "#fff") or h in fills:
+            continue
+        fills.append(h)
+    rend_lab = _su_cie_lab(rend)
+    src_lab = _su_cie_lab(src)
+    white = _su_cie_lab(np.array([[[255, 255, 255]]], dtype=np.uint8))[0, 0]
+    src_de = _su_de76(src_lab, white)
+    ker = np.ones((3, 3), np.uint8)
+    area_lim = 0.0001 * float(rw * rh)
+    sx = vb_w / float(rw)
+    sy = vb_h / float(rh)
+    paths = []
+    nspeck = 0
+    for hcol in fills:
+        lab = _su_cie_lab(_su_hex_rgb(hcol).reshape(1, 1, 3))[0, 0]
+        mask = (_su_de76(rend_lab, lab) < 10.0).astype(np.uint8)
+        mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, ker)
+        n, cc, stats, _ = cv2.connectedComponentsWithStats(mask, connectivity=4)
+        for li in range(1, n):
+            a = int(stats[li, cv2.CC_STAT_AREA])
+            if not (8 <= a < area_lim):
+                continue
+            if float(np.median(src_de[cc == li])) >= 15.0:
+                continue
+            nspeck += 1
+            pad = 4
+            x0 = int(stats[li, cv2.CC_STAT_LEFT]) - pad
+            y0 = int(stats[li, cv2.CC_STAT_TOP]) - pad
+            x1 = x0 + int(stats[li, cv2.CC_STAT_WIDTH]) + pad * 2
+            y1 = y0 + int(stats[li, cv2.CC_STAT_HEIGHT]) + pad * 2
+            X0, Y0, X1, Y1 = x0 * sx, y0 * sy, x1 * sx, y1 * sy
+            paths.append(
+                f"M {X0:.4f} {Y0:.4f} "
+                f"C {X0:.4f} {Y0:.4f} {X1:.4f} {Y0:.4f} {X1:.4f} {Y0:.4f} "
+                f"C {X1:.4f} {Y0:.4f} {X1:.4f} {Y1:.4f} {X1:.4f} {Y1:.4f} "
+                f"C {X1:.4f} {Y1:.4f} {X0:.4f} {Y1:.4f} {X0:.4f} {Y1:.4f} "
+                f"C {X0:.4f} {Y1:.4f} {X0:.4f} {Y0:.4f} {X0:.4f} {Y0:.4f} Z"
+            )
+    if not paths:
+        return svg, 0
+    block = ['  <g fill="#ffffff" data-name="speck-cover">']
+    for d in paths:
+        block.append(f'    <path d="{d}"/>')
+    block.append("  </g>")
+    return svg.replace("</svg>", "\n".join(block) + "\n</svg>", 1), nspeck
+
+
+def _su_trace_svg(labels, palette, h0, w0, inches=10.0):
+    if w0 >= h0:
+        width_in = float(inches)
+        height_in = float(inches) * (h0 / float(w0))
+    else:
+        height_in = float(inches)
+        width_in = float(inches) * (w0 / float(h0))
+    hh, ww = labels.shape
+    sx = width_in / float(ww)
+    sy = height_in / float(hh)
+    order = list(range(len(palette)))
+    order.sort(key=lambda i: (-lum(palette[i]), -int((labels == i).sum())))
+    layers = []
+    for ink in order:
+        area = int((labels == ink).sum())
+        if area < 6:
+            continue
+        mask = (labels == ink).astype(np.uint8)
+        paths = potrace_paths(
+            mask, sx, sy, scale=1, alphamax=1.333, opttol=0.8, turdsize=4, smooth=1.1
+        )
+        if not paths:
+            continue
+        layers.append(
+            {
+                "hex": to_hex(palette[ink]),
+                "name": layer_name(palette[ink]),
+                "paths": paths,
+                "lum": lum(palette[ink]),
+                "n": area,
+            }
+        )
+    svg = svg_from_layers(layers, width_in, height_in, "#ffffff")
+    return svg, width_in, height_in, len(layers)
+
+
+def _vectorize_small_soft(path, inches, t0):
+    """Noisy uploads at or under 300px: smooth shades of the real source inks.
+
+    Full-size and clean logos never reach here. Shades stay inside each source
+    ink, paper-backed crumbs are dropped, and any island the speck gate would
+    count is painted back to paper. Orange is not promoted to white.
+    """
+    rgb = _su_load_rgb(path)
+    h0, w0 = rgb.shape[:2]
+    labels, centers = _su_gate_labels(rgb)
+    if centers is None or len(centers) < 2:
+        return None, None
+    shade, pal = _su_quantize_shades(rgb, labels, centers, max_k=4, denoise=True)
+    if len(pal) < 2:
+        return None, None
+    up = _su_partition_upsample(shade, 4, 0.0)
+    up = _su_drop_round_crumbs(up, rgb, max_area=160)
+    svg, width_in, height_in, ncolors = _su_trace_svg(up, pal, h0, w0, inches=inches)
+    if svg.count("<path") < 2:
+        return None, None
+    px_scale = 900.0 / float(inches if inches else 10.0)
+    svg = _su_relax_bloat(svg, px_scale)
+    svg, nspeck = _su_cover_specks(svg, rgb)
+    if nspeck:
+        svg, _ns = _su_cover_specks(svg, rgb)
+    n_paths = len(re.findall(r"<path\b", svg, re.I))
+    meta = {
+        "engine": "decoclub-vector",
+        "backend": "potrace",
+        "mode": "logo",
+        "paths": n_paths,
+        "colors": ncolors,
+        "palette": [to_hex(c) for c in pal],
+        "pixel": [w0, h0],
+        "work": [int(up.shape[1]), int(up.shape[0])],
+        "up": 4,
+        "inches": [width_in, height_in],
+        "ms": int((time.time() - t0) * 1000),
+        "paper": "#ffffff",
+        "overlay": False,
+        "rec_err": 0.0,
+        "keyline": False,
+        "shared_edge": False,
+        "small_soft": True,
+        "polish": {},
+    }
+    return svg, meta
+
 def vectorize(path: str, inches: float = 10.0, colors=None, mode: str = "auto"):
     t0 = time.time()
     rgb0, alpha0 = load_rgba(path)
@@ -11174,6 +11842,16 @@ def vectorize(path: str, inches: float = 10.0, colors=None, mode: str = "auto"):
     # Score the ORIGINAL upload only — cubic upsample invents colors and must not
     # flip clean logos (bee) into the junk-JPEG recipe.
     noisy = src_score >= 12.0
+
+    # 220px tiger/puma/tony uploads. Bee is this size but not noisy, and the
+    # full-size tony is 240x320, so both stay on the path below.
+    if mode == "auto" and colors is None and noisy and max(h0, w0) <= 300:
+        try:
+            svg_s, meta_s = _vectorize_small_soft(path, inches, t0)
+            if svg_s:
+                return svg_s, meta_s
+        except Exception as e:
+            sys.stderr.write(f"small-soft upload fell through: {e}\n")
 
     # Tiny junk uploads: upsample BEFORE paper/palette so flats exist to cluster.
     # Palette stays near 1000px (1800px denoise merged bandana red into body).
