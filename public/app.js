@@ -859,6 +859,7 @@ async function fillArt(el, job, shopControls) {
           <button type="button" class="zoom-btn" id="zoomFit" title="Fit">Fit</button>
           <button type="button" class="zoom-btn" id="zoomIn" title="Zoom in">+</button>
           <span class="zoom-readout" id="zoomRead">100%</span>
+          <button type="button" class="zoom-btn" id="bgToggle" title="Switch preview background (light / dark) so every ink stands out">Light bg</button>
           <span class="muted">Scroll to zoom · drag to pan</span>
         </div>` : ""}
         <input id="artFile" type="file" accept="image/*,.svg,.pdf" hidden />
@@ -1070,6 +1071,8 @@ async function fillArt(el, job, shopControls) {
     if (host && host.dataset.src) {
       fetch(host.dataset.src, { credentials: "include" }).then((r) => r.text()).then((svg) => {
         host.innerHTML = svg;
+        // Show exactly what downloads: no paper plate, so white ink vs. empty reads on the checkerboard.
+        host.querySelectorAll('[data-name="paper-underlay"]').forEach((n) => n.remove());
         const elSvg = host.querySelector("svg");
         if (elSvg) {
           elSvg.removeAttribute("width");
@@ -1079,6 +1082,18 @@ async function fillArt(el, job, shopControls) {
           elSvg.style.height = "auto";
         }
         bindArtZoom(drop);
+        const bgBtn = $("#bgToggle");
+        if (bgBtn) {
+          const applyBg = (dark) => {
+            host.classList.toggle("bg-dark", dark);
+            bgBtn.textContent = dark ? "Light bg" : "Dark bg";
+            try { localStorage.setItem("dcPreviewBg", dark ? "dark" : "light"); } catch (e) { /* ignore */ }
+          };
+          let dark = true;
+          try { dark = localStorage.getItem("dcPreviewBg") !== "light"; } catch (e) { /* ignore */ }
+          applyBg(dark);
+          bgBtn.onclick = () => applyBg(!host.classList.contains("bg-dark"));
+        }
       }).catch(() => {
         host.outerHTML = '<img id="artZoomImg" src="' + host.dataset.src + '" alt="Vector" draggable="false" />';
         bindArtZoom(drop);

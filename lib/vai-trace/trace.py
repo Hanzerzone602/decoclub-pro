@@ -2566,10 +2566,9 @@ def svg_from_layers_with_gaps(
         '<?xml version="1.0" encoding="UTF-8"?>',
         f'<svg xmlns="http://www.w3.org/2000/svg" width="{w}in" height="{h}in" viewBox="0 0 {w} {h}">',
     ]
-    if paper_hex:
-        parts.append(
-            f'  <path d="M 0 0 L {w} 0 L {w} {h} L 0 {h} Z" fill="{paper_hex}" data-name="paper-underlay"/>'
-        )
+    # paper_hex is accepted for call-site compatibility. The site strips
+    # data-name="paper-underlay", so a full-canvas sheet is never emitted;
+    # white art is a real ink from restore_white_art_ink.
     if gap_strokes:
         parts.append('  <g fill="none" stroke-linejoin="round" stroke-linecap="round" data-name="gap-filler">')
         for g in gap_strokes:
@@ -4058,6 +4057,85 @@ def punch_near_paper(assign, palette, paper_rgb, max_dist=10.0):
         if math.sqrt(float(np.dot(d, d))) < max_dist:
             out[out == i] = -1
     return out
+
+
+def restore_white_art_ink(assign, palette, src_rgb, paper_mask=None, alpha=None):
+    """Fill interior white/near-white source art as a real ink.
+
+    Detected background (border-connected sheet — white, grey, or any flat
+    border colour) stays assign=-1 so it remains transparent empty space.
+    White whiskers, teeth, laces, muzzle, bee-eye, etc. that were punched
+    to paper become a near-white fill covering only the art.
+    """
+    a = np.asarray(assign, dtype=np.int32).copy()
+    h, w = a.shape
+    if h < 2 or w < 2:
+        return a, list(palette)
+    src = np.asarray(src_rgb, dtype=np.uint8)
+    if src.ndim != 3 or src.shape[2] < 3:
+        return a, list(palette)
+    if src.shape[:2] != (h, w):
+        src = cv2.resize(src[:, :, :3], (w, h), interpolation=cv2.INTER_CUBIC)
+    else:
+        src = src[:, :, :3]
+    if paper_mask is None:
+        al = alpha
+        if al is None:
+            al = np.full((h, w), 255, np.uint8)
+        elif np.asarray(al).shape[:2] != (h, w):
+            al = cv2.resize(
+                np.asarray(al, dtype=np.uint8), (w, h), interpolation=cv2.INTER_NEAREST
+            )
+        paper_mask, _ = detect_paper(src, np.asarray(al, dtype=np.uint8))
+    bg = np.asarray(paper_mask, dtype=bool)
+    if bg.shape != (h, w):
+        bg = (
+            cv2.resize(bg.astype(np.uint8), (w, h), interpolation=cv2.INTER_NEAREST) > 0
+        )
+    if alpha is None:
+        al_ok = np.ones((h, w), dtype=bool)
+    else:
+        al = np.asarray(alpha)
+        if al.shape[:2] != (h, w):
+            al = cv2.resize(
+                al.astype(np.uint8), (w, h), interpolation=cv2.INTER_NEAREST
+            )
+        al_ok = np.asarray(al) >= 28
+    lab = to_lab(src)
+    chroma = np.hypot(lab[:, :, 1] - 128.0, lab[:, :, 2] - 128.0)
+    # OpenCV L 220 ≈ CIE L* 86. Slightly below the gate's L*>90 white-paper
+    # test so JPEG-dirty muzzles still count as white art.
+    white_like = (lab[:, :, 0] >= 220.0) & (chroma < 14.0)
+    promote = (a < 0) & (~bg) & white_like & al_ok
+    n_prom = int(promote.sum())
+    if n_prom < 8 or float(n_prom) > 0.80 * h * w:
+        return a, list(palette)
+    pal = list(palette)
+    color = np.median(src[promote].astype(np.float64), axis=0)
+    color = np.clip(color, 0, 255)
+    if lum(color) < 200:
+        color = np.array([255.0, 255.0, 255.0], dtype=np.float64)
+    # Pure white when the source is already a near-white ink. Keeps the
+    # fill as real white while matching the gate's paper-hex white test
+    # for speck-sized chips (those chips are white art, not a new colour).
+    if lum(color) >= 230.0 and chroma_of_lab(lab_of_rgb([color])[0]) < 10.0:
+        color = np.array([255.0, 255.0, 255.0], dtype=np.float64)
+    idx = None
+    c_lab = lab_of_rgb([color])[0]
+    for i, c in enumerate(pal):
+        if lum(c) < 200:
+            continue
+        if chroma_of_lab(lab_of_rgb([c])[0]) > 16:
+            continue
+        d = lab_of_rgb([c])[0] - c_lab
+        if math.sqrt(float(np.dot(d, d))) < 10.0:
+            idx = i
+            break
+    if idx is None:
+        idx = len(pal)
+        pal.append(color)
+    a[promote] = int(idx)
+    return a, pal
 
 
 def despeckle(assign, palette, min_size=4):
@@ -9397,10 +9475,8 @@ def svg_from_layers(layers, width_in, height_in, paper_hex=None):
         '<?xml version="1.0" encoding="UTF-8"?>',
         f'<svg xmlns="http://www.w3.org/2000/svg" width="{w}in" height="{h}in" viewBox="0 0 {w} {h}">',
     ]
-    if paper_hex:
-        parts.append(
-            f'  <path d="M 0 0 L {w} 0 L {w} {h} L 0 {h} Z" fill="{paper_hex}" data-name="paper-underlay"/>'
-        )
+    # paper_hex is accepted for call-site compatibility. No full-canvas
+    # paper-underlay — white art is a real ink covering only the figure.
     for L in layers:
         hex_ = L["hex"]
         name = L.get("name") or ""
@@ -9698,6 +9774,7 @@ def vectorize_busy_type_poster(rgb, paper, paper_rgb, inches, kind, t0, h0, w0, 
     )
     assign = protect_cream_orange_plates(assign, pal, work, paper_w)
     assign, pal = compact_assign_palette(assign, pal)
+    assign, pal = restore_white_art_ink(assign, pal, work)
 
     if w0 >= h0:
         width_in = float(inches)
@@ -9938,6 +10015,18 @@ def run_vtracer(png_path: str, svg_path: str, settings: dict, timeout: int = 180
     return r
 
 
+def _save_rgb_knockout_paper(rgb, path):
+    """Write PNG with the detected sheet transparent so vtracer does not
+    emit a full-canvas paper fill. Interior white art stays opaque."""
+    arr = np.asarray(rgb, dtype=np.uint8)
+    if arr.ndim == 2:
+        arr = np.stack([arr, arr, arr], axis=2)
+    al = np.full(arr.shape[:2], 255, np.uint8)
+    bg, _ = detect_paper(arr[:, :, :3], al)
+    rgba = np.dstack([arr[:, :, :3], np.where(bg, 0, 255).astype(np.uint8)])
+    Image.fromarray(rgba).save(path)
+
+
 def vectorize_vtracer(
     rgb, paper_rgb, inches, kind, t0, h0, w0, rec_err, palette, *, soft_flat: bool = False
 ):
@@ -9964,7 +10053,7 @@ def vectorize_vtracer(
     try:
         png_p = os.path.join(tmp, "in.png")
         svg_p = os.path.join(tmp, "out.svg")
-        Image.fromarray(work).save(png_p)
+        _save_rgb_knockout_paper(work, png_p)
         run_vtracer(png_p, svg_p, settings)
         raw = open(svg_p, encoding="utf-8").read()
     finally:
@@ -10180,6 +10269,7 @@ def vectorize_soft_flat(rgb, paper, paper_rgb, inches, kind, t0, h0, w0, rec_err
 
     assign = _soft_flat_assign(work, paper_w, pal, paper_rgb)
     assign, pal = compact_assign_palette(assign, pal)
+    assign, pal = restore_white_art_ink(assign, pal, work)
     snapped = _soft_flat_raster(assign, pal, paper_rgb)
     adj = region_adjacency(assign)
 
@@ -10339,7 +10429,7 @@ def vectorize_soft_flat(rgb, paper, paper_rgb, inches, kind, t0, h0, w0, rec_err
         try:
             png_p = os.path.join(tmp, "in.png")
             svg_p = os.path.join(tmp, "out.svg")
-            Image.fromarray(snapped).save(png_p)
+            _save_rgb_knockout_paper(snapped, png_p)
             run_vtracer(png_p, svg_p, settings)
             raw = open(svg_p, encoding="utf-8").read()
         finally:
@@ -10789,6 +10879,7 @@ def vectorize_plate_poster(rgb, paper, paper_rgb, inches, kind, t0, h0, w0, rec_
         assign[glyph] = -1
         if halo is not None:
             assign[halo] = -1
+    assign, pal = restore_white_art_ink(assign, pal, work)
 
     if w0 >= h0:
         width_in = float(inches)
@@ -11803,6 +11894,7 @@ def _vectorize_small_soft(path, inches, t0):
         return None, None
     up = _su_partition_upsample(shade, 4, 0.0)
     up = _su_drop_round_crumbs(up, rgb, max_area=160)
+    up, pal = restore_white_art_ink(up, pal, rgb)
     svg, width_in, height_in, ncolors = _su_trace_svg(up, pal, h0, w0, inches=inches)
     if svg.count("<path") < 2:
         return None, None
@@ -12296,6 +12388,23 @@ def vectorize(path: str, inches: float = 10.0, colors=None, mode: str = "auto"):
         assign, sliver_meta = drop_invented_jpeg_slivers(
             assign, palette, src_support, paper_rgb
         )
+    src_white = rgb0
+    if src_white.shape[:2] != assign.shape[:2]:
+        src_white = cv2.resize(
+            rgb0,
+            (assign.shape[1], assign.shape[0]),
+            interpolation=cv2.INTER_CUBIC,
+        )
+    a_white = alpha0
+    if a_white is not None and a_white.shape[:2] != assign.shape[:2]:
+        a_white = cv2.resize(
+            a_white.astype(np.uint8),
+            (assign.shape[1], assign.shape[0]),
+            interpolation=cv2.INTER_NEAREST,
+        )
+    assign, palette = restore_white_art_ink(
+        assign, palette, src_white, alpha=a_white
+    )
     if kind == "logo" and glyph is None and ov_mask is None:
         try:
             glayers, gaux = logo_potrace_mask_layers(
@@ -12488,7 +12597,6 @@ def vectorize(path: str, inches: float = 10.0, colors=None, mode: str = "auto"):
             layers.append(rec)
 
     paper_hex = to_hex(paper_rgb)
-    # Dark full-bleed: still paint the underlay so holes aren't transparent.
     svg = svg_from_layers(layers, width_in, height_in, paper_hex)
     # Keylined mascots: skip SVG fairing — compound whisker/keyline paths melt.
     polish_stats = {}
