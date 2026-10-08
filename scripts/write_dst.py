@@ -58,7 +58,10 @@ def hex_to_thread(t: dict) -> EmbThread:
     )
 
 
-def pattern_from_ir(ir: dict) -> EmbPattern:
+def pattern_from_ir(ir: dict, pec: bool = False) -> EmbPattern:
+    """pec=True: put a needle-down at every jump landing point. pyembroidery's encoder
+    otherwise reaches the first stitch after a trim+jump with a second jump, and the PEC
+    writer flags every jump after the first as trim-jump -> Brother cut twice per trim."""
     p = EmbPattern()
     name = str(ir.get("name") or "DESIGN")[:16]
     p.extras["name"] = name
@@ -68,14 +71,19 @@ def pattern_from_ir(ir: dict) -> EmbPattern:
     for t in threads:
         p.add_thread(hex_to_thread(t))
     last_x, last_y = 0, 0
+    pending_land = False
     for s in ir.get("stitches") or []:
         cmd = CMD.get(str(s.get("cmd") or s.get("kind") or "stitch").lower(), STITCH)
         x = int(round(float(s.get("x") or 0)))
         y = int(round(float(s.get("y") or 0)))
         if cmd in (TRIM, COLOR_CHANGE, END):
             p.add_stitch_absolute(cmd, last_x, last_y)
+            pending_land = False
         else:
+            if pending_land and cmd == STITCH and (x, y) != (last_x, last_y):
+                p.add_stitch_absolute(STITCH, last_x, last_y)
             p.add_stitch_absolute(cmd, x, y)
+            pending_land = pec and cmd == JUMP
             last_x, last_y = x, y
     p.add_command(END)
     return p
@@ -102,7 +110,9 @@ def main() -> int:
         if write_pes is None:
             raise SystemExit("pyembroidery write_pes is not available")
         Path(args.pes).parent.mkdir(parents=True, exist_ok=True)
-        write_pes(pat, args.pes)
+        # PES v1 snaps every thread to the 64-colour Brother PEC palette (navy ->
+        # Peacock teal, Cadet Blue -> Lavender). v6 "t" keeps the real thread list.
+        write_pes(pattern_from_ir(ir, pec=True), args.pes, {"version": "6t"})
     if args.stdout == "dst":
         import io
         buf = io.BytesIO()

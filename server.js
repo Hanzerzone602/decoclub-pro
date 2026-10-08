@@ -2258,6 +2258,8 @@ async function handleApi(req, res, url) {
       angleDeg: body.angleDeg,
       madeiraCatalog: body.madeiraCatalog,
       fabric: body.fabric,
+      engine: body.engine,
+      prep: body.prep !== false,
     });
     job.stitchCount = dig.stitchCount;
     job.colorStops = dig.colorStops;
@@ -2274,6 +2276,12 @@ async function handleApi(req, res, url) {
       exporter: dig.exporter,
       usedFallback: !!dig.usedFallback,
       fabric: dig.fabric || body.fabric || null,
+      engine: dig.engine || "legacy",
+      summary: dig.summary || null,
+      warnings: dig.warnings || [],
+      textWarnings: dig.textWarnings || [],
+      minRecommendedWidthIn: dig.minRecommendedWidthIn == null ? null : dig.minRecommendedWidthIn,
+      files: body.includeFiles ? { dst: dig.dst && dig.dst.length ? dig.dst.toString("base64") : null, pes: dig.pes && dig.pes.length ? dig.pes.toString("base64") : null } : undefined,
     });
   }
 
@@ -2718,6 +2726,19 @@ function serveStatic(req, res, url) {
   send(res, 200, fs.readFileSync(file), headers);
 }
 
+// Digitize runtime check (python libs for digitize_prep + pyembroidery, potrace),
+// probed once in the background after start; reported on /health.
+let DIGITIZE_DEPS = null;
+function probeDigitizeDeps() {
+  const cp = require("child_process");
+  const py = process.env.DIGITIZE_PYTHON || "/venv/bin/python3";
+  cp.execFile(py, ["-c", "import numpy, scipy, cv2, skimage, PIL, pyembroidery; print('ok')"], { timeout: 90000 }, function (err, out) {
+    cp.execFile("potrace", ["--version"], { timeout: 10000 }, function (perr) {
+      DIGITIZE_DEPS = { python: !err && String(out || "").trim() === "ok", potrace: !perr, prep: fs.existsSync(path.join(__dirname, "lib", "digitize_prep.py")) };
+    });
+  });
+}
+
 const server = http.createServer(async function (req, res) {
   try {
     const url = new URL(req.url, "http://localhost");
@@ -2733,6 +2754,7 @@ const server = http.createServer(async function (req, res) {
         vaiTrace: vaiTrace.available(),
         services: enabledServiceNames(),
         pricing: "ppi",
+        digitizeDeps: DIGITIZE_DEPS,
       });
     }
     if (url.pathname.indexOf("/api/") === 0) return await handleApi(req, res, url);
@@ -2751,4 +2773,5 @@ const PORT = process.env.PORT || 3847;
 const HOST = process.env.HOST || "0.0.0.0";
 server.listen(PORT, HOST, function () {
   console.log("DecoClub Pro running at http://" + HOST + ":" + PORT);
+  setTimeout(probeDigitizeDeps, 5000).unref();
 });
