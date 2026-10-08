@@ -148,12 +148,12 @@ function stop(child) {
     const pack = await req(port, "GET", "/api/export/" + job.json.job.id + "/cut-contour.svg", { headers: { Cookie: cookie } });
     assert.strictEqual(pack.status, 200, "trial keeps SVG/EPS/cut files");
     const dstTrial = await req(port, "GET", "/api/export/" + job.json.job.id + "/design.dst", { headers: { Cookie: cookie } });
-    assert.strictEqual(dstTrial.status, 402, "trial DST fence");
+    assert.strictEqual(dstTrial.status, 404, "trial DST hidden (Digitize is admin-only)");
     const digTrial = await req(port, "POST", "/api/jobs/" + job.json.job.id + "/digitize", {
       headers: { "Content-Type": "application/json", Cookie: cookie },
       body: JSON.stringify({ density: 0.4 }),
     });
-    assert.strictEqual(digTrial.status, 402, "trial digitize/DST fence");
+    assert.strictEqual(digTrial.status, 404, "trial digitize hidden (Digitize is admin-only)");
     const loginHtml = await req(port, "GET", "/login.html");
     assert.ok(loginHtml.text.indexOf("Remember me") !== -1);
     assert.ok(loginHtml.text.indexOf("remember_me") !== -1);

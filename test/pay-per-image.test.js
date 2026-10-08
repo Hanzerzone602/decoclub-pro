@@ -360,13 +360,42 @@ async function uploadJob(port, cookie, title) {
   const s2 = startServer({ PORT: String(port2), FEATURE_MEMBERSHIP: "1", FEATURE_DIGITIZE: "1" });
   try {
     await waitHealth(port2);
+    // FEATURE_DIGITIZE=1 is admin-only: anonymous + normal users see the flag-off site
     const cfg2 = await req(port2, "GET", "/api/config");
     assert.strictEqual(cfg2.json.features.membership, true);
-    assert.strictEqual(cfg2.json.features.digitize, true);
-    assert.strictEqual(cfg2.json.services.digitize, true);
+    assert.strictEqual(cfg2.json.features.digitize, false);
+    assert.strictEqual(cfg2.json.services.digitize, false);
+    assert.ok(/no-store/.test(cfg2.headers["cache-control"] || ""), "config not cacheable");
     const h2 = await req(port2, "GET", "/health");
-    assert.ok((h2.json.services || []).indexOf("digitize") !== -1);
-    console.log("ok flags re-enable membership and digitize");
+    assert.ok((h2.json.services || []).indexOf("digitize") === -1);
+    assert.strictEqual((await req(port2, "GET", "/digitize-demo.html")).status, 404);
+    assert.ok(!(await req(port2, "GET", "/api/services")).json.services.digitize);
+    const su = await req(port2, "POST", "/api/signup", { body: JSON.stringify({ name: "Bo", email: "bo@shop.test", password: "secret12" }) });
+    const boCk = cookieFrom(su);
+    const boCfg = await req(port2, "GET", "/api/config", { headers: { Cookie: boCk } });
+    assert.strictEqual(boCfg.json.features.digitize, false);
+    assert.strictEqual(boCfg.json.services.digitize, false);
+    assert.ok(!(await req(port2, "GET", "/api/services", { headers: { Cookie: boCk } })).json.services.digitize);
+    assert.ok(!((await req(port2, "GET", "/api/me", { headers: { Cookie: boCk } })).json.user.services || {}).digitize);
+    assert.strictEqual((await req(port2, "GET", "/digitize-demo.html", { headers: { Cookie: boCk } })).status, 404);
+    const boJob = await req(port2, "POST", "/api/jobs", { headers: { Cookie: boCk }, body: JSON.stringify({ title: "B", method: "embroidery", width_in: 2, height_in: 2 }) });
+    assert.strictEqual(boJob.status, 200);
+    assert.strictEqual((await req(port2, "POST", "/api/jobs/" + boJob.json.job.id + "/digitize", { headers: { Cookie: boCk }, body: "{}" })).status, 404);
+    assert.strictEqual((await req(port2, "GET", "/api/export/" + boJob.json.job.id + "/design.dst", { headers: { Cookie: boCk } })).status, 404);
+    // admin sees Digitize
+    const ad = await req(port2, "POST", "/api/login", { body: JSON.stringify({ email: ADMIN_EMAIL, password: ADMIN_PASSWORD }) });
+    assert.strictEqual(ad.status, 200, JSON.stringify(ad.json));
+    const adCk = cookieFrom(ad);
+    const adCfg = await req(port2, "GET", "/api/config", { headers: { Cookie: adCk } });
+    assert.strictEqual(adCfg.json.features.digitize, true);
+    assert.strictEqual(adCfg.json.services.digitize, true);
+    assert.ok(/no-store/.test(adCfg.headers["cache-control"] || "") && /Cookie/.test(adCfg.headers["vary"] || ""));
+    assert.ok((await req(port2, "GET", "/api/services", { headers: { Cookie: adCk } })).json.services.digitize);
+    assert.ok((await req(port2, "GET", "/api/me", { headers: { Cookie: adCk } })).json.user.services.digitize);
+    const adDemo = await req(port2, "GET", "/digitize-demo.html", { headers: { Cookie: adCk } });
+    assert.strictEqual(adDemo.status, 200);
+    assert.ok(/no-store/.test(adDemo.headers["cache-control"] || ""));
+    console.log("ok FEATURE_DIGITIZE=1 is admin-only (anon/shop see flag-off site)");
   } finally {
     await stop(s2.child);
   }

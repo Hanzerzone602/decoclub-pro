@@ -314,6 +314,16 @@ function consumeHalftoneCredit(user) {
   return { ok: true, consumed: true, included: false, remaining: user.halftone_credits };
 }
 
+// Digitize is admin-only: visible/usable only when FEATURE_DIGITIZE is on AND
+// the requesting user is an admin (same check as the admin backend). Everyone
+// else sees exactly the flag-off site.
+function digitizeFor(u) {
+  return features.digitizeEnabled() && !!(u && u.role === "admin");
+}
+function flagsFor(u) {
+  return Object.assign({}, features.flags(), { digitize: digitizeFor(u) });
+}
+
 function serviceEntitlements(u) {
   const out = {
     vectorize: {
@@ -328,11 +338,11 @@ function serviceEntitlements(u) {
       canApply: canApplyHalftone(u),
     },
   };
-  if (features.digitizeEnabled()) out.digitize = { entitled: canProduce(u) };
+  if (digitizeFor(u)) out.digitize = { entitled: canProduce(u) };
   return out;
 }
 
-function serviceCatalog(settings) {
+function serviceCatalog(settings, user) {
   const mem = features.membershipEnabled();
   const vectorize = {
     name: "Vectorize",
@@ -354,7 +364,7 @@ function serviceCatalog(settings) {
     halftones.included_with = ["studio", "admin"];
     halftones.apply = "studio_unlimited_or_credit";
   }
-  if (!features.digitizeEnabled()) return { vectorize: vectorize, halftones: halftones };
+  if (!digitizeFor(user)) return { vectorize: vectorize, halftones: halftones };
   const digitize = {
     name: "Digitize",
     description: "Stitch preview · draft DST/EXP",
@@ -363,9 +373,9 @@ function serviceCatalog(settings) {
   return { vectorize: vectorize, digitize: digitize, halftones: halftones };
 }
 
-function enabledServiceNames() {
+function enabledServiceNames(user) {
   const list = ["vectorize", "halftones"];
-  if (features.digitizeEnabled()) list.splice(1, 0, "digitize");
+  if (digitizeFor(user)) list.splice(1, 0, "digitize");
   return list;
 }
 
@@ -936,6 +946,8 @@ function send(res, code, body, headers) {
   res.end(payload);
 }
 function json(res, code, obj) { send(res, code, JSON.stringify(obj), { "Content-Type": "application/json; charset=utf-8" }); }
+// per-user responses (config/services/me): never cached or shared between users
+function jsonPrivate(res, code, obj) { send(res, code, JSON.stringify(obj), { "Content-Type": "application/json; charset=utf-8", "Cache-Control": "private, no-store", "Vary": "Cookie" }); }
 const SAFE_CLIENT_MSGS = [
   "File too large",
   "Artwork required",
@@ -1256,13 +1268,13 @@ async function handleApi(req, res, url) {
 
   if (pth === "/api/config" && method === "GET") {
     const st = ensureSettings(db);
-    return json(res, 200, { demo: allowDemo(), billing: billingConfigured(), imagine: imagineConfigured(), imagineModel: "latest", vectorizerAi: vectorizerAi.configured(), vtracer: vtracer.available(), vaiTrace: vaiTrace.available(), inventVectorize: true, inventWinner: null, rasterCorel: true, inventWarp: inventWarp.available(), inventWarpReason: inventWarp.available() ? null : (inventWarp.unavailableReason && inventWarp.unavailableReason()), corelImport: true, name: "DecoClub Pro", statuses: STATUSES, methods: METHODS, blanks: BLANKS, seed: allowDemo() ? { owner: "owner@anvil.local", client: "client@anvil.local", password: "anvil123" } : null, services: { vectorize: true, halftones: true, digitize: features.digitizeEnabled() }, features: features.flags(), pricing: { vectorize: buyOptions("vectorize", st), halftones: buyOptions("halftones", st) }, halftonePricing: halftoneBuyOptions(st) });
+    return jsonPrivate(res, 200, { demo: allowDemo(), billing: billingConfigured(), imagine: imagineConfigured(), imagineModel: "latest", vectorizerAi: vectorizerAi.configured(), vtracer: vtracer.available(), vaiTrace: vaiTrace.available(), inventVectorize: true, inventWinner: null, rasterCorel: true, inventWarp: inventWarp.available(), inventWarpReason: inventWarp.available() ? null : (inventWarp.unavailableReason && inventWarp.unavailableReason()), corelImport: true, name: "DecoClub Pro", statuses: STATUSES, methods: METHODS, blanks: BLANKS, seed: allowDemo() ? { owner: "owner@anvil.local", client: "client@anvil.local", password: "anvil123" } : null, services: { vectorize: true, halftones: true, digitize: digitizeFor(user) }, features: flagsFor(user), pricing: { vectorize: buyOptions("vectorize", st), halftones: buyOptions("halftones", st) }, halftonePricing: halftoneBuyOptions(st) });
   }
   if (pth === "/api/services" && method === "GET") {
     const st = ensureSettings(db);
-    return json(res, 200, {
+    return jsonPrivate(res, 200, {
       billing_configured: billingConfigured(),
-      services: serviceCatalog(st),
+      services: serviceCatalog(st, user),
     });
   }
   if (pth === "/api/quote" && (method === "POST" || method === "GET")) {
@@ -1279,7 +1291,7 @@ async function handleApi(req, res, url) {
         setSession(res, sess.token, req, true);
       }
     }
-    return json(res, 200, { user: publicUser(user) });
+    return jsonPrivate(res, 200, { user: publicUser(user) });
   }
   if (pth === "/api/catalog" && method === "GET") {
     const q = url.searchParams.get("q");
@@ -2237,7 +2249,7 @@ async function handleApi(req, res, url) {
   }
   const digPath = pth.match(/^\/api\/jobs\/([^/]+)\/digitize$/);
   if (digPath && method === "POST") {
-    if (!features.digitizeEnabled()) return json(res, 404, { error: "Not found" });
+    if (!digitizeFor(user)) return json(res, 404, { error: "Not found" });
     if (!canRunFloor(user)) return json(res, 403, { error: "Shop login required" });
     if (!requirePaidProduce(user, res)) return;
     const job = db.jobs.find(function (j) { return j.id === digPath[1] && j.shop_id === user.shop_id; });
@@ -2299,7 +2311,7 @@ async function handleApi(req, res, url) {
     if (!canRunFloor(user)) return json(res, 403, { error: "Shop login required" });
     const exportName = String(expFile[2] || "").toLowerCase();
     const stitchPacket = exportName.indexOf("dst") !== -1 || exportName.indexOf("exp") !== -1;
-    if (stitchPacket && !features.digitizeEnabled()) return json(res, 404, { error: "Not found" });
+    if (stitchPacket && !digitizeFor(user)) return json(res, 404, { error: "Not found" });
     const packetExport = /\.(dst|exp)$/.test(exportName) || stitchPacket || exportName.indexOf("stones") !== -1 || exportName.indexOf("packet") !== -1;
     if (packetExport) {
       if (!requirePaidProduce(user, res)) return;
@@ -2431,7 +2443,7 @@ async function handleApi(req, res, url) {
         halftone_pack10_cents: settings.halftone_pack10_cents,
         vector_single_cents: settings.vector_single_cents,
         vector_pack10_cents: settings.vector_pack10_cents,
-        services: enabledServiceNames(),
+        services: enabledServiceNames(user),
       },
       billing_configured: billingConfigured(),
       stripe_configured: billingConfigured(),
@@ -2702,7 +2714,8 @@ async function handleApi(req, res, url) {
 function serveStatic(req, res, url) {
   let rel = decodeURIComponent(url.pathname);
   if (rel === "/") rel = "/index.html";
-  if (!features.digitizeEnabled() && rel === "/digitize-demo.html") return send(res, 404, "Not found");
+  const digitizeDemo = rel === "/digitize-demo.html";
+  if (digitizeDemo && !digitizeFor(currentUser(req, load()))) return send(res, 404, "Not found");
   // Trailing slash → bare path so /admin/ and /login/ match aliases like /admin and /login.
   if (rel.length > 1 && rel.charAt(rel.length - 1) === "/") rel = rel.slice(0, -1);
   const ALIAS = { "/login": "/login.html", "/app": "/app.html", "/admin": "/admin.html", "/signup": "/signup.html", "/start": "/start.html" };
@@ -2718,7 +2731,10 @@ function serveStatic(req, res, url) {
   if (!fs.existsSync(file) || fs.statSync(file).isDirectory()) return send(res, 404, "Not found");
   const ext = path.extname(file).toLowerCase();
   const headers = { "Content-Type": MIME[ext] || "application/octet-stream" };
-  if (ext === ".html" || ext === ".js" || ext === ".css") {
+  if (digitizeDemo) {
+    headers["Cache-Control"] = "private, no-store";
+    headers["Vary"] = "Cookie";
+  } else if (ext === ".html" || ext === ".js" || ext === ".css") {
     headers["Cache-Control"] = "no-cache";
   } else if (rel === "/brand.jpg" || rel === "/logo.png" || rel === "/logo.svg" || ext === ".jpg" || ext === ".jpeg" || ext === ".png" || ext === ".webp" || ext === ".gif" || ext === ".svg") {
     headers["Cache-Control"] = "public, max-age=86400";
@@ -2732,9 +2748,20 @@ let DIGITIZE_DEPS = null;
 function probeDigitizeDeps() {
   const cp = require("child_process");
   const py = process.env.DIGITIZE_PYTHON || "/venv/bin/python3";
-  cp.execFile(py, ["-c", "import numpy, scipy, cv2, skimage, PIL, pyembroidery; print('ok')"], { timeout: 90000 }, function (err, out) {
+  const code = "import importlib, json\nr = {}\nfor m in ['numpy', 'scipy', 'cv2', 'skimage', 'PIL', 'pyembroidery']:\n    try:\n        importlib.import_module(m); r[m] = True\n    except Exception:\n        r[m] = False\nprint(json.dumps(r))";
+  cp.execFile(py, ["-c", code], { timeout: 90000 }, function (err, out) {
+    let mods = {};
+    try { mods = JSON.parse(String(out || "").trim().split("\n").pop()); } catch (e) { mods = {}; }
+    const need = ["numpy", "scipy", "cv2", "skimage", "PIL", "pyembroidery"];
     cp.execFile("potrace", ["--version"], { timeout: 10000 }, function (perr) {
-      DIGITIZE_DEPS = { python: !err && String(out || "").trim() === "ok", potrace: !perr, prep: fs.existsSync(path.join(__dirname, "lib", "digitize_prep.py")) };
+      DIGITIZE_DEPS = {
+        python: !err && need.every(function (m) { return mods[m] === true; }),
+        pyembroidery: mods.pyembroidery === true,
+        opencv: mods.cv2 === true,
+        numpy: mods.numpy === true, scipy: mods.scipy === true, skimage: mods.skimage === true, pillow: mods.PIL === true,
+        potrace: !perr,
+        prep: fs.existsSync(path.join(__dirname, "lib", "digitize_prep.py")),
+      };
     });
   });
 }
@@ -2752,7 +2779,7 @@ const server = http.createServer(async function (req, res) {
         imagine: false,
         vectorizerAi: false,
         vaiTrace: vaiTrace.available(),
-        services: enabledServiceNames(),
+        services: enabledServiceNames(null),
         pricing: "ppi",
         digitizeDeps: DIGITIZE_DEPS,
       });

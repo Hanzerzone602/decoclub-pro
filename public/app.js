@@ -656,16 +656,20 @@ async function renderIntake() {
   };
 }
 
+// Digitize shows only when this user's /api/me entitlements include it (admin + flag).
+function canDigitize() { return !!(user && user.services && user.services.digitize); }
+
 async function renderJob(id) {
   const { job, events } = await api("/api/jobs/" + id);
   const shopControls = canFloor();
   const PRICE_STATION_ENABLED = false; // apparel quote UI off until David turns it back on
   const tabs = [
-    ["art","Art"],["digitize","Digitize"],["export","Export"],["mockup","Mockup"],
+    ["art","Art"],...(canDigitize() ? [["digitize","Digitize"]] : []),["export","Export"],["mockup","Mockup"],
     ...(PRICE_STATION_ENABLED ? [["price","Price"]] : []),
     ["proof","Proof"],["overview","Overview"],["comments","Comments"]
   ];
   if (!PRICE_STATION_ENABLED && station === "price") station = "art";
+  if (station === "digitize" && !canDigitize()) station = "art";
   main.innerHTML = `
     <button class="btn ghost small" id="back">← Board</button>
     <div class="row" style="margin-top:12px">
@@ -2078,8 +2082,8 @@ function fillProduce(el, job, shopControls) {
     <div class="export-grid export-hero">
       <a href="/api/export/${job.id}/art.svg">SVG</a>
       <a href="/api/export/${job.id}/art.eps">EPS</a>
-      <a href="/api/export/${job.id}/design.dst">DST</a>
-      <a href="/api/export/${job.id}/design.exp">EXP</a>
+      ${canDigitize() ? `<a href="/api/export/${job.id}/design.dst">DST</a>
+      <a href="/api/export/${job.id}/design.exp">EXP</a>` : ""}
       <a href="/api/export/${job.id}/stones.svg">Stones SVG</a>
       <a href="/api/export/${job.id}/stones.csv">Stones CSV</a>
       <a href="/api/export/${job.id}/stones.plt">Stones PLT</a>
