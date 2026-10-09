@@ -26,7 +26,7 @@ const colorspec = require("./lib/colorspec");
 const { hasRealPaths: vectorHasRealPaths } = require("./lib/stitch/svgLayers");
 const corelImport = require("./lib/corelImport");
 const { listPalettes } = require("./lib/palettes");
-const { digitizeJob } = require("./lib/digitize");
+const { digitizeJobCached, getDigitizeCache, ensureStitchFiles, pickPrepPython } = require("./lib/digitize");
 const { stonesForJob } = require("./lib/stones");
 const features = require("./lib/features");
 const {
@@ -37,6 +37,9 @@ const {
 
 const ROOT = __dirname;
 loadEnvFile(ROOT);
+if (!process.env.DIGITIZE_PYTHON) {
+  try { process.env.DIGITIZE_PYTHON = pickPrepPython(); } catch (e) {}
+}
 let BUILD = { name: "DecoClub Pro", version: "0.2.1", stamp: null };
 try {
   const pkg = JSON.parse(fs.readFileSync(path.join(ROOT, "package.json"), "utf8"));
@@ -319,6 +322,36 @@ function consumeHalftoneCredit(user) {
 // else sees exactly the flag-off site.
 function digitizeFor(u) {
   return features.digitizeEnabled() && !!(u && u.role === "admin");
+}
+
+function digitizeOptsFromJob(job) {
+  const s = job.digitizeSettings || {};
+  return {
+    widthIn: Number(s.widthIn || job.width_in) || 1,
+    heightIn: Number(s.heightIn || job.height_in) || 1,
+    fabric: s.fabric || "tee",
+    density: s.density,
+    satinSpacingMm: s.satinSpacingMm,
+    simplify: !!s.simplify,
+    prep: true,
+    previewOnly: true,
+    pes: true,
+    engine: "wq",
+  };
+}
+
+async function stitchFileForJob(job, name) {
+  const opts = digitizeOptsFromJob(job);
+  let dig = getDigitizeCache(job, opts);
+  if (!dig) dig = await digitizeJobCached(job, UPLOADS, opts);
+  if (name === "stitch-preview.svg") {
+    return dig.previewSvg || "";
+  }
+  ensureStitchFiles(dig, String(job.title || job.id || "DESIGN").replace(/[^\w\- ]+/g, "").slice(0, 16) || "DESIGN");
+  if (name === "design.dst") return dig.dst;
+  if (name === "design.exp") return dig.exp;
+  if (name === "design.pes") return dig.pes;
+  return null;
 }
 function flagsFor(u) {
   return Object.assign({}, features.flags(), { digitize: digitizeFor(u) });
@@ -938,7 +971,7 @@ function ensureDemoJob(db) {
 }
 
 
-const MIME = { ".html": "text/html; charset=utf-8", ".css": "text/css; charset=utf-8", ".js": "text/javascript; charset=utf-8", ".svg": "image/svg+xml", ".png": "image/png", ".jpg": "image/jpeg", ".jpeg": "image/jpeg", ".gif": "image/gif", ".webp": "image/webp", ".pdf": "application/pdf", ".json": "application/json", ".plt": "application/vnd.hp-hpgl", ".txt": "text/plain; charset=utf-8", ".eps": "application/postscript", ".dst": "application/octet-stream", ".exp": "application/octet-stream", ".csv": "text/csv; charset=utf-8" };
+const MIME = { ".html": "text/html; charset=utf-8", ".css": "text/css; charset=utf-8", ".js": "text/javascript; charset=utf-8", ".svg": "image/svg+xml", ".png": "image/png", ".jpg": "image/jpeg", ".jpeg": "image/jpeg", ".gif": "image/gif", ".webp": "image/webp", ".pdf": "application/pdf", ".json": "application/json", ".plt": "application/vnd.hp-hpgl", ".txt": "text/plain; charset=utf-8", ".eps": "application/postscript", ".dst": "application/octet-stream", ".exp": "application/octet-stream", ".pes": "application/octet-stream", ".csv": "text/csv; charset=utf-8" };
 function send(res, code, body, headers) {
   headers = headers || {};
   const payload = Buffer.isBuffer(body) ? body : Buffer.from(body || "");
@@ -2257,7 +2290,7 @@ async function handleApi(req, res, url) {
     const body = parseJsonBody(await readBody(req));
     if (body.widthIn != null || body.width_in != null) job.width_in = Number(body.widthIn || body.width_in);
     if (body.heightIn != null || body.height_in != null) job.height_in = Number(body.heightIn || body.height_in);
-    const dig = digitizeJob(job, UPLOADS, {
+    const digOpts = {
       satinMm: body.satinMm,
       satinSpacingMm: body.satinSpacingMm,
       density: body.density,
@@ -2265,18 +2298,35 @@ async function handleApi(req, res, url) {
       heightIn: job.height_in,
       threads: body.threads,
       typeOverrides: body.typeOverrides,
-      previewOnly: !!body.previewOnly,
+      previewOnly: body.includeFiles ? false : (body.previewOnly !== false),
       recolorOnly: !!body.recolorOnly,
       angleDeg: body.angleDeg,
       madeiraCatalog: body.madeiraCatalog,
       fabric: body.fabric,
       engine: body.engine,
       prep: body.prep !== false,
-    });
+      simplify: !!body.simplify,
+      pes: true,
+    };
+    job.digitizeSettings = {
+      widthIn: job.width_in,
+      heightIn: job.height_in,
+      fabric: body.fabric || (job.digitizeSettings && job.digitizeSettings.fabric) || "tee",
+      density: body.density,
+      satinSpacingMm: body.satinSpacingMm,
+      simplify: !!body.simplify,
+    };
+    let dig;
+    try {
+      dig = await digitizeJobCached(job, UPLOADS, digOpts);
+    } catch (err) {
+      return json(res, 500, { error: String(err && err.message || err) });
+    }
     job.stitchCount = dig.stitchCount;
     job.colorStops = dig.colorStops;
     if (dig.objects) job.digitizeObjects = dig.objects;
     if (dig.exporter) job.digitizeExporter = dig.exporter;
+    if (dig.summary) job.digitizeSummary = dig.summary;
     event(db, job, dig.recolored ? ("Thread swap · " + (dig.colorStops[0] && dig.colorStops[0].madeiraCode || "Madeira")) : ("Digitized · " + dig.stitchCount + " stitches"));
     save(db);
     return json(res, 200, {
@@ -2288,12 +2338,13 @@ async function handleApi(req, res, url) {
       exporter: dig.exporter,
       usedFallback: !!dig.usedFallback,
       fabric: dig.fabric || body.fabric || null,
-      engine: dig.engine || "legacy",
+      engine: dig.engine || "wq",
       summary: dig.summary || null,
       warnings: dig.warnings || [],
       textWarnings: dig.textWarnings || [],
       minRecommendedWidthIn: dig.minRecommendedWidthIn == null ? null : dig.minRecommendedWidthIn,
-      files: body.includeFiles ? { dst: dig.dst && dig.dst.length ? dig.dst.toString("base64") : null, pes: dig.pes && dig.pes.length ? dig.pes.toString("base64") : null } : undefined,
+      busyArt: dig.busyArt || null,
+      files: body.includeFiles ? { dst: dig.dst && dig.dst.length ? dig.dst.toString("base64") : null, exp: dig.exp && dig.exp.length ? dig.exp.toString("base64") : null, pes: dig.pes && dig.pes.length ? dig.pes.toString("base64") : null } : undefined,
     });
   }
 
@@ -2310,9 +2361,9 @@ async function handleApi(req, res, url) {
   if (expFile && method === "GET") {
     if (!canRunFloor(user)) return json(res, 403, { error: "Shop login required" });
     const exportName = String(expFile[2] || "").toLowerCase();
-    const stitchPacket = exportName.indexOf("dst") !== -1 || exportName.indexOf("exp") !== -1;
+    const stitchPacket = exportName.indexOf("dst") !== -1 || exportName.indexOf("exp") !== -1 || exportName.indexOf("pes") !== -1;
     if (stitchPacket && !digitizeFor(user)) return json(res, 404, { error: "Not found" });
-    const packetExport = /\.(dst|exp)$/.test(exportName) || stitchPacket || exportName.indexOf("stones") !== -1 || exportName.indexOf("packet") !== -1;
+    const packetExport = /\.(dst|exp|pes)$/.test(exportName) || stitchPacket || exportName.indexOf("stones") !== -1 || exportName.indexOf("packet") !== -1;
     if (packetExport) {
       if (!requirePaidProduce(user, res)) return;
     } else {
@@ -2340,9 +2391,17 @@ async function handleApi(req, res, url) {
         return download(res, "decoclub-" + job.id.slice(0, 8) + "-art.eps", fs.readFileSync(abs), "application/postscript");
       }
     }
-    const pack = writeExports(job, UPLOADS, path.join(EXPORTS, job.id));
     const name = expFile[2];
     const short = job.id.slice(0, 8);
+    if (name === "design.dst" || name === "design.exp" || name === "design.pes" || name === "stitch-preview.svg") {
+      try {
+        const file = await stitchFileForJob(job, name);
+        if (file) return download(res, "decoclub-" + short + "-" + name, file, MIME[path.extname(name)] || "application/octet-stream");
+      } catch (err) {
+        return json(res, 500, { error: String(err && err.message || err) });
+      }
+    }
+    const pack = writeExports(job, UPLOADS, path.join(EXPORTS, job.id));
     if (name === "packet.json") return download(res, "decoclub-" + short + "-packet.json", JSON.stringify(pack.packet, null, 2), "application/json");
     if (pack.contents[name]) return download(res, "decoclub-" + short + "-" + name, pack.contents[name], MIME[path.extname(name)] || "application/octet-stream");
     return json(res, 404, { error: "Unknown export" });
@@ -2747,7 +2806,7 @@ function serveStatic(req, res, url) {
 let DIGITIZE_DEPS = null;
 function probeDigitizeDeps() {
   const cp = require("child_process");
-  const py = process.env.DIGITIZE_PYTHON || "/venv/bin/python3";
+  const py = process.env.DIGITIZE_PYTHON || pickPrepPython();
   const code = "import importlib, json\nr = {}\nfor m in ['numpy', 'scipy', 'cv2', 'skimage', 'PIL', 'pyembroidery']:\n    try:\n        importlib.import_module(m); r[m] = True\n    except Exception:\n        r[m] = False\nprint(json.dumps(r))";
   cp.execFile(py, ["-c", code], { timeout: 90000 }, function (err, out) {
     let mods = {};

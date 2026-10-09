@@ -1952,6 +1952,9 @@ async function fillDigitize(el, job, shopControls) {
       </div>
       <div class="dig-tools">
         <p class="stat" id="digCount">${job.stitchCount != null ? Number(job.stitchCount).toLocaleString() + " stitches" : "— stitches"}</p>
+        <ul class="dig-stats" id="digStats"></ul>
+        <ul class="dig-threads" id="digThreads"></ul>
+        <div class="dig-warns" id="digWarns"></div>
         <p class="muted" id="digMeta">${escapeHtml((job.digitizeExporter || "") + (job.colorStops && job.colorStops[0] ? " · " + job.colorStops[0].madeiraCode + " " + job.colorStops[0].name : ""))}</p>
         <label>Width (in) <span id="digWread">${w0}</span></label>
         <input id="digW" type="range" min="0.4" max="6" step="0.05" value="${w0}" />
@@ -1964,13 +1967,14 @@ async function fillDigitize(el, job, shopControls) {
         <input id="digS" type="range" min="0.25" max="0.80" step="0.05" value="0.40" />
         <label>Fabric</label>
         <select id="digFabric">
-          <option value="knit" selected>Knit / jersey</option>
+          <option value="tee" selected>T-shirt / jersey</option>
+          <option value="polo">Polo / pique</option>
           <option value="woven">Woven / poplin</option>
           <option value="twill">Twill / chino</option>
-          <option value="pique">Pique / polo</option>
           <option value="fleece">Fleece / sweat</option>
           <option value="cap">Cap front</option>
         </select>
+        <label class="remember" id="digBusyWrap" hidden><input id="digSimplify" type="checkbox" /> Simplify busy art</label>
         <label>Stitch player <span id="digPread">100%</span></label>
         <input id="digPlayer" type="range" min="0" max="100" step="1" value="100" />
         <div class="cta-row">
@@ -1981,9 +1985,10 @@ async function fillDigitize(el, job, shopControls) {
         <input id="digFilter" class="field" placeholder="Search code or name" />
         <select id="digThread" size="8" class="dig-thread"></select>
         <p class="muted">On-screen match, not a certified spool. Size/density restitches. Thread swap recolors only.</p>
-        <div class="export-grid export-hero art-dl">
+        <div class="export-grid export-hero art-dl" id="digDl">
           <a href="/api/export/${job.id}/design.dst">Download DST</a>
           <a href="/api/export/${job.id}/design.exp">Download EXP</a>
+          <a href="/api/export/${job.id}/design.pes">Download PES</a>
           <a href="/api/export/${job.id}/stitch-preview.svg">2D preview SVG</a>
         </div>
         <p class="notice" id="digErr"></p>
@@ -2003,7 +2008,57 @@ async function fillDigitize(el, job, shopControls) {
   let payload = null;
   let timer = 0;
   function readSize() {
-    return { widthIn: Number($("#digW").value), heightIn: Number($("#digH").value), density: Number($("#digD").value), satinSpacingMm: Number($("#digS").value), fabric: $("#digFabric") ? $("#digFabric").value : "knit" };
+    return {
+      widthIn: Number($("#digW").value),
+      heightIn: Number($("#digH").value),
+      density: Number($("#digD").value),
+      satinSpacingMm: Number($("#digS").value),
+      fabric: $("#digFabric") ? $("#digFabric").value : "tee",
+      simplify: !!( $("#digSimplify") && $("#digSimplify").checked ),
+    };
+  }
+  function paintDigitizeStats(data) {
+    const sum = data.summary || {};
+    const stitches = Number(data.stitchCount || sum.stitchCount || 0);
+    const colours = (data.colorStops || []).length || sum.colours || 0;
+    const changes = sum.colorChanges != null ? sum.colorChanges : Math.max(0, colours - 1);
+    const trims = sum.trims != null ? sum.trims : 0;
+    $("#digCount").textContent = stitches.toLocaleString() + " stitches";
+    const stats = $("#digStats");
+    if (stats) {
+      stats.innerHTML =
+        "<li>" + colours + " thread colour" + (colours === 1 ? "" : "s") + "</li>" +
+        "<li>" + changes + " colour change" + (changes === 1 ? "" : "s") + "</li>" +
+        "<li>" + trims + " trim" + (trims === 1 ? "" : "s") + "</li>";
+    }
+    const list = $("#digThreads");
+    if (list) {
+      list.innerHTML = (data.colorStops || []).map((s) => {
+        const hex = escapeHtml(s.hex || "#888");
+        const code = s.madeiraCode ? escapeHtml(String(s.madeiraCode)) + " " : "";
+        const name = escapeHtml(s.name || "Thread");
+        return "<li><span class='dig-swatch' style='background:" + hex + "'></span>" + code + name + "</li>";
+      }).join("");
+    }
+    const warns = [];
+    if (data.minRecommendedWidthIn) warns.push("Recommended width ≥ " + Number(data.minRecommendedWidthIn).toFixed(1) + " in");
+    (data.textWarnings || []).forEach((w) => {
+      const msg = w && (w.message || w.warning || w.text);
+      if (msg) warns.push(msg);
+      else if (w && w.type) warns.push(String(w.type).replace(/_/g, " "));
+    });
+    const busy = data.busyArt;
+    const busyWrap = $("#digBusyWrap");
+    if (busy && (busy.warning || busy.simplifyAvailable || busy.score != null)) {
+      if (busy.warning) warns.push(busy.warning);
+      else if (busy.score != null) warns.push("Busy art score " + busy.score);
+      else warns.push("Busy artwork — simplify recommended.");
+      if (busyWrap) busyWrap.hidden = !busy.simplifyAvailable && busy.score == null;
+    } else if (busyWrap) busyWrap.hidden = true;
+    const box = $("#digWarns");
+    if (box) box.innerHTML = warns.map((t) => "<p class='dig-warn'>" + escapeHtml(t) + "</p>").join("");
+    const stop = (data.colorStops && data.colorStops[0]) || {};
+    $("#digMeta").textContent = (data.engine || "wq") + (data.exporter ? " · " + data.exporter : "") + (stop.madeiraCode ? " · " + stop.madeiraCode + " " + stop.name : "");
   }
   async function restitch() {
     const s = readSize();
@@ -2011,17 +2066,17 @@ async function fillDigitize(el, job, shopControls) {
     $("#digHread").textContent = s.heightIn.toFixed(2);
     $("#digDread").textContent = s.density.toFixed(2);
     $("#digSread").textContent = s.satinSpacingMm.toFixed(2);
-    $("#digErr").textContent = "Restitching…";
+    $("#digErr").textContent = "Digitizing…";
+    const dl = $("#digDl");
+    if (dl) dl.querySelectorAll("a").forEach((a) => { a.style.pointerEvents = "none"; a.style.opacity = "0.5"; });
     try {
       const data = await api("/api/jobs/" + job.id + "/digitize", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ widthIn: s.widthIn, heightIn: s.heightIn, density: s.density, satinSpacingMm: s.satinSpacingMm, fabric: s.fabric, previewOnly: true }),
+        body: JSON.stringify({ widthIn: s.widthIn, heightIn: s.heightIn, density: s.density, satinSpacingMm: s.satinSpacingMm, fabric: s.fabric, simplify: s.simplify, previewOnly: true }),
       });
       payload = data.preview;
-      $("#digCount").textContent = Number(data.stitchCount).toLocaleString() + " stitches";
-      const stop = (data.colorStops && data.colorStops[0]) || {};
-      $("#digMeta").textContent = (data.objects || []).map((o) => o.type).join(" + ") + " · " + (data.exporter || "") + (stop.madeiraCode ? " · " + stop.madeiraCode + " " + stop.name : "");
+      paintDigitizeStats(data);
       $("#digErr").textContent = data.usedFallback ? "Art was too thin — used a fill block. Vectorize first for a real logo." : "";
       if (payload && window.DigitizePreview) {
         const canvas = $("#digView");
@@ -2031,6 +2086,7 @@ async function fillDigitize(el, job, shopControls) {
           digitizeView = window.DigitizePreview.mount(canvas, payload);
         }
       }
+      if (dl) dl.querySelectorAll("a").forEach((a) => { a.style.pointerEvents = ""; a.style.opacity = ""; });
     } catch (err) {
       $("#digErr").textContent = err.message;
     }
@@ -2047,6 +2103,7 @@ async function fillDigitize(el, job, shopControls) {
   $("#digD").oninput = debounce;
   $("#digS").oninput = debounce;
   if ($("#digFabric")) $("#digFabric").onchange = restitch;
+  if ($("#digSimplify")) $("#digSimplify").onchange = restitch;
   if ($("#digPlayer")) $("#digPlayer").oninput = () => {
     const t = Number($("#digPlayer").value) / 100;
     $("#digPread").textContent = Math.round(t * 100) + "%";
@@ -2083,7 +2140,8 @@ function fillProduce(el, job, shopControls) {
       <a href="/api/export/${job.id}/art.svg">SVG</a>
       <a href="/api/export/${job.id}/art.eps">EPS</a>
       ${canDigitize() ? `<a href="/api/export/${job.id}/design.dst">DST</a>
-      <a href="/api/export/${job.id}/design.exp">EXP</a>` : ""}
+      <a href="/api/export/${job.id}/design.exp">EXP</a>
+      <a href="/api/export/${job.id}/design.pes">PES</a>` : ""}
       <a href="/api/export/${job.id}/stones.svg">Stones SVG</a>
       <a href="/api/export/${job.id}/stones.csv">Stones CSV</a>
       <a href="/api/export/${job.id}/stones.plt">Stones PLT</a>

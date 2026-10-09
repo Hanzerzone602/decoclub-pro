@@ -438,6 +438,13 @@ th { color: var(--muted); font-weight: 600; font-size: 11px; letter-spacing: .06
 .dig-tools input[type=range] { width: 100%; }
 .dig-thread { width: 100%; min-height: 140px; background: var(--panel); border: 1px solid var(--line); }
 .dig-tools .stat, #digCount { font-size: 22px; font-weight: 700; margin: 0 0 6px; }
+.dig-stats { list-style: none; margin: 0 0 10px; padding: 0; color: var(--muted); font-size: 13px; }
+.dig-stats li { margin: 2px 0; }
+.dig-threads { list-style: none; margin: 0 0 12px; padding: 0; font-size: 13px; }
+.dig-threads li { display: flex; align-items: center; gap: 8px; margin: 4px 0; }
+.dig-swatch { width: 14px; height: 14px; border-radius: 3px; border: 1px solid var(--line); flex: 0 0 14px; }
+.dig-warns { margin: 0 0 10px; }
+.dig-warn { margin: 6px 0; padding: 8px 10px; background: #3a2a12; color: #f3d7a0; border: 1px solid #6a5424; font-size: 12px; }
 @media (max-width: 960px) {
   .dig-canvas { height: 48vh; }
 }
