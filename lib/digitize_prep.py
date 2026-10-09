@@ -37,6 +37,12 @@ Pipeline (all sizes in mm, px/mm = image px width / (widthIn * 25.4)):
   6. warnings for thin columns and small lettering.
   7. optional SVG preview.
 
+Busy art (1.6): complexity is scored before quantisation. --simplify on
+posterizes by luminance band (then hue) so a light subject cannot merge across
+a strong L edge, and lettering is masked out of the piece floor. --simplify auto
+uses that result only when fidelity stays within 0.03 SSIM of simplify-off and
+pieces and trims both drop. off, and auto on an ok design, follow the 1.4 path.
+
 Free/permissive deps only: numpy, opencv, scipy, scikit-image, Pillow,
 potrace CLI (GPL binary invoked as a separate process, not linked).
 Does NOT import or modify lib/trace.py.
@@ -60,7 +66,7 @@ try:
 except Exception:  # pragma: no cover
     _sk_skeletonize = None
 
-VERSION = "digitize_prep 1.4"
+VERSION = "digitize_prep 1.6"
 UNDERLAP_WIDTH_FRAC = 0.15   # underlap <= 15% of the covering shape's local width ...
 UNDERLAP_MIN_MM = 0.25       # ... but at least 0.25 mm (no gaps) and at most --fabric underlap (0.7 mm)
 TARGET_PPM = 10.0        # working raster: at least 10 px per mm
@@ -315,6 +321,18 @@ class MergeCtx:
         self.src_scale = 1.0       # working px per source px
         self.rims_kept_by_guard = 0
         self.dots_kept = 0              # small round dots (punctuation) kept by merge_pieces
+        self.protect_mask = None        # simplify: lettering / counters exempt from merges
+        self.subject_mask = None        # simplify: light subject may merge, but only within its tone
+
+
+def _mask_overlap(mask, y0, y1, x0, x1, comp):
+    """Share of `comp` that lies on `mask`. 0 when the mask is absent."""
+    if mask is None or not comp.any():
+        return 0.0
+    sub = mask[y0:y1, x0:x1]
+    if sub.shape != comp.shape:
+        return 0.0
+    return float(sub[comp].mean())
 
 
 def is_blend_rim(l, nb_counts, ctx, width_mm):
@@ -476,7 +494,12 @@ def collect_runs(lab_img, lab_map, label_rgb, label_lab, ctx, ppm, min_w_mm, des
         c = plabs[l]
         d = np.linalg.norm(lab_img - c[None, None, :], axis=2).astype(np.float32)
         closed = cv2.morphologyEx(d, cv2.MORPH_CLOSE, disk(r))
-        line = ((closed - d) > 25.0) & (d < 35.0) & design & (lab_map != l)
+        # simplify flattens shading into fills; hairline hunting would put the
+        # gradient noise back. Keyline runs queued earlier are still unioned in.
+        if getattr(ctx, "simplify_flat", False):
+            line = np.zeros((H, W), bool)
+        else:
+            line = ((closed - d) > 25.0) & (d < 35.0) & design & (lab_map != l)
         kmask = np.zeros((H, W), bool)
         for rp in ctx.runs:
             if rp["label"] == l:
@@ -596,6 +619,13 @@ def merge_small_regions(lab_map, n_labels, ppm, min_w_mm, min_area_mm2, ctx=None
                 exempt.add((l, int(x), int(y), int(ww), int(hh), int(area)))
                 ctx.counters += 1
                 continue
+            # simplify only: lettering, counters, and the light subject are never
+            # handed to a neighbour here. Subject specks merge later, and only
+            # into a similar tone, so the sun cannot eat the skull edge.
+            if _mask_overlap(getattr(ctx, "protect_mask", None), y0, y1, x0, x1, comp) >= 0.35 \
+                    or _mask_overlap(getattr(ctx, "subject_mask", None), y0, y1, x0, x1, comp) >= 0.35:
+                exempt.add((l, int(x), int(y), int(ww), int(hh), int(area)))
+                continue
             ring = cv2.dilate(comp.astype(np.uint8), k3).astype(bool) & ~comp
             nb = crop[ring]
             nb = nb[nb != l]
@@ -685,7 +715,8 @@ def count_pieces(lab_map, labels):
     return out
 
 
-def merge_pieces(lab_map, ppm, min_piece_mm2, thin_mm, ctx, max_passes=6, force_labels=(), dot_min_w=1.0):
+def merge_pieces(lab_map, ppm, min_piece_mm2, thin_mm, ctx, max_passes=6, force_labels=(), dot_min_w=1.0,
+                 protect_mask=None):
     """Size-scaled clean-up of fill colours (labels > 0): isolated pieces under
     min_piece_mm2, and short thin fragments (max width < thin_mm) that are not
     line art, are merged into the neighbour sharing the longest border.
@@ -728,6 +759,10 @@ def merge_pieces(lab_map, ppm, min_piece_mm2, thin_mm, ctx, max_passes=6, force_
             comp = (ccs[l][y0:y1, x0:x1] == i) & (crop == l)
             if not comp.any():
                 continue
+            # text / keyline strokes (simplify only; mask is None on the 1.4 path)
+            if protect_mask is not None and float(protect_mask[y0:y1, x0:x1][comp].mean()) >= 0.35:
+                exempt.add(key)
+                continue
             width_mm = 2.0 * mxdt / ppm
             if l in force_labels:
                 pass
@@ -754,6 +789,40 @@ def merge_pieces(lab_map, ppm, min_piece_mm2, thin_mm, ctx, max_passes=6, force_
             if len(nb) == 0:
                 exempt.add(key)
                 continue
+            # Simplify keeps a light subject's tone. A low-chroma facet (the skull)
+            # may join another light neutral, never the saturated sun, even when
+            # it is small. Letter ink and large pieces also stay in their tone.
+            # Other small background facets may join whatever they touch.
+            cap = getattr(ctx, "max_merge_dL", None)
+            labs = getattr(ctx, "label_lab", None)
+            on_subject = _mask_overlap(getattr(ctx, "subject_mask", None), y0, y1, x0, x1, comp) >= 0.35
+            if cap is not None and labs and l in labs and labs.get(l) is not None and (on_subject or area >= 2.5 * ppm * ppm):
+                my = labs[l]
+                myL = float(my[0])
+                myC = float(np.hypot(my[1], my[2]))
+                neutral = myC < 24.0 and myL >= 42.0
+                structural = myL < 16.0
+                if structural or neutral or on_subject or area >= 50.0 * ppm * ppm:
+                    keep_nb = []
+                    for v in np.unique(nb):
+                        ol = labs.get(int(v))
+                        if ol is None:
+                            keep_nb.append(int(v))
+                            continue
+                        oL = float(ol[0])
+                        oC = float(np.hypot(ol[1], ol[2]))
+                        if abs(oL - myL) > float(cap):
+                            continue
+                        # a bone-coloured piece does not dissolve into the sun
+                        if (neutral or on_subject) and myC < 28.0 and oC > 38.0:
+                            continue
+                        if structural and oL > 30.0:
+                            continue
+                        keep_nb.append(int(v))
+                    if not keep_nb:
+                        exempt.add(key)
+                        continue
+                    nb = nb[np.isin(nb, keep_nb)]
             crop[comp] = int(np.bincount(nb).argmax())
             merged += 1
         total += merged
@@ -809,6 +878,9 @@ def extract_thin_branches(lab_map, n_labels, ppm, min_w_mm, ctx):
                 continue
             x0, y0, x1, y1 = max(0, x - 1), max(0, y - 1), x + ww + 1, y + hh + 1
             piece = cc[y0:y1, x0:x1] == i
+            if _mask_overlap(getattr(ctx, "protect_mask", None), y0, y1, x0, x1, piece) >= 0.25 \
+                    or _mask_overlap(getattr(ctx, "subject_mask", None), y0, y1, x0, x1, piece) >= 0.25:
+                continue
             sk = _sk_skeletonize(piece) if _sk_skeletonize is not None else piece
             L = sk.sum() / ppm
             if L < 1.5:
@@ -1806,13 +1878,951 @@ def _text_lines(lab_map, labels, layer_idx, label_rgb, ppm, width_in, min_h_mm, 
     return out
 
 
+# --------------------------------------------------------- busy-art score ---
+def _fmt_in(x):
+    x = round(float(x), 2)
+    if abs(x - round(x)) < 1e-6:
+        return "%d" % int(round(x))
+    return ("%.2f" % x).rstrip("0").rstrip(".")
+
+
+def _ceil_quarter(x):
+    return round(math.ceil(float(x) / 0.25 - 1e-9) * 0.25, 2)
+
+
+def _clip10(x):
+    return float(max(0.0, min(10.0, x)))
+
+
+def _assign_tones(vals, k, min_gap=22.0):
+    """Snap a 1-d sample to at most k centres (histogram peaks, min_gap apart)."""
+    vals = np.asarray(vals, np.float32)
+    if len(vals) == 0:
+        return vals
+    if k <= 1 or float(vals.std()) < 10.0:
+        return np.full(len(vals), float(np.median(vals)), np.float32)
+    hist, edges = np.histogram(vals, bins=16, range=(0, 256))
+    centers = []
+    total = float(hist.sum()) or 1.0
+    for i in np.argsort(hist)[::-1]:
+        if hist[i] <= 0:
+            break
+        if centers and hist[i] < 0.05 * total:
+            break
+        c = float(0.5 * (edges[i] + edges[i + 1]))
+        if any(abs(c - p) < min_gap for p in centers):
+            continue
+        centers.append(c)
+        if len(centers) >= k:
+            break
+    if not centers:
+        centers = [float(np.median(vals))]
+    C = np.asarray(centers, np.float32)
+    return C[np.abs(vals[:, None] - C[None]).argmin(1)]
+
+
+def complexity_score(rgb, lab, fab, bg_lab, ppm, width_in, height_in):
+    """Score how hard the art will be to sew, before quantisation.
+
+    Reads only. Weights are tuned so a flat logo (summit, bee) stays "ok",
+    detailed line art with little smooth shading (tiger) stays "ok", and a
+    large shaded illustration (Carpenters) lands on "busy".
+    """
+    design = ~fab
+    n_des = int(design.sum())
+    if n_des < 16:
+        return {"score": 0.0, "level": "ok", "reasons": [], "suggestedWidthIn": round(float(width_in), 2),
+                "verdict": "ok",
+                "metrics": {"distinctColors": 0, "shadingFraction": 0.0, "edgeDensity": 0.0,
+                            "tinyPiecesPerIn2": 0.0, "tinyAreaFraction": 0.0, "textFlaggedShare": 0.0,
+                            "estimatedStitches": 0, "estimatedStitchesAtSuggested": 0}}
+    # distinct colours after the light denoise already applied in working_raster
+    q = (rgb >> 3).astype(np.int32)
+    keys = (q[:, :, 0] << 10) | (q[:, :, 1] << 5) | q[:, :, 2]
+    kk = keys[design]
+    _u, cnts = np.unique(kk, return_counts=True)
+    n5 = int((cnts >= 0.001 * n_des).sum())
+    # smooth shading: low-but-nonzero gradient of a lightly blurred L, in
+    # regions big enough to be a gradient rather than a hard edge or JPEG speckle
+    Lch = lab[:, :, 0]
+    blur = cv2.GaussianBlur(Lch, (0, 0), max(1.0, 0.35 * ppm))
+    lx = cv2.Sobel(blur, cv2.CV_32F, 1, 0, ksize=3)
+    ly = cv2.Sobel(blur, cv2.CV_32F, 0, 1, ksize=3)
+    mag = np.sqrt(lx * lx + ly * ly)
+    shade = (mag >= 0.8) & (mag < 5.0) & design
+    sn, scc, sst, _ = cv2.connectedComponentsWithStats(shade.astype(np.uint8), connectivity=8)
+    big_px = 8.0 * ppm * ppm
+    big = sum(int(sst[i, cv2.CC_STAT_AREA]) for i in range(1, sn) if sst[i, cv2.CC_STAT_AREA] >= big_px)
+    shade_frac = big / float(n_des)
+    gray = cv2.cvtColor(rgb, cv2.COLOR_RGB2GRAY)
+    edges = cv2.Canny(gray, 60, 160)
+    edge_frac = float(((edges > 0) & design).sum() / float(n_des))
+    # provisional quantise (own RNG seed inside quantize_palette) -> tiny pieces
+    max_dim = max(float(width_in), float(height_in))
+    mc = auto_max_colors(max_dim)
+    min_piece, _thin = auto_min_piece(max_dim, 1.0)
+    tiny_n, tiny_area = 0, 0
+    sub_areas = []
+    text_share = 0.0
+    small_text = False
+    sug_text = float(width_in)
+    pal = quantize_palette(lab[design], mc, bg_lab=bg_lab)
+    if getattr(pal, "ndim", 0) == 2 and len(pal) > 0:
+        K = len(pal)
+        centers = pal if bg_lab is None else np.vstack([pal, bg_lab[None].astype(np.float32)])
+        raw = nearest_label(lab, centers) + 1
+        raw[fab] = 0
+        k_mode = max(3, int(round(0.35 * ppm)) | 1)
+        lab_map = mode_filter(raw, K + 2, k_mode)
+        min_px = min_piece * ppm * ppm
+        for l in range(1, K + 1):
+            msk = (lab_map == l).astype(np.uint8)
+            if not msk.any():
+                continue
+            n, _cc, st, _ = cv2.connectedComponentsWithStats(msk, connectivity=8)
+            for i in range(1, n):
+                a = int(st[i, cv2.CC_STAT_AREA])
+                if a < min_px:
+                    tiny_n += 1
+                    tiny_area += a
+                    amm = a / (ppm * ppm)
+                    if amm >= 0.4:
+                        sub_areas.append(amm)
+        label_rgb = {l: lab_to_rgb(pal[l - 1][None])[0] for l in range(1, K + 1)}
+        if bg_lab is not None:
+            label_rgb[K + 1] = lab_to_rgb(bg_lab[None].astype(np.float32))[0]
+        present = [l for l in range(1, K + 2) if l in label_rgb and (lab_map == l).any()]
+        areas = {l: int((lab_map == l).sum()) for l in present}
+        order = sorted(present, key=lambda l: -areas[l])
+        tw, _rec = detect_text_warnings(lab_map, order, label_rgb, ppm, width_in, early_map=None)
+        des_in2 = (n_des / (ppm * ppm)) / (25.4 ** 2)
+        text_in2 = 0.0
+        for w in tw:
+            b = w["bboxIn"]
+            text_in2 += max(0.0, b[2] - b[0]) * max(0.0, b[3] - b[1])
+            if w.get("type") == "small_text" or float(w.get("heightMm") or 99) < 5.0:
+                small_text = True
+            sug_text = max(sug_text, float(w.get("suggestWidthIn") or width_in))
+        text_share = text_in2 / max(des_in2, 1e-6)
+    area_in2 = (n_des / (ppm * ppm)) / (25.4 ** 2)
+    tiny_per = tiny_n / max(area_in2, 1e-6)
+    tiny_frac = tiny_area / float(n_des)
+    sug_piece = float(width_in)
+    if sub_areas:
+        p75 = float(np.percentile(sub_areas, 75))
+        if p75 < min_piece:
+            sug_piece = float(width_in) * (min_piece / max(p75, 0.2)) ** 0.5
+    sug = max(float(width_in), sug_text)
+    if tiny_frac > 0.03:
+        sug = max(sug, sug_piece)
+    sug = _ceil_quarter(max(sug, float(width_in)))
+    # Stitch estimate from fill area × a density that rises with shading and
+    # speckle. Calibrated a little high on the busy badge so the suggestion
+    # stays under ~60k stitches. Density is per mm² at this width; area (and
+    # therefore stitches) scales with the square of the width. Above 4 in the
+    # size rules keep more small pieces, so the estimate adds a little.
+    area_mm2 = n_des / (ppm * ppm)
+    dens = (2.0
+            + 10.0 * max(0.0, shade_frac - 0.08)
+            + 12.0 * max(0.0, tiny_frac - 0.02))
+
+    def _est_at(w):
+        bump = 1.15 if w > float(width_in) + 0.05 and w > 4.0 else 1.0
+        return dens * area_mm2 * (float(w) / float(width_in)) ** 2 * bump
+
+    sug = min(float(sug), 8.0)
+    fits = []
+    w = float(width_in)
+    while w <= sug + 1e-6:
+        if _est_at(w) <= 60000.0:
+            fits.append(round(w, 2))
+        w = round(w + 0.25, 2)
+    if fits:
+        sug = fits[-1]
+    else:
+        sug = round(float(width_in), 2)
+    est_now = int(round(_est_at(width_in)))
+    est_sug = int(round(_est_at(sug)))
+    color_s = _clip10((n5 - 45) / 5.0)
+    shade_s = _clip10((shade_frac - 0.10) / 0.012)
+    edge_s = _clip10((edge_frac - 0.045) / 0.012)
+    tiny_s = _clip10((tiny_frac - 0.035) / 0.008)
+    if small_text:
+        text_s = _clip10(text_share / 0.03 * 6.0 + 3.0)
+    else:
+        text_s = _clip10(text_share / 0.08 * 4.0)
+    raw_score = 0.22 * color_s + 0.50 * shade_s + 0.10 * edge_s + 0.12 * tiny_s + 0.06 * text_s
+    score = round(raw_score, 1)
+    if score >= 7.5:
+        level = "too_busy"
+    elif score >= 4.0:
+        level = "busy"
+    else:
+        level = "ok"
+    reasons = []
+    if color_s >= 3.0:
+        reasons.append("%d distinct colours" % n5)
+    if shade_s >= 3.0:
+        reasons.append("smooth shading on %d%% of the design" % int(round(100 * shade_frac)))
+    if edge_s >= 3.0:
+        reasons.append("dense edges (%d%% of the design)" % int(round(100 * edge_frac)))
+    if tiny_s >= 3.0:
+        reasons.append("%d tiny pieces per in²" % int(round(tiny_per)))
+    if small_text and text_s >= 3.0:
+        reasons.append("lettering under 5 mm")
+    elif text_s >= 3.0:
+        reasons.append("thin lettering strokes")
+    # A bigger hoop cannot fix lettering once the 8 in cap or the ~60k stitch
+    # estimate binds. Say so instead of suggesting a huge size.
+    text_wants = float(sug_text) > float(sug) + 0.05
+    stitch_binds = est_sug >= 52000 or (est_now > 60000) or (float(sug) + 0.05 < min(8.0, max(float(sug_text), float(sug_piece))))
+    if level == "ok":
+        verdict = "ok"
+    elif text_wants or (level == "too_busy" and stitch_binds):
+        verdict = "needs manual digitizing"
+    else:
+        verdict = "simplify recommended"
+    return {
+        "score": score, "level": level, "reasons": reasons, "suggestedWidthIn": sug,
+        "verdict": verdict,
+        "metrics": {
+            "distinctColors": int(n5),
+            "shadingFraction": round(float(shade_frac), 3),
+            "edgeDensity": round(float(edge_frac), 3),
+            "tinyPiecesPerIn2": round(float(tiny_per), 1),
+            "tinyAreaFraction": round(float(tiny_frac), 3),
+            "textFlaggedShare": round(float(text_share), 3),
+            "estimatedStitches": est_now,
+            "estimatedStitchesAtSuggested": est_sug,
+        },
+    }
+
+
+def _thin_neutral_mask(lab, design, ppm, which, max_width_mm, min_len_mm=0.8):
+    """Connected strokes of near-black or near-white ink, no fatter than max_width_mm.
+    Fat fills (a navy ground, a white foam blob) are left out so simplify can flatten them."""
+    L = lab[:, :, 0]
+    chroma = np.sqrt(lab[:, :, 1] ** 2 + lab[:, :, 2] ** 2)
+    if which == "dark":
+        raw = design & (L < 45.0) & (chroma < 32.0)
+    else:
+        raw = design & (L > 80.0) & (chroma < 24.0)
+    if not raw.any():
+        return raw
+    n, cc, st, _ = cv2.connectedComponentsWithStats(raw.astype(np.uint8), connectivity=8)
+    dt = cv2.distanceTransform(raw.astype(np.uint8), cv2.DIST_L2, 5)
+    max_half = 0.5 * max_width_mm * ppm
+    min_len = min_len_mm * ppm
+    min_area = 0.15 * ppm * ppm
+    keep = np.zeros(raw.shape, bool)
+    for i in range(1, n):
+        area = int(st[i, cv2.CC_STAT_AREA])
+        w, h = int(st[i, cv2.CC_STAT_WIDTH]), int(st[i, cv2.CC_STAT_HEIGHT])
+        if area < min_area or max(w, h) < min_len:
+            continue
+        x, y = int(st[i, cv2.CC_STAT_LEFT]), int(st[i, cv2.CC_STAT_TOP])
+        comp = cc[y:y + h, x:x + w] == i
+        if not comp.any():
+            continue
+        half = float(dt[y:y + h, x:x + w][comp].max())
+        if half <= max_half:
+            keep[y:y + h, x:x + w][comp] = True
+    return keep
+
+
+def _thicken_strokes(mask, lab, ppm, target_mm=1.2):
+    """Grow thin strokes up to target_mm, not into their own holes or into a neighbour stroke."""
+    if not mask.any():
+        return mask, 0
+    n, cc, st, _ = cv2.connectedComponentsWithStats(mask.astype(np.uint8), connectivity=8)
+    out = mask.copy()
+    thickened = 0
+    target_half = 0.5 * target_mm * ppm
+    for i in range(1, n):
+        area = int(st[i, cv2.CC_STAT_AREA])
+        if area < 4:
+            continue
+        x, y = int(st[i, cv2.CC_STAT_LEFT]), int(st[i, cv2.CC_STAT_TOP])
+        w, h = int(st[i, cv2.CC_STAT_WIDTH]), int(st[i, cv2.CC_STAT_HEIGHT])
+        # work in a padded crop so dilation can grow, then write back
+        pad = int(math.ceil(target_half)) + 2
+        x0, y0 = max(0, x - pad), max(0, y - pad)
+        x1, y1 = min(mask.shape[1], x + w + pad), min(mask.shape[0], y + h + pad)
+        comp = cc[y0:y1, x0:x1] == i
+        if comp.sum() < 4:
+            continue
+        dt = cv2.distanceTransform(comp.astype(np.uint8), cv2.DIST_L2, 5)
+        if _sk_skeletonize is not None:
+            sk = _sk_skeletonize(comp)
+            v = dt[sk] if sk.any() else dt[comp]
+        else:
+            v = dt[comp]
+        half = float(np.median(v)) if len(v) else 0.0
+        deficit = target_half - half
+        if deficit < 0.6:
+            continue
+        rad = int(math.ceil(deficit))
+        grown = cv2.dilate(comp.astype(np.uint8), disk(rad)).astype(bool)
+        holes = ndi.binary_fill_holes(comp) & ~comp
+        if holes.any():
+            grown &= ~holes
+        others = out[y0:y1, x0:x1] & ~comp
+        if others.any():
+            grown &= ~cv2.dilate(others.astype(np.uint8), disk(rad)).astype(bool)
+        # only where the stroke still has room: don't jump a strong colour change
+        # (keeps an orange keyline beside black type)
+        if grown.any():
+            stroke = lab[y0:y1, x0:x1][comp]
+            col = np.median(stroke, axis=0)
+            de = np.linalg.norm(lab[y0:y1, x0:x1] - col[None, None, :], axis=2)
+            grown &= (de < 28.0) | comp
+        if int(grown.sum()) > int(comp.sum()):
+            thickened += 1
+        out[y0:y1, x0:x1] |= grown
+    return out, thickened
+
+
+def _paint_flat(dst, thick, src, base):
+    """One flat thread colour per protected stroke, taken from the original ink."""
+    n, cc = cv2.connectedComponents(thick.astype(np.uint8), connectivity=8)
+    for i in range(1, n):
+        comp = cc == i
+        src_m = comp & base
+        if int(src_m.sum()) < 3:
+            src_m = comp
+        col = np.median(src[src_m], axis=0)
+        dst[comp] = np.clip(np.round(col), 0, 255).astype(np.uint8)
+    return dst
+
+
+def posterize_hues(rgb, max_tones=3):
+    """Flatten each hue family (and neutrals) to a few flat tones."""
+    hsv = cv2.cvtColor(rgb, cv2.COLOR_RGB2HSV)
+    H = hsv[:, :, 0].astype(np.int16)
+    S = hsv[:, :, 1].astype(np.int16)
+    V = hsv[:, :, 2].astype(np.int16)
+    outH, outS, outV = H.copy(), S.copy(), V.copy()
+    neutral = S < 28
+    assigned = neutral.copy()
+    for hi in range(12):
+        lo, hi_h = hi * 15, (hi + 1) * 15
+        m = ~assigned & (H >= lo) & (H < hi_h)
+        if int(m.sum()) < 40:
+            continue
+        ang = H[m].astype(np.float64) * (2.0 * np.pi / 180.0)
+        mean = math.atan2(float(np.sin(ang).mean()), float(np.cos(ang).mean()))
+        hue = int(round(mean * 180.0 / (2.0 * np.pi))) % 180
+        outH[m] = hue
+        outV[m] = np.clip(np.round(_assign_tones(V[m], max_tones)), 0, 255)
+        outS[m] = np.clip(np.round(_assign_tones(S[m], 2)), 0, 255)
+        assigned |= m
+    if neutral.any():
+        outS[neutral] = 0
+        outV[neutral] = np.clip(np.round(_assign_tones(V[neutral], max_tones)), 0, 255)
+        outH[neutral] = 0
+    hsv2 = np.stack([
+        outH.astype(np.uint8),
+        np.clip(outS, 0, 255).astype(np.uint8),
+        np.clip(outV, 0, 255).astype(np.uint8),
+    ], axis=-1)
+    return cv2.cvtColor(hsv2, cv2.COLOR_HSV2RGB)
+
+
+def _l_band_ids(L, design, k=6, min_gap=9.0):
+    """Snap L to a few tone centres. A pixel never leaves its band, so a strong
+    luminance step (skull against a darker ground, type against a fill) stays."""
+    vals = np.asarray(L[design], np.float32)
+    if vals.size < 32:
+        c = float(np.median(vals)) if vals.size else 50.0
+        band = np.zeros(L.shape, np.int32)
+        band[~design] = -1
+        return band, np.array([c], np.float32)
+    centers = np.percentile(vals, np.linspace(8, 92, k)).astype(np.float32)
+    for _ in range(10):
+        which = np.abs(vals[:, None] - centers[None]).argmin(1)
+        nxt = []
+        for i in range(k):
+            m = which == i
+            nxt.append(float(np.median(vals[m])) if m.any() else float(centers[i]))
+        centers = np.asarray(nxt, np.float32)
+    centers = np.sort(centers)
+    merged = [float(centers[0])]
+    for c in centers[1:]:
+        if float(c) - merged[-1] < min_gap:
+            merged[-1] = 0.5 * (merged[-1] + float(c))
+        else:
+            merged.append(float(c))
+    centers = np.asarray(merged, np.float32)
+    band = np.abs(L[:, :, None] - centers[None]).argmin(2).astype(np.int32)
+    band[~design] = -1
+    return band, centers
+
+
+def _l_edge_barrier(L, design, ppm):
+    """Pixels on a strong luminance edge. Merges may not cross this mask."""
+    Ls = cv2.GaussianBlur(L, (0, 0), max(0.6, 0.08 * ppm))
+    mag = np.hypot(cv2.Sobel(Ls, cv2.CV_32F, 1, 0, ksize=3),
+                   cv2.Sobel(Ls, cv2.CV_32F, 0, 1, ksize=3))
+    return design & (mag >= 45.0)
+
+
+def _flatten_lum(rgb, lab, design, ppm):
+    """Bilateral denoise, then one flat Lab per (L-band, hue) — never across a band edge.
+
+    Smoothing is the bilateral pass plus a per-band median. A speckle may join a
+    neighbour only when their L differs by less than 10 (same tone band); a
+    strong L edge is a hard stop.
+    """
+    rgb_b = cv2.bilateralFilter(np.ascontiguousarray(rgb), d=5, sigmaColor=18,
+                                sigmaSpace=max(3, int(round(0.18 * ppm))))
+    lab_b = rgb_to_lab(rgb_b)
+    Lb, ab, bb = lab_b[:, :, 0], lab_b[:, :, 1], lab_b[:, :, 2]
+    Cb = np.hypot(ab, bb)
+    band, centers = _l_band_ids(Lb, design)
+    barrier = _l_edge_barrier(Lb, design, ppm)
+    ang = np.arctan2(bb, ab)
+    out = lab_b.copy()
+    for i in range(len(centers)):
+        m = (band == i) & design
+        if not m.any():
+            continue
+        neutral = m & (Cb < 20.0)
+        colored = m & ~neutral
+        if int(neutral.sum()) >= 30:
+            out[neutral] = np.median(lab_b[neutral], axis=0)
+        if int(colored.sum()) < 40:
+            if colored.any():
+                out[colored] = np.median(lab_b[colored], axis=0)
+            continue
+        an = ang[colored]
+        bins = np.linspace(-np.pi, np.pi, 13)
+        hi, _ = np.histogram(an, bins=bins)
+        ch = []
+        total = float(colored.sum())
+        for idx in np.argsort(hi)[::-1]:
+            if hi[idx] < 0.06 * total:
+                break
+            cang = float(0.5 * (bins[idx] + bins[idx + 1]))
+            if any(min(abs(cang - p), 2 * np.pi - abs(cang - p)) < 0.55 for p in ch):
+                continue
+            ch.append(cang)
+            if len(ch) >= 4:
+                break
+        if not ch:
+            ch = [float(np.median(an))]
+        CH = np.asarray(ch, np.float32)
+        d = np.abs(an[:, None] - CH[None])
+        d = np.minimum(d, 2 * np.pi - d)
+        which = d.argmin(1)
+        cols = lab_b[colored]
+        ys, xs = np.nonzero(colored)
+        for hi_ in range(len(CH)):
+            sel = which == hi_
+            if int(sel.sum()) < 25:
+                continue
+            out[ys[sel], xs[sel]] = np.median(cols[sel], axis=0)
+    flat = lab_to_rgb(out)
+    flat[~design] = rgb[~design]
+    _merge_l_specks(flat, band, design, barrier, ppm, max_mm2=1.3, max_dL=10.0)
+    flat[~design] = rgb[~design]
+    return np.ascontiguousarray(flat), band, barrier, centers
+
+
+def _merge_l_specks(rgb, band, design, barrier, ppm, max_mm2, max_dL):
+    """Fold sub-1.3 mm² islands into a touching colour in the same L band."""
+    lab = rgb_to_lab(rgb)
+    L = lab[:, :, 0]
+    q = (rgb.astype(np.int16) >> 2).astype(np.int32)
+    keys = ((q[:, :, 0] << 12) | (q[:, :, 1] << 6) | q[:, :, 2]).copy()
+    keys[~design] = -1
+    present = keys[design]
+    if present.size == 0:
+        return
+    uniq, inv = np.unique(present, return_inverse=True)
+    lab_id = np.zeros(rgb.shape[:2], np.int32)
+    lab_id[design] = inv.astype(np.int32) + 1
+    min_px = max_mm2 * ppm * ppm
+    H, W = lab_id.shape
+    k3 = np.ones((3, 3), np.uint8)
+    for lid in range(1, int(uniq.size) + 1):
+        m = lab_id == lid
+        if int(m.sum()) < 4:
+            continue
+        n, cc, st, _ = cv2.connectedComponentsWithStats(m.astype(np.uint8), connectivity=8)
+        for i in range(1, n):
+            area = int(st[i, cv2.CC_STAT_AREA])
+            if area >= min_px or area < 4:
+                continue
+            x, y, w, h = [int(v) for v in st[i, :4]]
+            x0, y0 = max(0, x - 1), max(0, y - 1)
+            x1, y1 = min(W, x + w + 1), min(H, y + h + 1)
+            comp = cc[y0:y1, x0:x1] == i
+            if not comp.any():
+                continue
+            if float(barrier[y0:y1, x0:x1][comp].mean()) > 0.45:
+                continue  # sits on a luminance edge: leave the edge alone
+            ring = cv2.dilate(comp.astype(np.uint8), k3).astype(bool) & ~comp
+            nb_ids = lab_id[y0:y1, x0:x1][ring]
+            nb_ids = nb_ids[nb_ids > 0]
+            if nb_ids.size == 0:
+                continue
+            myL = float(np.median(L[y0:y1, x0:x1][comp]))
+            myB = int(np.median(band[y0:y1, x0:x1][comp])) if band is not None else -1
+            best = None
+            for nid in np.unique(nb_ids):
+                sel = ring & (lab_id[y0:y1, x0:x1] == int(nid))
+                if not sel.any():
+                    continue
+                nL = float(np.median(L[y0:y1, x0:x1][sel]))
+                dL = abs(nL - myL)
+                if dL > max_dL:
+                    continue
+                if myB >= 0:
+                    nB = int(np.median(band[y0:y1, x0:x1][sel]))
+                    if nB != myB:
+                        continue
+                cnt = int(sel.sum())
+                if best is None or dL < best[0] - 1e-6 or (abs(dL - best[0]) < 1e-6 and cnt > best[1]):
+                    best = (dL, cnt, int(nid), sel)
+            if best is None:
+                continue
+            col = np.median(rgb[y0:y1, x0:x1][best[3]], axis=0)
+            rgb[y0:y1, x0:x1][comp] = np.clip(np.round(col), 0, 255).astype(np.uint8)
+            lab_id[y0:y1, x0:x1][comp] = best[2]
+            L[y0:y1, x0:x1][comp] = float(np.median(L[y0:y1, x0:x1][best[3]]))
+
+
+def _lettering_mask(lab, design, ppm):
+    """Blackletter and small type (Local 635), plus the keyline and counters.
+
+    A dark component counts as lettering only when a thin contrasting keyline
+    wraps it. A skull contour or a mountain ridge sitting on a sunset does not.
+    Returns (stroke_mask, counter_mask).
+    """
+    L = lab[:, :, 0]
+    a = lab[:, :, 1]
+    b = lab[:, :, 2]
+    C = np.hypot(a, b)
+    dark = design & (L < 26.0) & (C < 30.0)
+    keep = np.zeros(design.shape, bool)
+    orange = design & (C > 30.0) & (a > 8.0) & (b > 6.0) & (L > 28.0) & (L < 82.0)
+    thin_orange = np.zeros(design.shape, bool)
+    near_thin = np.zeros(design.shape, bool)
+    if orange.any():
+        r = max(1, int(round(0.55 * ppm)))
+        opened = cv2.morphologyEx(orange.astype(np.uint8), cv2.MORPH_OPEN, disk(r)).astype(bool)
+        thin_orange = orange & ~opened
+        rad = max(1, int(round(1.15 * ppm)))
+        near_thin = cv2.dilate(thin_orange.astype(np.uint8), disk(rad)).astype(bool)
+    if dark.any():
+        n, cc, st, _ = cv2.connectedComponentsWithStats(dark.astype(np.uint8), connectivity=8)
+        for i in range(1, n):
+            area = int(st[i, cv2.CC_STAT_AREA])
+            x, y, w, h = [int(v) for v in st[i, :4]]
+            amm = area / (ppm * ppm)
+            hmm, wmm = h / ppm, w / ppm
+            if not (3.5 <= amm <= 240.0 and 3.2 <= hmm <= 22.0 and 1.4 <= wmm <= 28.0):
+                continue
+            if wmm > 18.0 and hmm < 5.0:
+                continue
+            comp = cc[y:y + h, x:x + w] == i
+            if not near_thin[y:y + h, x:x + w][comp].any():
+                continue
+            # a real outline wraps the stroke; a sunset field only grazes it
+            if float(near_thin[y:y + h, x:x + w][comp].mean()) < 0.72:
+                continue
+            keep[y:y + h, x:x + w][comp] = True
+    if keep.any() and thin_orange.any():
+        rad = max(1, int(round(0.85 * ppm)))
+        near = cv2.dilate(keep.astype(np.uint8), disk(rad)).astype(bool)
+        keep |= thin_orange & near
+    holes = np.zeros(design.shape, bool)
+    if keep.any():
+        n, cc = cv2.connectedComponents(keep.astype(np.uint8), connectivity=8)
+        H, W = keep.shape
+        max_hole = 40.0 * ppm * ppm
+        for i in range(1, n):
+            ys, xs = np.nonzero(cc == i)
+            if ys.size < 0.4 * ppm * ppm:
+                continue
+            y0, y1 = max(0, int(ys.min()) - 2), min(H, int(ys.max()) + 3)
+            x0, x1 = max(0, int(xs.min()) - 2), min(W, int(xs.max()) + 3)
+            sub = cc[y0:y1, x0:x1] == i
+            filled = ndi.binary_fill_holes(sub)
+            h = filled & ~sub
+            # a letter counter is a small enclosed hole, not the bay of a curve
+            if h.any() and int(h.sum()) < 0.45 * int(sub.sum()) and int(h.sum()) <= max_hole:
+                holes[y0:y1, x0:x1] |= h
+    return keep, holes
+
+
+def _lock_subject_colors(pal, lab, design, ink_mask=None):
+    """Keep a light low-chroma subject, a teal, and letter ink if k-means dropped them.
+
+    Letter ink is the dark pixels of the lettering mask, not every dark mountain.
+    It is kept even when it sits close to a navy background, so small type does
+    not disappear into the fill behind it.
+    """
+    if pal is None or len(pal) == 0 or not np.any(design):
+        return pal
+    L = lab[:, :, 0]
+    a = lab[:, :, 1]
+    b = lab[:, :, 2]
+    C = np.hypot(a, b)
+    n = float(design.sum()) or 1.0
+    extras = []  # (min_dE, median)
+    skull = design & (L >= 50.0) & (L <= 80.0) & (C <= 18.0)
+    if skull.sum() > 0.025 * n:
+        extras.append((13.0, np.median(lab[skull], axis=0)))
+    teal = design & (a < -12.0) & (C >= 16.0) & (L >= 40.0) & (L <= 78.0)
+    if teal.sum() > 0.012 * n:
+        extras.append((13.0, np.median(lab[teal], axis=0)))
+    # Ink first so a later cap cannot drop letter black in favour of a second grey.
+    if ink_mask is not None and np.any(ink_mask):
+        ink = ink_mask & design & (L < 30.0) & (C < 26.0)
+        if int(ink.sum()) > 80:
+            vals = lab[ink]
+            order = np.argsort(vals[:, 0])
+            core = vals[order[:max(40, len(order) // 2)]]
+            extras.insert(0, (5.0, np.median(core, axis=0)))
+    else:
+        ink = design & (L < 20.0) & (C < 18.0)
+        if ink.sum() > 0.008 * n:
+            extras.append((13.0, np.median(lab[ink], axis=0)))
+    centers = [np.asarray(c, np.float32) for c in pal]
+    for min_de, med in extras:
+        med = np.asarray(med, np.float32)
+        if all(float(np.linalg.norm(med - c)) > min_de for c in centers):
+            centers.append(med)
+    locked_from = len(pal)
+    while len(centers) > 9:
+        # Drop the most redundant k-means centre. Locked extras (ink, skull, teal) stay.
+        best = None
+        for i in range(len(centers)):
+            for j in range(i + 1, len(centers)):
+                d = float(np.linalg.norm(centers[i] - centers[j]))
+                if best is None or d < best[0]:
+                    best = (d, i, j)
+        _, i, j = best
+        if i >= locked_from and j >= locked_from:
+            drop = j
+        elif i < locked_from:
+            drop = i
+        else:
+            drop = j
+        del centers[drop]
+        if drop < locked_from:
+            locked_from -= 1
+    return np.asarray(centers, np.float32)
+
+
+def _unify_light_subject(flat, design, letters, holes, ppm):
+    """Pull a big translucent subject (the skull) into light and shadow tones.
+
+    Seeds are the large low-chroma masses. They grow a few millimetres but stop
+    at a thin dark outline, so the sun outside the skull is not painted and the
+    sunset stripes inside the outline become one light shape. Red eyes and
+    lettering stay.
+    """
+    lab = rgb_to_lab(flat)
+    L = lab[:, :, 0]
+    a = lab[:, :, 1]
+    C = np.hypot(a, lab[:, :, 2])
+    bone = design & ~letters & ~holes & (L >= 50.0) & (L <= 80.0) & (C <= 18.0)
+    if int(bone.sum()) < 40.0 * ppm * ppm:
+        return flat, np.zeros(design.shape, bool)
+    n, cc, st, _ = cv2.connectedComponentsWithStats(bone.astype(np.uint8), connectivity=8)
+    seed = np.zeros(bone.shape, bool)
+    for i in range(1, n):
+        if int(st[i, cv2.CC_STAT_AREA]) < 40.0 * ppm * ppm:
+            continue
+        x, y, w, h = [int(v) for v in st[i, :4]]
+        sub = cc[y:y + h, x:x + w] == i
+        seed[y:y + h, x:x + w][sub] = True
+    if int(seed.sum()) < 40.0 * ppm * ppm:
+        return flat, np.zeros(design.shape, bool)
+    # Grow inside the skull only. A dark outline is the wall, so the orange
+    # forehead (inside the line) is painted and the sun outside it is not.
+    # A plain dilation leaks through gaps in that line into the mountains.
+    dark = design & ~letters & (L < 34.0) & (C < 45.0)
+    rad = max(1, int(round(0.45 * ppm)))
+    wall = cv2.morphologyEx(dark.astype(np.uint8), cv2.MORPH_CLOSE, disk(rad)).astype(bool)
+    wall |= letters
+    free = (design & ~wall & ~holes).astype(np.uint8)
+    cur = seed.astype(np.uint8)
+    k3 = np.ones((3, 3), np.uint8)
+    for _ in range(int(round(12.0 * ppm))):
+        nxt = cv2.dilate(cur, k3) & free
+        if int(nxt.sum()) == int(cur.sum()):
+            break
+        cur = nxt
+    eye = design & (a > 30.0) & (C > 45.0) & (L > 35.0) & (L < 72.0)
+    region = cur.astype(bool)
+    # Paint the cranium only. The jaw and the teeth already read as a light
+    # shape; painting them flattens the teeth into one grey blob. The cut is
+    # the bottom of the small red eyes inside the skull, not the mountains.
+    cut = None
+    red = region & eye
+    if red.any():
+        rn, _rcc, rst, _ = cv2.connectedComponentsWithStats(red.astype(np.uint8), connectivity=8)
+        eye_rows = []
+        for i in range(1, rn):
+            area = int(rst[i, cv2.CC_STAT_AREA])
+            if not (3.0 * ppm * ppm <= area <= 120.0 * ppm * ppm):
+                continue
+            eye_rows.append(int(rst[i, cv2.CC_STAT_TOP]) + int(rst[i, cv2.CC_STAT_HEIGHT]))
+        if eye_rows:
+            cut = int(np.median(eye_rows))
+    fill = region & ~eye & (L >= 26.0)
+    # Thin saturated corridors are tooth gaps and sunset slivers. Leave them so
+    # the teeth stay drawn. A wide saturated area (the forehead) is still painted.
+    sat = (design & (C > 42.0)).astype(np.uint8)
+    thick_sat = cv2.morphologyEx(sat, cv2.MORPH_OPEN, disk(max(1, int(round(0.55 * ppm)))))
+    fill &= ~(sat.astype(bool) & ~thick_sat.astype(bool))
+    if cut is not None:
+        fill[cut:, :] = False
+    # A leak past the outline paints a large share of the badge. Give up.
+    if int(fill.sum()) < 80.0 * ppm * ppm or int(fill.sum()) > 1400.0 * ppm * ppm:
+        return flat, np.zeros(design.shape, bool)
+    # One bone tone. Two tones were quantizing into a cream patch and a grey
+    # patch and the skull stopped reading as one shape.
+    med = np.median(lab[seed], axis=0).astype(np.float32)
+    tone = med.copy()
+    tone[0] = float(np.clip(med[0], 62.0, 76.0))
+    out = flat.copy()
+    out[fill] = lab_to_rgb(tone[None])[0]
+    return out, fill
+
+
+def _thicken_letters(flat, rgb_src, strokes, holes, ppm):
+    """Grow letter strokes toward 1.2 mm, at most ~0.35 mm, without closing counters
+    or painting the orange keyline the same colour as the black fill."""
+    if not strokes.any():
+        return flat, strokes, 0
+    lab = rgb_to_lab(rgb_src)
+    L = lab[:, :, 0]
+    # width along the skeleton; only strokes clearly under 1.2 mm grow
+    dt = cv2.distanceTransform(strokes.astype(np.uint8), cv2.DIST_L2, 5)
+    n, cc, st, _ = cv2.connectedComponentsWithStats(strokes.astype(np.uint8), connectivity=8)
+    grown_all = strokes.copy()
+    n_thick = 0
+    target_half = 0.5 * 1.2 * ppm
+    cap = max(1, int(round(0.35 * ppm)))
+    for i in range(1, n):
+        if int(st[i, cv2.CC_STAT_AREA]) < 4:
+            continue
+        x, y, w, h = [int(v) for v in st[i, :4]]
+        pad = cap + 2
+        x0, y0 = max(0, x - pad), max(0, y - pad)
+        x1, y1 = min(strokes.shape[1], x + w + pad), min(strokes.shape[0], y + h + pad)
+        comp = cc[y0:y1, x0:x1] == i
+        if int(comp.sum()) < 4:
+            continue
+        half = float(np.median(dt[y0:y1, x0:x1][comp]))
+        deficit = target_half - half
+        if deficit < 0.8:
+            continue
+        rad = int(min(cap, max(1, math.ceil(deficit))))
+        grown = cv2.dilate(comp.astype(np.uint8), disk(rad)).astype(bool)
+        grown &= ~holes[y0:y1, x0:x1]
+        others = grown_all[y0:y1, x0:x1] & ~comp
+        if others.any():
+            grown &= ~cv2.dilate(others.astype(np.uint8), disk(rad)).astype(bool)
+        # stay on ink of a similar lightness so black does not eat the orange keyline
+        stroke_L = float(np.median(L[y0:y1, x0:x1][comp]))
+        grown &= (np.abs(L[y0:y1, x0:x1] - stroke_L) < 16.0) | comp
+        extra = grown & ~comp
+        if not extra.any():
+            continue
+        col = np.median(rgb_src[y0:y1, x0:x1][comp], axis=0)
+        flat[y0:y1, x0:x1][extra] = np.clip(np.round(col), 0, 255).astype(np.uint8)
+        grown_all[y0:y1, x0:x1] |= grown
+        n_thick += 1
+    return flat, grown_all, n_thick
+
+
+def simplify_artwork(rgb, lab, design, ppm, level):
+    """Luminance-band flatten. Returns (rgb, lab, protect_mask, info).
+
+    Light and dark structure stays because pixels are posterized inside an L
+    band and never merged across a strong L edge. A large light subject is then
+    pulled into one tone so it does not dissolve into the background. Lettering
+    keeps its original ink (black fill and orange keyline separately), is
+    thickened toward 1.2 mm where there is room, and is returned as a mask the
+    min-piece rule must not eat. Counters are part of that mask.
+    """
+    fab = ~design
+    strokes, holes = _lettering_mask(lab, design, ppm)
+    flat, band, barrier, centers = _flatten_lum(rgb, lab, design, ppm)
+    flat, subject = _unify_light_subject(flat, design, strokes, holes, ppm)
+    # original ink, per pixel — do not flatten a letter and its keyline together
+    if strokes.any():
+        flat[strokes] = rgb[strokes]
+    # red eyes sit in the skull and are small enough for the piece floor to eat
+    eye = np.zeros(design.shape, bool)
+    el = rgb_to_lab(flat)
+    ea = el[:, :, 1]
+    eC = np.hypot(ea, el[:, :, 2])
+    eL = el[:, :, 0]
+    red = design & ~strokes & (ea > 28.0) & (eC > 42.0) & (eL > 35.0) & (eL < 74.0)
+    if red.any():
+        n, cc, st, _ = cv2.connectedComponentsWithStats(red.astype(np.uint8), connectivity=8)
+        bone = design & (eC <= 18.0) & (eL >= 48.0) & (eL <= 94.0)
+        near = cv2.dilate(bone.astype(np.uint8), disk(max(1, int(round(1.2 * ppm))))).astype(bool)
+        for i in range(1, n):
+            area = int(st[i, cv2.CC_STAT_AREA])
+            if not (4.0 * ppm * ppm <= area <= 140.0 * ppm * ppm):
+                continue
+            x, y, w, h = [int(v) for v in st[i, :4]]
+            comp = cc[y:y + h, x:x + w] == i
+            if float(near[y:y + h, x:x + w][comp].mean()) < 0.5:
+                continue
+            eye[y:y + h, x:x + w][comp] = True
+    flat, thick, n_thick = _thicken_letters(flat, rgb, strokes, holes, ppm)
+    flat[fab] = rgb[fab]
+    # Letters never merge away. The painted skull is a separate mask: its edge
+    # is not handed to the sun, but small bone-coloured pieces may still join
+    # the skull (same tone only).
+    protect = (thick | holes | eye) & ~fab
+    subject = subject & ~fab & ~protect
+    info = {
+        "smoothing": "bilateral-within-L-band",
+        "posterize": "L-bands-then-hue",
+        "lBands": [round(float(c), 1) for c in centers],
+        "lEdgeBarrierPx": int(barrier.sum()),
+        "maxDLMerge": 10.0,
+        "protectedPx": int(protect.sum()),
+        "subjectPx": int(subject.sum()),
+        "letterPx": int(strokes.sum()),
+        "counterPx": int(holes.sum()),
+        "thickenedStrokes": int(n_thick),
+        "strokeTargetMm": 1.2,
+        "level": level,
+    }
+    return np.ascontiguousarray(flat), rgb_to_lab(flat), protect, subject, info
+
+
+def busy_art_message(width_in, suggested, verdict=None):
+    if verdict == "needs manual digitizing":
+        return ("This artwork has lots of shading and fine detail, so it won't sew cleanly at %s in. "
+                "Simplify recommended. Even at %s in the lettering or the stitch count is still out of "
+                "range, so it needs manual digitizing." % (_fmt_in(width_in), _fmt_in(suggested)))
+    if verdict == "simplify recommended":
+        return ("This artwork has lots of shading and fine detail, so it won't sew cleanly at %s in. "
+                "Simplify recommended, or go up to %s in." % (_fmt_in(width_in), _fmt_in(suggested)))
+    return ("This artwork has lots of shading and fine detail, so it won't sew cleanly at %s in. "
+            "Try the simplified version, or go up to %s in." % (_fmt_in(width_in), _fmt_in(suggested)))
+
+
+def _layer_fidelity(src_rgb, lab_map, label_rgb, design):
+    """Fidelity of rendered thread colours vs the working source, on the design.
+
+    0.8 × SSIM of luminance + 0.2 × recall of the source's strong edges.
+    Shading that was flattened on purpose is not punished as hard as a subject
+    whose outline disappeared.
+    """
+    rend = np.zeros_like(src_rgb)
+    for l, col in label_rgb.items():
+        if int(l) <= 0:
+            continue
+        m = lab_map == int(l)
+        if m.any():
+            rend[m] = np.asarray(col, np.uint8)
+    src = src_rgb.copy()
+    src[~design] = 0
+    rend[~design] = 0
+    sL = rgb_to_lab(src)[:, :, 0]
+    rL = rgb_to_lab(rend)[:, :, 0]
+    C1 = 1.0
+    C2 = 9.0
+    mu1 = cv2.GaussianBlur(sL, (0, 0), 1.5)
+    mu2 = cv2.GaussianBlur(rL, (0, 0), 1.5)
+    s1 = cv2.GaussianBlur(sL * sL, (0, 0), 1.5) - mu1 * mu1
+    s2 = cv2.GaussianBlur(rL * rL, (0, 0), 1.5) - mu2 * mu2
+    s12 = cv2.GaussianBlur(sL * rL, (0, 0), 1.5) - mu1 * mu2
+    num = (2.0 * mu1 * mu2 + C1) * (2.0 * s12 + C2)
+    den = (mu1 * mu1 + mu2 * mu2 + C1) * (s1 + s2 + C2)
+    ssim = float((num / np.maximum(den, 1e-6))[design].mean()) if design.any() else 0.0
+    su = np.clip(sL * 2.55, 0, 255).astype(np.uint8)
+    ru = np.clip(rL * 2.55, 0, 255).astype(np.uint8)
+    es = cv2.Canny(su, 80, 180)
+    er = cv2.dilate(cv2.Canny(ru, 40, 140), np.ones((3, 3), np.uint8))
+    es = (es > 0) & design
+    er = (er > 0) & design
+    if es.any():
+        recall = float(np.logical_and(es, er).sum()) / float(es.sum())
+    else:
+        recall = 1.0
+    return round(0.8 * ssim + 0.2 * recall, 4)
+
+
+def _choose_simplify(off, on):
+    """auto: keep simplify-on only when fidelity stays close and the sew gets simpler."""
+    fo = off["complexity"].get("fidelity")
+    fn = on["complexity"].get("fidelity")
+    po = int(off["stats"].get("parts") or 0)
+    pn = int(on["stats"].get("parts") or 0)
+    ro = int(off["stats"].get("openRuns") or 0)
+    rn = int(on["stats"].get("openRuns") or 0)
+    fid_ok = fo is not None and fn is not None and float(fn) >= float(fo) - 0.03
+    piece_ok = pn <= po * 0.90 and (po - pn) >= 8
+    if ro < 8:
+        trim_ok = rn <= ro
+    else:
+        trim_ok = rn <= ro * 0.80 and (ro - rn) >= 6
+    if fid_ok and piece_ok and trim_ok:
+        reason = ("fidelity drop %.3f <= 0.03; pieces %d -> %d; runs %d -> %d"
+                  % (float(fo) - float(fn), po, pn, ro, rn))
+        chosen = "on"
+    else:
+        bits = []
+        if not fid_ok:
+            drop = (float(fo) - float(fn)) if (fo is not None and fn is not None) else float("nan")
+            bits.append("fidelity drop %.3f > 0.03" % drop)
+        if not piece_ok:
+            bits.append("pieces %d -> %d (not a meaningful drop)" % (po, pn))
+        if not trim_ok:
+            bits.append("runs %d -> %d (not a meaningful drop)" % (ro, rn))
+        reason = "kept off: " + "; ".join(bits)
+        chosen = "off"
+    return chosen, {
+        "mode": "auto",
+        "chosen": chosen,
+        "fidelityOff": fo,
+        "fidelityOn": fn,
+        "piecesOff": po,
+        "piecesOn": pn,
+        "reason": reason,
+    }
+
+
 # ------------------------------------------------------------------- main ---
 def prep(img_path, width_in, max_colors=None, fabric="tee", source_mode="clean", source_max_side=512,
          interior_bg="stitch", debug_dir=None, alphamax=1.0, opttol=0.2, log=None, underlap_mm=None,
-         runs_mode="inline", min_piece_mm2=None, min_late_mm=15.0, late_colors="all", fold_mode="knockout"):
+         runs_mode="inline", min_piece_mm2=None, min_late_mm=15.0, late_colors="all", fold_mode="knockout",
+         simplify="auto", _auto_gate=True):
     def say(*a):
         if log:
             print(*a, file=log)
+
+    # auto on an ok design is the off object, unchanged. auto on a busy design
+    # runs both and keeps simplify-on only when fidelity and piece counts agree.
+    if simplify == "auto" and _auto_gate:
+        kw = dict(max_colors=max_colors, fabric=fabric, source_mode=source_mode,
+                  source_max_side=source_max_side, interior_bg=interior_bg, alphamax=alphamax,
+                  opttol=opttol, log=log, underlap_mm=underlap_mm, runs_mode=runs_mode,
+                  min_piece_mm2=min_piece_mm2, min_late_mm=min_late_mm, late_colors=late_colors,
+                  fold_mode=fold_mode, _auto_gate=False)
+        off = prep(img_path, width_in, debug_dir=debug_dir, simplify="off", **kw)
+        if off["complexity"]["level"] not in ("busy", "too_busy"):
+            return off
+        on = prep(img_path, width_in, debug_dir=None, simplify="on", **kw)
+        which, info = _choose_simplify(off, on)
+        if which == "on" and debug_dir:
+            on = prep(img_path, width_in, debug_dir=debug_dir, simplify="on", **kw)
+        result = on if which == "on" else off
+        result["complexity"]["simplify"] = info
+        return result
 
     fab_cfg = FABRICS.get(fabric, FABRICS["tee"])
     min_w = fab_cfg["minWidthMm"]
@@ -1837,11 +2847,41 @@ def prep(img_path, width_in, max_colors=None, fabric="tee", source_mode="clean",
     lab = rgb_to_lab(rgb)
     say("source %dx%d  %.2f px/mm -> working %dx%d (x%.2f) %.2f px/mm" % (src_w, src_h, ppm_src, W, H, scale, ppm))
 
-    # 1a. fabric
+    # 1a. fabric, then the busy-art score (before quantisation). Simplify, when it
+    # runs, only replaces the working raster; every later step is the 1.4 path.
     fab_seed, bg_lab, fab_info = detect_fabric(lab, alpha, ppm)
     design0 = ~fab_seed
+    complexity = complexity_score(rgb, lab, fab_seed, bg_lab, ppm, width_in, height_in)
+    protect_mask = None
+    simplify_info = None
+    do_simplify = simplify == "on" or (simplify == "auto" and complexity["level"] in ("busy", "too_busy"))
+    rgb_ref = rgb
+    if do_simplify:
+        # One or two extra threads so a light subject and a second hue (teal)
+        # survive. Lettering is on protect_mask, so a higher piece floor
+        # cannot delete Local 635 or the wordmark.
+        cap = 7 if complexity["level"] == "too_busy" else 8
+        max_colors = max(int(max_colors), cap)
+        floor_piece = 14.0 if complexity["level"] == "too_busy" else 12.0
+        if min_piece_mm2 < floor_piece:
+            min_piece_mm2 = floor_piece
+        rgb_ref = rgb.copy()
+        rgb, lab, protect_mask, subject_mask, simplify_info = simplify_artwork(
+            rgb, lab, design0, ppm, complexity["level"])
+        simplify_info["threadCap"] = int(cap)
+        simplify_info["maxColors"] = int(max_colors)
+        simplify_info["minPieceMm2"] = float(min_piece_mm2)
+        simplify_info["thinFragmentMm"] = float(thin_piece_mm)
+        say("simplify on (%s, score %.1f): <=%d threads, min piece %.1f mm^2, letter px %d" % (
+            complexity["level"], complexity["score"], max_colors, min_piece_mm2,
+            simplify_info.get("letterPx", 0)))
+    else:
+        say("complexity %s %.1f" % (complexity["level"], complexity["score"]))
     # 1b. palette
     pal = quantize_palette(lab[design0], max_colors, bg_lab=bg_lab)
+    if simplify_info is not None:
+        pal = _lock_subject_colors(pal, lab, design0, ink_mask=protect_mask)
+        simplify_info["lockedColors"] = int(len(pal))
     K = len(pal)
     centers = pal if bg_lab is None else np.vstack([pal, bg_lab[None].astype(np.float32)])
     raw = nearest_label(lab, centers) + 1          # 1..K palette, K+1 = bg colour
@@ -1863,16 +2903,30 @@ def prep(img_path, width_in, max_colors=None, fabric="tee", source_mode="clean",
     label_lab[K + 1] = None if bg_lab is None else bg_lab.astype(np.float64)
     label_lab[0] = label_lab[K + 1]
     ctx = MergeCtx(ppm, label_lab)
+    if simplify_info is not None:
+        ctx.simplify_flat = True
+        ctx.protect_mask = protect_mask
+        ctx.subject_mask = subject_mask
+        # do not fold the light subject into the sun, or letter ink into navy
+        ctx.max_merge_dL = 14.0
     ctx.lab_img = lab
     ctx.src_ppm = ppm_src
     ctx.src_de_lab = rgb_to_lab(np.ascontiguousarray(rgba[:, :, :3]))
     ctx.src_scale = scale
     # thin separate regions -> runs (captured before smoothing can erase them)
-    lab_map, n_merged = merge_small_regions(lab_map, n_labels, ppm, min_w, min_area, ctx)
-    # thin branches of big regions (whisker roots, fine lines on a blob) -> runs
-    lab_map, n_branch = extract_thin_branches(lab_map, n_labels, ppm, min_w, ctx)
+    # Simplify already flattened inside luminance bands. The 1.4 thin-region
+    # pass pulls the skull's outline apart and lets the sun bleed through, so
+    # busy art only drops whole pieces under the area floor (letters protected).
+    if simplify_info is None:
+        lab_map, n_merged = merge_small_regions(lab_map, n_labels, ppm, min_w, min_area, ctx)
+        lab_map, n_branch = extract_thin_branches(lab_map, n_labels, ppm, min_w, ctx)
+    else:
+        n_merged, n_branch = 0, 0
     lab_map = smooth_labels(lab_map, n_labels, 0.15 * ppm)
-    lab_map, n_merged2 = merge_small_regions(lab_map, n_labels, ppm, min_w, min_area, ctx)
+    if simplify_info is None:
+        lab_map, n_merged2 = merge_small_regions(lab_map, n_labels, ppm, min_w, min_area, ctx)
+    else:
+        n_merged2 = 0
     say("palette %d (+bg=%s), mode k=%d, merged %d+%d regions, %d thin branches, %d run pieces, %d counters kept"
         % (K, bg_lab is not None, k_mode, n_merged, n_merged2, n_branch, len(ctx.runs), ctx.counters))
 
@@ -1888,7 +2942,17 @@ def prep(img_path, width_in, max_colors=None, fabric="tee", source_mode="clean",
         if m.sum() > 50:
             label_rgb[l] = np.median(rgb[m], axis=0).astype(np.uint8)
 
-    # final colours closer than dE 10 (e.g. black + dark AA-rim grey) -> one thread
+    # final colours closer than dE 10 (e.g. black + dark AA-rim grey) -> one thread.
+    # On simplify, two light neutrals (the two creams of a skull) may join up to
+    # dE 18, but letter ink never joins the dark fill behind it.
+    def _ink_frac(l):
+        if protect_mask is None:
+            return 0.0
+        m = lab_map == l
+        if not m.any():
+            return 0.0
+        return float(protect_mask[m].mean())
+
     while True:
         pres = [l for l in label_rgb if (lab_map == l).any()]
         labs = {l: rgb_to_lab(np.array([label_rgb[l]], np.uint8))[0] for l in pres}
@@ -1896,7 +2960,19 @@ def prep(img_path, width_in, max_colors=None, fabric="tee", source_mode="clean",
         for ai, a in enumerate(pres):
             for b in pres[ai + 1:]:
                 d = float(np.linalg.norm(labs[a] - labs[b]))
-                if d < 10.0 and (best is None or d < best[0]):
+                limit = 10.0
+                if simplify_info is not None:
+                    La, Lb_ = float(labs[a][0]), float(labs[b][0])
+                    Ca = float(np.hypot(labs[a][1], labs[a][2]))
+                    Cb = float(np.hypot(labs[b][1], labs[b][2]))
+                    if La > 82.0 and Lb_ > 82.0 and Ca < 30.0 and Cb < 30.0:
+                        limit = 18.0
+                    fa, fb = _ink_frac(a), _ink_frac(b)
+                    # one colour lives in the letters, the other in the background
+                    if (fa >= 0.45 and fb < 0.15) or (fb >= 0.45 and fa < 0.15):
+                        if La < 40.0 and Lb_ < 40.0:
+                            continue
+                if d < limit and (best is None or d < best[0]):
                     best = (d, a, b)
         if best is None:
             break
@@ -1911,6 +2987,8 @@ def prep(img_path, width_in, max_colors=None, fabric="tee", source_mode="clean",
                 rpc["label"] = keep
         say("merged near-duplicate colour %s into %s" % (to_hex(label_rgb[drop]), to_hex(label_rgb[keep])))
         del label_rgb[drop]
+        if keep in label_rgb:
+            ctx.label_lab[keep] = rgb_to_lab(np.array([label_rgb[keep]], np.uint8))[0]
     lab_map, n_merged3 = merge_small_regions(lab_map, n_labels, ppm, min_w, min_area, ctx)
     n_merged2 += n_merged3
     # size-scaled piece clean-up (a 4 in design cannot hold 2 mm^2 islands)
@@ -1928,8 +3006,12 @@ def prep(img_path, width_in, max_colors=None, fabric="tee", source_mode="clean",
             tiny.add(l)
             say("thread %s covers only %.1f mm^2: merged into neighbours" % (to_hex(label_rgb[l]), a_l / (ppm * ppm)))
     if min_piece_mm2 > min_area or thin_piece_mm > min_w or tiny:
-        lab_map, n_pieces = merge_pieces(lab_map, ppm, min_piece_mm2, thin_piece_mm, ctx, force_labels=tiny,
-                                         dot_min_w=min_w)
+        mp_kw = {"force_labels": tiny, "dot_min_w": min_w}
+        if protect_mask is not None:
+            mp_kw["protect_mask"] = protect_mask
+            for l, col in label_rgb.items():
+                ctx.label_lab[l] = rgb_to_lab(np.array([col], np.uint8))[0].astype(np.float64)
+        lab_map, n_pieces = merge_pieces(lab_map, ppm, min_piece_mm2, thin_piece_mm, ctx, **mp_kw)
     tiny_colours_merged = len(tiny)
     lab_map, fringe_slivers = drop_edge_fringe_slivers(lab_map, label_rgb, lab, ppm, src_ppm=ppm_src)
     if fringe_slivers:
@@ -1939,7 +3021,28 @@ def prep(img_path, width_in, max_colors=None, fabric="tee", source_mode="clean",
         % (max_dim_in, max_colors, auto_mc, min_piece_mm2, thin_piece_mm, n_pieces))
 
     # stacking order: largest first (background-most), details later
-    # run-stitch polylines (thin detail sewn as running stitch, not dropped)
+    # run-stitch polylines (thin detail sewn as running stitch, not dropped).
+    # Simplify keeps keyline runs (text, black lines) and drops gradient hairlines.
+    if simplify_info is not None:
+        # Gradient hairlines become trims. Keep keylines, lettering, and long
+        # structural strokes; drop the short noise the flattener left behind.
+        kept_runs = []
+        pm = protect_mask
+        for r in ctx.runs:
+            if r.get("keyline"):
+                kept_runs.append(r)
+                continue
+            m = r["mask"]
+            if pm is not None and m is not None:
+                sub = pm[r["y0"]:r["y0"] + m.shape[0], r["x0"]:r["x0"] + m.shape[1]]
+                if sub.shape == m.shape and m.any() and float(sub[m].mean()) >= 0.25:
+                    kept_runs.append(r)
+                    continue
+            if skel_len_px(m) / ppm >= 10.0:
+                kept_runs.append(r)
+                continue
+        simplify_info["nonKeylineRunsDropped"] = len(ctx.runs) - len(kept_runs)
+        ctx.runs = kept_runs
     run_items = collect_runs(lab, lab_map, label_rgb, label_lab, ctx, ppm, min_w, raw_quant > 0)
     for it in run_items:
         if it["label"] not in label_rgb:
@@ -2141,6 +3244,12 @@ def prep(img_path, width_in, max_colors=None, fabric="tee", source_mode="clean",
                                     "without a run stitch (too short for a run). Enlarge the design or thicken them "
                                     "if they matter." % (len(es), name_guess(label_rgb[l]), min_w,
                                                          sum(e["areaMm2"] for e in es))})
+    if complexity["level"] in ("busy", "too_busy"):
+        warnings.append({
+            "type": "busyArt", "level": complexity["level"], "score": complexity["score"],
+            "suggestedWidthIn": complexity["suggestedWidthIn"],
+            "message": busy_art_message(width_in, complexity["suggestedWidthIn"], complexity.get("verdict")),
+        })
 
     # 5. source raster
     # overlapApplied: lower layers already extend under later ones (underlap), so
@@ -2207,6 +3316,21 @@ def prep(img_path, width_in, max_colors=None, fabric="tee", source_mode="clean",
         "blendRimsKeptByGuard": ctx.rims_kept_by_guard,
         "countersKept": ctx.counters, "thinBranchesToRuns": n_branch, "aaRimsSplit": ctx.rims_split,
     }
+    if simplify_info is not None:
+        out["stats"]["simplified"] = True
+        out["stats"]["simplify"] = simplify_info
+    complexity["fidelity"] = _layer_fidelity(rgb_ref, lab_map, label_rgb, design0)
+    if simplify == "on":
+        complexity["simplify"] = {
+            "mode": "on",
+            "chosen": "on",
+            "fidelityOff": None,
+            "fidelityOn": complexity["fidelity"],
+            "piecesOff": None,
+            "piecesOn": int(out["stats"]["parts"]),
+            "reason": "forced",
+        }
+    out["complexity"] = complexity
     if debug_dir:
         os.makedirs(debug_dir, exist_ok=True)
         # source quantized straight to the final thread palette (no cleaning)
@@ -2283,6 +3407,8 @@ def main(argv=None):
     ap.add_argument("--fold-mode", choices=["knockout", "clip"], default="knockout",
                     help="how a folded (no late visit) run stays visible: knockout = later fills leave a corridor "
                          "for it (default); clip = cut the run where later layers cover it (pieces < 3 mm dropped)")
+    ap.add_argument("--simplify", choices=["auto", "on", "off"], default="off",
+                    help="flatten shading into flat tones when the art is busy (auto), always (on), or never (off, default until simplify beats off by eye)")
     ap.add_argument("--debug-dir", help="dump label maps (npz) for evaluation")
     ap.add_argument("-q", "--quiet", action="store_true")
     a = ap.parse_args(argv)
@@ -2297,7 +3423,7 @@ def main(argv=None):
                source_max_side=a.source_max_side, interior_bg=a.interior_bg, debug_dir=a.debug_dir, log=log,
                underlap_mm=a.underlap_mm, runs_mode=a.runs,
                min_piece_mm2=a.min_piece_mm2, min_late_mm=a.min_late_mm, late_colors=a.late_colors,
-               fold_mode=a.fold_mode)
+               fold_mode=a.fold_mode, simplify=a.simplify)
     os.makedirs(os.path.dirname(os.path.abspath(a.output)) or ".", exist_ok=True)
     with open(a.output, "w") as f:
         json.dump(vec, f, separators=(",", ":"))

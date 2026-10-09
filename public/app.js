@@ -2052,8 +2052,9 @@ async function fillDigitize(el, job, shopControls) {
     if (busy && (busy.warning || busy.simplifyAvailable || busy.score != null)) {
       if (busy.warning) warns.push(busy.warning);
       else if (busy.score != null) warns.push("Busy art score " + busy.score);
-      else warns.push("Busy artwork — simplify recommended.");
-      if (busyWrap) busyWrap.hidden = !busy.simplifyAvailable && busy.score == null;
+      else warns.push("Busy artwork: may need manual digitizing.");
+      if (busy.verdict && !(busy.warning && String(busy.warning).toLowerCase().indexOf(String(busy.verdict).toLowerCase()) >= 0)) warns.push("Verdict: " + String(busy.verdict).replace(/_/g, " "));
+      if (busyWrap) busyWrap.hidden = !busy.simplifyAvailable;
     } else if (busyWrap) busyWrap.hidden = true;
     const box = $("#digWarns");
     if (box) box.innerHTML = warns.map((t) => "<p class='dig-warn'>" + escapeHtml(t) + "</p>").join("");
