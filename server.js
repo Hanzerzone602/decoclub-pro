@@ -743,14 +743,14 @@ function attachVzSettings(resultOrJob, body) {
 async function runVaiTraceSafe(buf, job, body, sizeMeta) {
   const timeoutMs = 180000;
   const norm = body && body._vzSettings ? body : normalizeVectorizeBody(body || {});
-  const opts = {
+  const opts = attachTraceCache({
     colors: norm.colors,
     mode: (norm && norm.mode) || "auto",
     timeoutMs: timeoutMs,
     epsilon: norm.epsilon,
     fitError: norm.fitError,
     cornerCos: norm.cornerCos,
-  };
+  }, job, norm);
   const info = vectorizeGuard.inspect(buf);
   const useWorker = !!(sizeMeta && sizeMeta.sizeGuard && sizeMeta.sizeGuard.downscaled) || info.needsDownscale || info.bytes > 6 * 1024 * 1024;
   let result;
@@ -767,6 +767,8 @@ async function runVaiTraceSafe(buf, job, body, sizeMeta) {
       epsilon: opts.epsilon,
       fitError: opts.fitError,
       cornerCos: opts.cornerCos,
+      cacheDir: opts.cacheDir,
+      fromCache: opts.fromCache,
     });
   }
   if (sizeMeta && sizeMeta.sizeGuard) {
@@ -777,6 +779,23 @@ async function runVaiTraceSafe(buf, job, body, sizeMeta) {
   }
   attachVzSettings(result, norm);
   return result;
+}
+
+function traceCacheDir(job) {
+  return path.join(DATA, "trace-cache", String(job && job.id || "none"));
+}
+function clearTraceCache(job) {
+  if (!job || !job.id) return;
+  try { fs.rmSync(traceCacheDir(job), { recursive: true, force: true }); } catch (e) { /* ignore */ }
+}
+function attachTraceCache(opts, job, body) {
+  const dir = traceCacheDir(job);
+  const live = !!(body && (body.live === true || body.live === "true" || body.live === 1));
+  const ready = fs.existsSync(path.join(dir, "manifest.json"));
+  try { fs.mkdirSync(dir, { recursive: true }); } catch (e) { /* ignore */ }
+  if (live && ready) opts.fromCache = dir;
+  else opts.cacheDir = dir;
+  return opts;
 }
 
 function scheduleVectorize(jobId) {
@@ -1573,6 +1592,7 @@ async function handleApi(req, res, url) {
     if (!job) return json(res, 404, { error: "Job not found" });
     const parsed = parseMultipart(await readBody(req), req.headers["content-type"]);
     if (!parsed.file) return json(res, 400, { error: "Artwork file required" });
+    clearTraceCache(job);
     job.file_path = applyUploadMatte(parsed.file.path, parsed.fields);
     job.unlocks = {};
     if (STATUSES.indexOf(job.status) < STATUSES.indexOf("art_in")) job.status = "art_in";
@@ -1628,6 +1648,7 @@ async function handleApi(req, res, url) {
       const name = Date.now() + "-" + uid() + ".png";
       fs.writeFileSync(path.join(UPLOADS, name), out);
       job.file_path = "/uploads/" + name;
+      clearTraceCache(job);
       // Greyscale / invert replace the raster preview — drop stale vector so UI shows the PNG
       const skipRevector = !!(body.greyscale || body.invert);
       if (skipRevector) clearJobVector(job);
@@ -2737,6 +2758,7 @@ async function handleApi(req, res, url) {
     if (!job) return json(res, 404, { error: "Job not found" });
     db.jobs = db.jobs.filter(function (j) { return j.id !== id; });
     db.events = (db.events || []).filter(function (e) { return e.job_id !== id; });
+    clearTraceCache(job);
     save(db);
     return json(res, 200, { ok: true, deleted: id });
   }

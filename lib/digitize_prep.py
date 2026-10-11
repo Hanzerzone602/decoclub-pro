@@ -66,7 +66,7 @@ try:
 except Exception:  # pragma: no cover
     _sk_skeletonize = None
 
-VERSION = "digitize_prep 1.6"
+VERSION = "digitize_prep 1.7"
 UNDERLAP_WIDTH_FRAC = 0.15   # underlap <= 15% of the covering shape's local width ...
 UNDERLAP_MIN_MM = 0.25       # ... but at least 0.25 mm (no gaps) and at most --fabric underlap (0.7 mm)
 TARGET_PPM = 10.0        # working raster: at least 10 px per mm
@@ -1721,8 +1721,9 @@ def detect_text_warnings(lab_map, order, label_rgb, ppm, width_in, min_h_mm=TEXT
     height, shared baseline, close neighbours, >= 3 in a row). Per line: glyph
     height = median component height, stroke = median of per-glyph skeleton
     stroke widths, both in mm at the output size."""
-    out = _text_lines(lab_map, order, {l: i for i, l in enumerate(order)}, label_rgb, ppm, width_in,
-                      min_h_mm, min_stroke_mm)
+    out, groups = _text_lines(lab_map, order, {l: i for i, l in enumerate(order)}, label_rgb, ppm, width_in,
+                              min_h_mm, min_stroke_mm)
+    final_boxes = [g["bbox_in"] for g in groups]
     if early_map is not None:
         # lettering the clean-up merged away (pieces < min-piece at small sizes) is
         # still the customer's text: look for it on the mode-filtered map too
@@ -1736,7 +1737,13 @@ def detect_text_warnings(lab_map, order, label_rgb, ppm, width_in, min_h_mm=TEXT
         labs.sort(key=lambda l: order.index(l) if l in order else len(order))
         idx = {l: (order.index(l) if l in order else None) for l in labs}
         primary = list(out)
-        for w in _text_lines(early_map, labs, idx, label_rgb, ppm, width_in, min_h_mm, min_stroke_mm):
+        early_warnings, _early_groups = _text_lines(early_map, labs, idx, label_rgb, ppm, width_in, min_h_mm, min_stroke_mm)
+        for w in early_warnings:
+            # A line still present on the final map was measured there. Do not
+            # re-flag the pre-cleanup copy (it is thinner, and it would disagree
+            # with the sewn strokes after lettering is thickened).
+            if any(ov(w["bboxIn"], b) > 0.4 for b in final_boxes):
+                continue
             if any(ov(w["bboxIn"], q["bboxIn"]) > 0.4 for q in primary):
                 continue
             w["mostlyRemovedInPrep"] = True
@@ -1749,6 +1756,7 @@ def detect_text_warnings(lab_map, order, label_rgb, ppm, width_in, min_h_mm=TEXT
 def _text_lines(lab_map, labels, layer_idx, label_rgb, ppm, width_in, min_h_mm, min_stroke_mm):
     H, W = lab_map.shape
     out = []
+    found = []
     cc_cache = {}
 
     def comps_of(l):
@@ -1860,6 +1868,10 @@ def _text_lines(lab_map, labels, layer_idx, label_rgb, ppm, width_in, min_h_mm, 
             by1 = max(c["y1"] for c in g) / ppm / 25.4
             f = max(min_h_mm / max(h_mm, 1e-6), min_stroke_mm / max(s_mm, 1e-6))
             sug = math.ceil(width_in * f / 0.25 - 1e-9) * 0.25
+            found.append({
+                "label": l, "glyphs": g, "h_mm": h_mm, "s_mm": s_mm,
+                "bbox_in": [round(bx0, 3), round(by0, 3), round(bx1, 3), round(by1, 3)],
+            })
             base = {"layer": li, "hex": hexv, "glyphs": len(g),
                     "bboxIn": [round(bx0, 3), round(by0, 3), round(bx1, 3), round(by1, 3)],
                     "heightMm": round(h_mm, 2), "strokeMm": round(s_mm, 2),
@@ -1875,7 +1887,131 @@ def _text_lines(lab_map, labels, layer_idx, label_rgb, ppm, width_in, min_h_mm, 
                 w["message"] = ("Lettering strokes %.2f mm (< %.1f mm satin minimum) at %.2f in; "
                                 "use at least %.2f in wide." % (s_mm, min_stroke_mm, width_in, sug))
                 out.append(w)
-    return out
+    return out, found
+
+
+def _thicken_small_lettering(lab_map, ppm):
+    """Grow flagged thin lettering toward the 1.2 mm satin minimum.
+
+    Only groups the text detector would flag are touched. Growth stays on the
+    field colour behind the letters, keeps a gap so neighbours do not join, and
+    does not fill counters. Returns the (possibly copied) label map and how
+    many groups grew.
+    """
+    labels = [int(v) for v in np.unique(lab_map) if int(v) > 0]
+    if not labels or ppm <= 0:
+        return lab_map, 0
+    _unused, groups = _text_lines(
+        lab_map, labels, {l: 0 for l in labels},
+        {l: np.array([0, 0, 0], np.uint8) for l in labels},
+        ppm, 4.0, TEXT_MIN_HEIGHT_MM, TEXT_MIN_STROKE_MM,
+    )
+    H, W = lab_map.shape
+    claim_dt = np.full((H, W), np.inf, np.float32)
+    claim_lab = np.zeros((H, W), np.int32)
+    n_groups = 0
+    gap_px = max(2.0, 0.40 * float(ppm))
+    cap = max(1, int(round(0.45 * float(ppm))))
+    for g in groups:
+        s_mm = float(g["s_mm"])
+        if s_mm >= TEXT_MIN_STROKE_MM - 1e-6:
+            continue
+        glyphs = g["glyphs"]
+        l = int(g["label"])
+        deficit_mm = TEXT_MIN_STROKE_MM - s_mm
+        # The stroke measure subtracts 1 px, so aim a little past the deficit.
+        rad = int(min(cap, max(1, math.ceil(deficit_mm * float(ppm) / 2.0 + 0.6))))
+        x0 = max(0, min(int(c["ox"]) for c in glyphs) - rad - 2)
+        y0 = max(0, min(int(c["oy"]) for c in glyphs) - rad - 2)
+        x1 = min(W, max(int(c["ox"]) + int(c["comp"].shape[1]) for c in glyphs) + rad + 2)
+        y1 = min(H, max(int(c["oy"]) + int(c["comp"].shape[0]) for c in glyphs) + rad + 2)
+        sub_h, sub_w = y1 - y0, x1 - x0
+        if sub_h < 2 or sub_w < 2:
+            continue
+        own = np.zeros((sub_h, sub_w), np.uint8)
+        holes = np.zeros((sub_h, sub_w), bool)
+        gid = np.zeros((sub_h, sub_w), np.int16)
+        for k, c in enumerate(glyphs, start=1):
+            comp = c["comp"]
+            ch, cw = comp.shape
+            gy, gx = int(c["oy"]) - y0, int(c["ox"]) - x0
+            ys0, xs0 = max(0, gy), max(0, gx)
+            ys1, xs1 = min(sub_h, gy + ch), min(sub_w, gx + cw)
+            if ys1 <= ys0 or xs1 <= xs0:
+                continue
+            piece = comp[ys0 - gy:ys0 - gy + (ys1 - ys0), xs0 - gx:xs0 - gx + (xs1 - xs0)]
+            own[ys0:ys1, xs0:xs1][piece] = 1
+            gid[ys0:ys1, xs0:xs1][piece] = k
+            filled = ndi.binary_fill_holes(piece)
+            holes[ys0:ys1, xs0:xs1][filled & ~piece] = True
+        if int(own.sum()) < 8:
+            continue
+        ring = cv2.dilate(own, np.ones((3, 3), np.uint8)).astype(bool) & (own == 0)
+        sub_lab = lab_map[y0:y1, x0:x1]
+        neigh = sub_lab[ring]
+        neigh = neigh[neigh != l]
+        nz = neigh[neigh != 0]
+        use = nz if nz.size else neigh
+        if use.size == 0:
+            continue
+        field = int(np.bincount(use.astype(np.int32)).argmax())
+        if field <= 0 or field == l:
+            continue
+        accept = np.zeros((sub_h, sub_w), bool)
+        best_local = np.full((sub_h, sub_w), np.inf, np.float32)
+        for k in range(1, len(glyphs) + 1):
+            one = gid == k
+            if not np.any(one):
+                continue
+            src = np.ones((sub_h, sub_w), np.uint8)
+            src[one] = 0
+            dt_self = cv2.distanceTransform(src, cv2.DIST_L2, 3)
+            others = (own > 0) & (gid != k)
+            if np.any(others):
+                src_o = np.ones((sub_h, sub_w), np.uint8)
+                src_o[others] = 0
+                dt_other = cv2.distanceTransform(src_o, cv2.DIST_L2, 3)
+            else:
+                dt_other = np.full((sub_h, sub_w), 1e6, np.float32)
+            cand = (dt_self <= (rad + 0.01)) & (dt_self > 0) & (dt_self < dt_other) & (dt_other >= dt_self + gap_px)
+            cand &= ~holes
+            cand &= sub_lab == field
+            better = cand & (dt_self < best_local)
+            accept[better] = True
+            best_local[better] = dt_self[better]
+        if not np.any(accept):
+            continue
+        trial = own.copy()
+        trial[accept] = 1
+        n_before = int(np.unique(gid[own > 0]).size)
+        n2, cc2, _st2, _ = cv2.connectedComponentsWithStats(trial, connectivity=8)
+        touched = 0
+        for i in range(1, n2):
+            if np.any((cc2 == i) & (own > 0)):
+                touched += 1
+        if touched < n_before:
+            continue
+        filled_b = ndi.binary_fill_holes(own > 0)
+        filled_a = ndi.binary_fill_holes(trial > 0)
+        hole_b = int((filled_b & (own == 0)).sum())
+        hole_a = int((filled_a & (trial == 0)).sum())
+        if hole_b > 8 and hole_a < hole_b * 0.85:
+            continue
+        gy, gx = np.nonzero(accept)
+        dtv = best_local[gy, gx]
+        fy, fx = gy + y0, gx + x0
+        better = dtv < claim_dt[fy, fx]
+        if not np.any(better):
+            continue
+        claim_dt[fy[better], fx[better]] = dtv[better]
+        claim_lab[fy[better], fx[better]] = l
+        n_groups += 1
+    if n_groups == 0 or not np.any(claim_lab):
+        return lab_map, 0
+    out = lab_map.copy()
+    m = claim_lab > 0
+    out[m] = claim_lab[m].astype(out.dtype, copy=False)
+    return out, n_groups
 
 
 # --------------------------------------------------------- busy-art score ---
@@ -2012,9 +2148,14 @@ def complexity_score(rgb, lab, fab, bg_lab, ppm, width_in, height_in):
         p75 = float(np.percentile(sub_areas, 75))
         if p75 < min_piece:
             sug_piece = float(width_in) * (min_piece / max(p75, 0.2)) ** 0.5
-    sug = max(float(width_in), sug_text)
+    # Geometry only. A provisional text warning used to push suggestedWidthIn
+    # (Summit 5.25) while the final lettering warning said 5.0. The sewn map's
+    # minRecommendedWidthIn is applied later and is the number we report.
+    sug_geo = float(width_in)
     if tiny_frac > 0.03:
-        sug = max(sug, sug_piece)
+        sug_geo = max(sug_geo, sug_piece)
+    sug_geo = _ceil_quarter(max(sug_geo, float(width_in)))
+    sug = max(sug_geo, float(sug_text))
     sug = _ceil_quarter(max(sug, float(width_in)))
     # Stitch estimate from fill area × a density that rises with shading and
     # speckle. Calibrated a little high on the busy badge so the suggestion
@@ -2030,19 +2171,24 @@ def complexity_score(rgb, lab, fab, bg_lab, ppm, width_in, height_in):
         bump = 1.15 if w > float(width_in) + 0.05 and w > 4.0 else 1.0
         return dens * area_mm2 * (float(w) / float(width_in)) ** 2 * bump
 
-    sug = min(float(sug), 8.0)
-    fits = []
-    w = float(width_in)
-    while w <= sug + 1e-6:
-        if _est_at(w) <= 60000.0:
-            fits.append(round(w, 2))
-        w = round(w + 0.25, 2)
-    if fits:
-        sug = fits[-1]
-    else:
-        sug = round(float(width_in), 2)
+    def _cap_to_stitches(s0):
+        s0 = min(float(s0), 8.0)
+        fits = []
+        w = float(width_in)
+        while w <= s0 + 1e-6:
+            if _est_at(w) <= 60000.0:
+                fits.append(round(w, 2))
+            w = round(w + 0.25, 2)
+        if fits:
+            return fits[-1]
+        return round(float(width_in), 2)
+
+    # Verdict still sees the lettering-inflated size. The reported width does not,
+    # unless prep() copies minRecommendedWidthIn over it.
+    sug = _cap_to_stitches(sug)
+    sug_report = _cap_to_stitches(sug_geo)
     est_now = int(round(_est_at(width_in)))
-    est_sug = int(round(_est_at(sug)))
+    est_sug = int(round(_est_at(sug_report)))
     color_s = _clip10((n5 - 45) / 5.0)
     shade_s = _clip10((shade_frac - 0.10) / 0.012)
     edge_s = _clip10((edge_frac - 0.045) / 0.012)
@@ -2075,7 +2221,7 @@ def complexity_score(rgb, lab, fab, bg_lab, ppm, width_in, height_in):
     # A bigger hoop cannot fix lettering once the 8 in cap or the ~60k stitch
     # estimate binds. Say so instead of suggesting a huge size.
     text_wants = float(sug_text) > float(sug) + 0.05
-    stitch_binds = est_sug >= 52000 or (est_now > 60000) or (float(sug) + 0.05 < min(8.0, max(float(sug_text), float(sug_piece))))
+    stitch_binds = int(round(_est_at(sug))) >= 52000 or (est_now > 60000) or (float(sug) + 0.05 < min(8.0, max(float(sug_text), float(sug_piece))))
     if level == "ok":
         verdict = "ok"
     elif text_wants or (level == "too_busy" and stitch_binds):
@@ -2083,7 +2229,7 @@ def complexity_score(rgb, lab, fab, bg_lab, ppm, width_in, height_in):
     else:
         verdict = "simplify recommended"
     return {
-        "score": score, "level": level, "reasons": reasons, "suggestedWidthIn": sug,
+        "score": score, "level": level, "reasons": reasons, "suggestedWidthIn": sug_report,
         "verdict": verdict,
         "metrics": {
             "distinctColors": int(n5),
@@ -2714,6 +2860,39 @@ def busy_art_message(width_in, suggested, verdict=None):
             "Try the simplified version, or go up to %s in." % (_fmt_in(width_in), _fmt_in(suggested)))
 
 
+def _agree_widths(complexity, text_warnings, min_rec_w, warnings, width_in):
+    """One suggested width. Lettering minimum wins; otherwise say why it is absent."""
+    if min_rec_w is not None:
+        agreed = _ceil_quarter(float(min_rec_w))
+        complexity["suggestedWidthIn"] = agreed
+        complexity["suggestedWidthReason"] = "matches minRecommendedWidthIn (lettering)"
+        for w in text_warnings:
+            w["suggestWidthIn"] = agreed
+            extra = ""
+            if w.get("mostlyRemovedInPrep"):
+                extra = " (Most of this lettering was merged away by the clean-up at this size.)"
+            if w.get("type") == "small_text":
+                w["message"] = (
+                    "Lettering %.1f mm tall (< %.0f mm) will not sew legibly at %.2f in; "
+                    "use at least %.2f in wide." % (w["heightMm"], w["minHeightMm"], width_in, agreed)
+                ) + extra
+            elif w.get("type") == "thin_stroke":
+                w["message"] = (
+                    "Lettering strokes %.2f mm (< %.1f mm satin minimum) at %.2f in; "
+                    "use at least %.2f in wide." % (w["strokeMm"], w["minStrokeMm"], width_in, agreed)
+                ) + extra
+        for w in warnings:
+            if w.get("type") == "busyArt":
+                w["suggestedWidthIn"] = agreed
+                w["message"] = busy_art_message(width_in, agreed, complexity.get("verdict"))
+        return agreed
+    complexity["suggestedWidthIn"] = _ceil_quarter(complexity["suggestedWidthIn"])
+    complexity["suggestedWidthReason"] = (
+        "no lettering minimum; suggestedWidthIn follows colour count, shading, and the stitch estimate"
+    )
+    return None
+
+
 def _layer_fidelity(src_rgb, lab_map, label_rgb, design):
     """Fidelity of rendered thread colours vs the working source, on the design.
 
@@ -3016,6 +3195,11 @@ def prep(img_path, width_in, max_colors=None, fabric="tee", source_mode="clean",
     lab_map, fringe_slivers = drop_edge_fringe_slivers(lab_map, label_rgb, lab, ppm, src_ppm=ppm_src)
     if fringe_slivers:
         say("edge-fringe slivers dropped: %d" % len(fringe_slivers))
+    n_letter_thick = 0
+    if simplify_info is None:
+        lab_map, n_letter_thick = _thicken_small_lettering(lab_map, ppm)
+        if n_letter_thick:
+            say("thickened %d thin lettering group(s) toward 1.2 mm" % n_letter_thick)
     pieces_after = count_pieces(lab_map, fill_labels)
     say("max dim %.2f in: maxColors %d (auto %d), minPiece %.1f mm^2, thin fragment < %.1f mm, %d pieces merged"
         % (max_dim_in, max_colors, auto_mc, min_piece_mm2, thin_piece_mm, n_pieces))
@@ -3250,6 +3434,7 @@ def prep(img_path, width_in, max_colors=None, fabric="tee", source_mode="clean",
             "suggestedWidthIn": complexity["suggestedWidthIn"],
             "message": busy_art_message(width_in, complexity["suggestedWidthIn"], complexity.get("verdict")),
         })
+    min_rec_w = _agree_widths(complexity, text_warnings, min_rec_w, warnings, width_in)
 
     # 5. source raster
     # overlapApplied: lower layers already extend under later ones (underlap), so
@@ -3315,6 +3500,7 @@ def prep(img_path, width_in, max_colors=None, fabric="tee", source_mode="clean",
         "edgeFringe": {"slivers": fringe_slivers, "runs": run_stats.pop("edgeFringeRuns", [])},
         "blendRimsKeptByGuard": ctx.rims_kept_by_guard,
         "countersKept": ctx.counters, "thinBranchesToRuns": n_branch, "aaRimsSplit": ctx.rims_split,
+        "letterGroupsThickened": int(n_letter_thick),
     }
     if simplify_info is not None:
         out["stats"]["simplified"] = True

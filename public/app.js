@@ -68,6 +68,11 @@ async function api(url, opts = {}) {
   try {
     res = await fetch(url, opts);
   } catch (e) {
+    if (e && (e.name === "AbortError" || (opts.signal && opts.signal.aborted))) {
+      const err = new Error("aborted");
+      err.code = "ABORTED";
+      throw err;
+    }
     const err = new Error("Network stalled. Check your connection and try again.");
     err.code = "NETWORK";
     throw err;
@@ -913,6 +918,7 @@ async function fillArt(el, job, shopControls) {
           ${continuousSliderRow("cornerRow", "Corner smoothness", "Sharp corners for type and badges, soft for organic shapes",
             initCorner, "Sharp", "Soft", cornerReadout)}
           <p class="muted vz-live-hint" id="vzLiveHint">Drag sliders to update the preview live after Vectorize.</p>
+          <p class="vz-updating-flag" id="vzUpdating" hidden>Updating…</p>
         </div>
         ${usedLine}` : ""}
         ${shopControls && layers.length ? `<div class="color-mode-row" id="colorModeRow">
@@ -961,45 +967,55 @@ async function fillArt(el, job, shopControls) {
   let colorMode = initColorMode === "cmyk" ? "cmyk" : "rgb";
 
   let vzLiveTimer = null;
-  let vzLiveBusy = false;
-  let vzLiveQueued = false;
-  function scheduleLiveVectorize() {
+  let vzLiveSeq = 0;
+  let vzLiveAbort = null;
+  function setVzUpdating(on) {
+    const flag = $("#vzUpdating");
+    const hint = $("#vzLiveHint");
+    const row = $("#detailRow");
+    if (flag) flag.hidden = !on;
+    if (row) row.classList.toggle("vz-updating", !!on);
+    if (hint) hint.textContent = on
+      ? "Updating…"
+      : "Drag sliders to update the preview live after Vectorize.";
+  }
+  function scheduleLiveVectorize(immediate) {
     if (!job.file_path) return;
     const errEl = $("#err");
-    const hint = $("#vzLiveHint");
-    if (hint) hint.textContent = "Updating preview…";
-    if (errEl && !vzLiveBusy) errEl.textContent = "";
+    if (errEl) errEl.textContent = "";
+    setVzUpdating(true);
     clearTimeout(vzLiveTimer);
-    vzLiveTimer = setTimeout(async () => {
-      if (vzLiveBusy) { vzLiveQueued = true; return; }
-      vzLiveBusy = true;
+    const go = async () => {
+      vzLiveSeq += 1;
+      const seq = vzLiveSeq;
+      if (vzLiveAbort) { try { vzLiveAbort.abort(); } catch (e) {} }
+      vzLiveAbort = typeof AbortController === "function" ? new AbortController() : null;
       try {
-        await runVectorize(null, { live: true });
+        await runVectorize(null, { live: true, signal: vzLiveAbort && vzLiveAbort.signal, seq: seq });
       } catch (err) {
+        if (err && err.code === "ABORTED") return;
+        if (seq !== vzLiveSeq) return;
         if (errEl) errEl.textContent = err.message;
-        if (hint) hint.textContent = "Drag sliders to update the preview live after Vectorize.";
       } finally {
-        vzLiveBusy = false;
-        if (vzLiveQueued) {
-          vzLiveQueued = false;
-          scheduleLiveVectorize();
-        }
+        if (seq === vzLiveSeq) setVzUpdating(false);
       }
-    }, 450);
+    };
+    if (immediate) go();
+    else vzLiveTimer = setTimeout(go, 400);
   }
   function bindContinuousSlider(rowId, prefKey, readout, setVal) {
     const slider = el.querySelector("#" + rowId + "Slider");
     const valEl = el.querySelector("#" + rowId + "Val");
     if (!slider) return;
-    const apply = (n, live) => {
+    const apply = (n) => {
       const v = Math.max(0, Math.min(100, Math.round(Number(n) || 0)));
       setVal(v);
       saveVzPref(prefKey, v);
       if (valEl) valEl.textContent = readout(v);
-      if (live) scheduleLiveVectorize();
     };
-    slider.oninput = () => apply(slider.value, true);
-    slider.onchange = () => apply(slider.value, true);
+    slider.oninput = () => { apply(slider.value); scheduleLiveVectorize(false); };
+    slider.onchange = () => { apply(slider.value); scheduleLiveVectorize(true); };
+    slider.addEventListener("pointerup", () => scheduleLiveVectorize(true));
   }
   bindContinuousSlider("detailRow", "detail", detailReadout, (v) => { vzDetail = v; });
   bindContinuousSlider("smoothRow", "smoothing", smoothReadout, (v) => { vzSmooth = v; });
@@ -1621,17 +1637,18 @@ async function fillArt(el, job, shopControls) {
     const errEl = $("#err");
     const hint = $("#vzLiveHint");
     if (errEl) errEl.textContent = "";
-    showArtWorking("Working");
+    const live = !!opts.live;
+    if (!live) showArtWorking("Working");
     try {
     await ensurePngArtwork(job);
-    const maxEdge = opts.live ? 900 : 1100;
+    const maxEdge = live ? 900 : 1100;
     const payload = {
       detail: vzDetail,
       smoothing: vzSmooth,
       cornerSmooth: vzCorner,
       maxEdge: maxEdge,
       fuse: "auto",
-      live: !!opts.live,
+      live: live,
     };
     if (engine) payload.engine = engine;
     saveVzPref("detail", vzDetail);
@@ -1641,7 +1658,9 @@ async function fillArt(el, job, shopControls) {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify(payload),
+      signal: opts.signal,
     });
+    if (opts.seq != null && opts.seq !== vzLiveSeq) return;
     const meta = (res && res.meta) || (res && res.vector && res.vector.meta) || {};
     const used = meta.settings || { detail: vzDetail, smoothing: vzSmooth, cornerSmooth: vzCorner };
     const d = toPct(used.detail, DETAIL_LEGACY, vzDetail);
@@ -1653,10 +1672,10 @@ async function fillArt(el, job, shopControls) {
       usedEl.hidden = false;
       usedEl.textContent = "Last run · Detail " + detailReadout(d) + " · Smoothing " + smoothReadout(sm) + " · Corners " + cornerReadout(c);
     }
-    if (hint) hint.textContent = "Drag sliders to update the preview live.";
+    if (hint && !live) hint.textContent = "Drag sliders to update the preview live.";
     renderJob(job.id);
     } finally {
-      hideArtWorking();
+      if (!live) hideArtWorking();
     }
   }
 

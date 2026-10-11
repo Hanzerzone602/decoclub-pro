@@ -421,6 +421,8 @@ th { color: var(--muted); font-weight: 600; font-size: 11px; letter-spacing: .06
 .vz-slider-val { font-size: 13px; font-weight: 700; color: var(--gold); min-width: 4.5em; text-align: right; }
 .vz-slider-ends { display: flex; justify-content: space-between; font-size: 10px; margin-top: 2px; }
 .vz-live-hint { margin: 0; font-size: 11px; }
+.vz-updating-flag { margin: 0; font-size: 11px; font-weight: 700; color: var(--gold); letter-spacing: 0.04em; text-transform: uppercase; }
+.vz-control.vz-updating .vz-slider-val::after { content: " · updating"; font-weight: 600; font-size: 10px; letter-spacing: 0.04em; text-transform: uppercase; color: var(--gold); }
 .vz-used { margin: 4px 0 10px; font-size: 12px; }
 .color-mode-row { display: flex; align-items: center; justify-content: space-between; gap: 10px; margin: 12px 0 6px; }
 .color-mode-seg { max-width: 160px; }

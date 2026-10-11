@@ -56,4 +56,31 @@ const { sampleArt } = require("../lib/stitch/art");
   console.log("ok downloads + worker + vectorize packet split");
 }
 
+{
+  const vz = fs.readFileSync(path.join(__dirname, "..", "lib", "vai-trace", "vectorize.js"), "utf8");
+  assert.ok(vz.indexOf('args.push("--cache-dir"') !== -1, "vectorizeFile passes --cache-dir");
+  assert.ok(vz.indexOf('args.push("--from-cache"') !== -1, "vectorizeFile passes --from-cache");
+  const vai = fs.readFileSync(path.join(__dirname, "..", "lib", "vaiTrace.js"), "utf8");
+  assert.ok(vai.indexOf('args.push("--cache-dir"') !== -1, "vaiTrace passes --cache-dir");
+  assert.ok(vai.indexOf('args.push("--from-cache"') !== -1, "vaiTrace passes --from-cache");
+  const srv = fs.readFileSync(path.join(__dirname, "..", "server.js"), "utf8");
+  assert.ok(srv.indexOf("traceCacheDir") !== -1, "one cache dir per upload");
+  assert.ok(srv.indexOf("clearTraceCache") !== -1, "cache cleaned with the job");
+  assert.ok(srv.indexOf("fromCache") !== -1 && srv.indexOf("cacheDir") !== -1, "first trace writes cache, slider reads it");
+  const app = fs.readFileSync(path.join(__dirname, "..", "public", "app.js"), "utf8");
+  assert.ok(app.indexOf("setTimeout(go, 400)") !== -1, "colour bar 400 ms idle debounce");
+  assert.ok(app.indexOf("AbortController") !== -1, "live preview cancels in-flight");
+  assert.ok(app.indexOf("vz-updating") !== -1 && app.indexOf("Updating…") !== -1, "small updating state");
+  const fab = require("../lib/stitch/fabric");
+  const tee = fab.wqFabric("jersey");
+  assert.ok(tee.pullSatinMm >= 0.35 && tee.pullSatinMm <= 0.4, "knit/jersey satin pull");
+  assert.ok(tee.pullFillMm >= 0.20 && tee.pullFillMm <= 0.4, "knit/jersey fill pull exposed");
+  assert.strictEqual(fab.wqFabric("pique").pullSatinMm, 0.3);
+  assert.strictEqual(fab.wqFabric("fleece").pullSatinMm, 0.4);
+  assert.strictEqual(fab.wqFabric("woven").pullSatinMm, 0.2);
+  assert.strictEqual(fab.wqFabric("twill").pullSatinMm, 0.2);
+  assert.strictEqual(fab.wqFabric("cap").pullSatinMm, 0.25);
+  console.log("ok speed-cache flags + colour-bar debounce + fabric pull");
+}
+
 console.log("PASS digitize-tab");

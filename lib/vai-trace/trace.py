@@ -11989,6 +11989,9 @@ def _vectorize_small_soft(path, inches, t0):
 
 SPEED_CACHE_VERSION = 1
 _SPEED_SINK = None
+# Plates from the natural trace just finished. Colour drop reads this; the
+# default SVG is already built and is not rewritten when N is absent or large.
+_LAST_PLATES = None
 
 
 def _sha256_file(path: str) -> str:
@@ -12128,8 +12131,9 @@ def _speed_write(sink):
         "svg": sink.get("svg"),
         "meta": meta,
         "label_shape": None if labels is None else [int(labels.shape[0]), int(labels.shape[1])],
-        # Live engine plate count does not follow --colors after classification.
-        "engine_honors_colors": False,
+        # Colour drop merges cached plates when N is below the natural ink count.
+        # The stored SVG itself is always the natural trace.
+        "engine_honors_colors": bool(labels is not None),
     }
     man_path = os.path.join(directory, "manifest.json")
     tmp = man_path + ".tmp"
@@ -12145,6 +12149,10 @@ def _speed_write(sink):
 
 def _speed_finish(svg, meta, **note):
     """Return the traced SVG unchanged. Optionally persist a colour-drop cache."""
+    global _LAST_PLATES
+    _LAST_PLATES = dict(note)
+    _LAST_PLATES["svg"] = svg
+    _LAST_PLATES["meta"] = meta
     sink = _SPEED_SINK
     if sink is not None and svg:
         payload = dict(sink)
@@ -12190,33 +12198,162 @@ def _load_speed_manifest(cache_dir, path, inches, mode):
     return manifest
 
 
-def _select_kept_inks(palette, labels, n):
-    """Keep `n` inks. White art always keeps a slot. Largest plates fill the rest."""
-    pal = [np.asarray(c, dtype=np.float64) for c in palette]
-    k = len(pal)
-    n = max(1, min(int(n), k))
-    counts = []
-    lab = np.asarray(labels)
-    for i in range(k):
-        counts.append(int((lab == i).sum()) if lab is not None else 0)
-    white = [i for i in range(k) if _ink_is_white(pal[i])]
-    others = [i for i in range(k) if i not in white]
-    others.sort(key=lambda i: (-counts[i], i))
-    slots = n
-    kept = []
-    # Reserve white first so a colour drop cannot delete the muzzle / lace plate.
-    for i in white:
-        if slots <= 0 and kept:
-            break
-        kept.append(i)
-        slots -= 1
-    for i in others:
-        if len(kept) >= n:
-            break
-        kept.append(i)
-    if not kept:
-        kept = [int(np.argmax(counts))] if counts else [0]
-    return kept
+def _hue_angle(lab):
+    """Hue degrees in Lab, or None when the ink is neutral."""
+    a, b = float(lab[1]), float(lab[2])
+    if math.hypot(a, b) < 10.0:
+        return None
+    ang = math.degrees(math.atan2(b, a))
+    if ang < 0.0:
+        ang += 360.0
+    return ang
+
+
+def _same_hue_family(lab_a, lab_b):
+    """Tints of one hue, or two neutrals (grey / black / white)."""
+    ha, hb = _hue_angle(lab_a), _hue_angle(lab_b)
+    if ha is None or hb is None:
+        ca = math.hypot(float(lab_a[1]), float(lab_a[2]))
+        cb = math.hypot(float(lab_b[1]), float(lab_b[2]))
+        return ca < 12.0 and cb < 12.0
+    d = abs(ha - hb)
+    d = min(d, 360.0 - d)
+    return d <= 32.0
+
+
+def _thin_component_mask(mask):
+    """Pixels that belong to a thin component, or None when there is no real keyline."""
+    m = (np.asarray(mask) > 0).astype(np.uint8)
+    area = int(m.sum())
+    if area < 24:
+        return None
+    n, cc, stats, _ = cv2.connectedComponentsWithStats(m, connectivity=8)
+    if n <= 1:
+        return None
+    h, w = m.shape[:2]
+    # Scale with the plate: letters on a 1440px badge are a few pixels wide,
+    # a solid snow field is not. The tiger's white muzzle still qualifies.
+    max_rad = max(2.6, 0.0055 * float(min(h, w)))
+    thin = np.zeros(m.shape, np.uint8)
+    thin_area = 0
+    for i in range(1, n):
+        a = int(stats[i, cv2.CC_STAT_AREA])
+        if a < 16:
+            continue
+        x, y, ww, hh = (int(stats[i, 0]), int(stats[i, 1]), int(stats[i, 2]), int(stats[i, 3]))
+        if ww < 1 or hh < 1:
+            continue
+        comp = cc[y:y + hh, x:x + ww] == i
+        if int(comp.sum()) < 16:
+            continue
+        dt = cv2.distanceTransform(comp.astype(np.uint8), cv2.DIST_L2, 3)
+        vals = dt[comp]
+        if vals.size == 0:
+            continue
+        # float64: median of a large float32 distance map warns on overflow.
+        if float(np.median(np.asarray(vals, dtype=np.float64))) <= max_rad:
+            thin[y:y + hh, x:x + ww][comp] = 1
+            thin_area += a
+    if thin_area < 80:
+        return None
+    return thin
+
+
+def _thin_light_structure(mask):
+    """True when a real share of the ink is a thin stroke (text or keyline)."""
+    return _thin_component_mask(mask) is not None
+
+
+def _erases_light_keyline(src, dst, labels, labs):
+    """Light text or a thin light keyline must not be folded into a darker ink."""
+    Ls = float(labs[src][0])
+    Ld = float(labs[dst][0])
+    if Ls < 58.0 or Ls < Ld + 18.0:
+        return False
+    return _thin_light_structure(labels == src)
+
+
+def _hides_keyline(src, dst, labels, labs, thin_cache):
+    """Do not pour a neighbour into a near-white keyline it surrounds.
+
+    White whiskers on grey, or white laces on a grey football, vanish if that
+    grey is repainted white. Summit's white lettering sits on navy, so orange
+    may still join the white plate. Paper (label < 0) is not a neighbour.
+    """
+    lab = labs[dst]
+    if float(lab[0]) < 85.0 or math.hypot(float(lab[1]), float(lab[2])) > 18.0:
+        return False
+    key = int(dst)
+    if key not in thin_cache:
+        thin_cache[key] = _thin_component_mask(labels == dst)
+    thin = thin_cache[key]
+    if thin is None:
+        return False
+    dil = cv2.dilate(thin, np.ones((3, 3), np.uint8))
+    ring = (dil > 0) & (thin == 0)
+    if not np.any(ring):
+        return False
+    neigh = labels[ring]
+    ink = neigh >= 0
+    if not np.any(ink):
+        return False
+    return float(np.count_nonzero(neigh[ink] == src)) / float(np.count_nonzero(ink)) >= 0.35
+
+
+def _ink_importance(i, alive, areas, labs):
+    """Small and close to another ink is least important. Distinct or large stays."""
+    md = None
+    for j in alive:
+        if j == i:
+            continue
+        d = _delta_e2000(labs[i], labs[j])
+        if md is None or d < md:
+            md = d
+    if md is None:
+        md = 0.0
+    return (float(areas[i]) * float(md), int(i))
+
+
+def _pick_merge(alive, areas, labs, labels):
+    """Least important ink and the kept ink it joins, or None if every move erases text."""
+    ranked = sorted(alive, key=lambda i: _ink_importance(i, alive, areas, labs))
+    thin_cache = {}
+    for src in ranked:
+        legal = []
+        for dst in alive:
+            if dst == src:
+                continue
+            if _erases_light_keyline(src, dst, labels, labs):
+                continue
+            if _hides_keyline(src, dst, labels, labs, thin_cache):
+                continue
+            d = _delta_e2000(labs[src], labs[dst])
+            fam = 0 if _same_hue_family(labs[src], labs[dst]) else 1
+            legal.append((d, fam, int(dst)))
+        if not legal:
+            continue
+        best = min(c[0] for c in legal)
+        # A tint stays in its hue family when that ink is not much further away.
+        family = [c for c in legal if c[1] == 0 and c[0] <= best * 1.25 + 6.0]
+        pool = family if family else legal
+        pool.sort()
+        return int(src), int(pool[0][2])
+    return None
+
+
+def _layers_by_ink(layers, palette):
+    hexes = [to_hex(np.asarray(c, dtype=np.float64)).lower() for c in palette]
+    out = {}
+    for L in layers or []:
+        ink = L.get("ink")
+        if ink is None:
+            hx = str(L.get("hex") or "").lower()
+            if hx in hexes:
+                ink = hexes.index(hx)
+        if ink is None:
+            continue
+        out[int(ink)] = L
+    return out
 
 
 def _retrace_logo_mask(mask, sx, sy):
@@ -12236,13 +12373,118 @@ def _retrace_logo_mask(mask, sx, sy):
     return paths
 
 
-def _merge_cached_layers(cache_dir, manifest, n_colors):
-    """Merge dropped inks into the nearest kept ink (CIEDE2000) and retrace those masks.
+def _colour_drop_svg(labels, palette, layers, sx, sy, width_in, height_in, paper_hex, n, base_meta=None):
+    """Merge least-important inks until `n` remain, then retrace the plates that grew.
 
-    Unchanged plates keep their cached path strings, so shared edges that did
-    not move stay the bytes the full engine traced. Paper (label < 0) is left
-    empty and is not painted.
+    Importance is area times CIEDE2000 distance to the nearest other ink, so a
+    small tint goes before a large or distinctive plate. The merge target is
+    the nearest ink, preferring the same hue family. A light text or keyline
+    ink is not folded into a darker one. Untouched plates keep their path
+    strings. Paper (label < 0) stays unpainted, so the background stays
+    transparent. The grown plate is dilated one pixel onto other inks except
+    protected light strokes, which closes curve gaps without eating the text.
     """
+    labels = np.array(labels, dtype=np.int32, copy=True)
+    palette = [np.asarray(c, dtype=np.float64).reshape(3) for c in palette]
+    if labels.ndim != 2 or not palette or sx is None or sy is None:
+        raise RuntimeError("incomplete plates")
+    if not width_in or not height_in:
+        raise RuntimeError("missing trace geometry")
+    n = int(n)
+    by_ink = _layers_by_ink(layers, palette)
+    areas = {i: int((labels == i).sum()) for i in range(len(palette))}
+    alive = [i for i in sorted(by_ink) if areas.get(i, 0) > 0]
+    if n < 1:
+        raise RuntimeError("bad colour count")
+    if n >= len(alive):
+        raise RuntimeError("nothing to drop")
+    labs = [_cie_lab(np.asarray(c, dtype=np.float64).reshape(1, 1, 3))[0, 0] for c in palette]
+    natural = len(alive)
+    absorbed = set()
+    guard = 0
+    while len(alive) > n and guard < 32:
+        guard += 1
+        choice = _pick_merge(alive, areas, labs, labels)
+        if choice is None:
+            break
+        src, dst = choice
+        if src == dst or src not in alive or dst not in alive:
+            break
+        labels[labels == src] = dst
+        areas[dst] = int(areas.get(dst, 0) + areas.get(src, 0))
+        areas[src] = 0
+        alive.remove(src)
+        absorbed.add(dst)
+    if len(alive) > n:
+        raise RuntimeError("could not drop to %d inks without erasing light text" % n)
+    # Fold any painted speck that never became its own layer into the nearest survivor.
+    for i in range(len(palette)):
+        if i in alive or int((labels == i).sum()) == 0:
+            continue
+        best = min(alive, key=lambda j: (_delta_e2000(labs[i], labs[j]), j))
+        labels[labels == i] = best
+        absorbed.add(best)
+        areas[best] = int((labels == best).sum())
+    protect = np.zeros(labels.shape, dtype=bool)
+    for i in alive:
+        if float(labs[i][0]) >= 58.0 and _thin_light_structure(labels == i):
+            protect |= labels == i
+    areas_now = {i: int((labels == i).sum()) for i in alive}
+    order = sorted(alive, key=lambda i: (-lum(palette[i]), -areas_now[i], i))
+    out_layers = []
+    retraced = 0
+    kernel = np.ones((3, 3), np.uint8)
+    for i in order:
+        area = areas_now[i]
+        if area < 4:
+            continue
+        src = by_ink.get(i)
+        if i not in absorbed and src and src.get("paths"):
+            paths = list(src["paths"])
+        else:
+            mask = (labels == i).astype(np.uint8)
+            if i in absorbed:
+                dil = cv2.dilate(mask, kernel)
+                other = (labels >= 0) & (labels != i) & ~protect
+                mask = np.where(other & (dil > 0), np.uint8(1), mask)
+            paths = _retrace_logo_mask(mask, float(sx), float(sy))
+            retraced += 1
+        if not paths:
+            continue
+        rec = {
+            "hex": (src or {}).get("hex") or to_hex(palette[i]),
+            "name": (src or {}).get("name") or layer_name(palette[i]),
+            "paths": paths,
+            "lum": lum(palette[i]),
+            "n": area,
+        }
+        if src and src.get("opacity") is not None:
+            rec["opacity"] = float(src["opacity"])
+        out_layers.append(rec)
+    if len(out_layers) != n:
+        # A survivor failed to trace. Still refuse an empty file upstream.
+        if not out_layers:
+            raise RuntimeError("merge produced no paths")
+        raise RuntimeError("merge produced %d inks, wanted %d" % (len(out_layers), n))
+    svg = svg_from_layers_with_gaps(
+        out_layers, float(width_in), float(height_in), paper_hex, gap_strokes=[], overlay_strokes=[]
+    )
+    if "<path" not in svg.lower():
+        raise RuntimeError("empty merged svg")
+    meta = dict(base_meta or {})
+    meta["fast_drop"] = True
+    meta["cache"] = "merge"
+    meta["retraced"] = retraced
+    meta["dropped"] = int(natural - len(out_layers))
+    meta["colors"] = len(out_layers)
+    meta["colors_requested"] = n
+    meta["palette"] = [L["hex"] for L in out_layers]
+    meta["paths"] = len(re.findall(r"<path\b", svg, re.I))
+    return svg, meta
+
+
+def _merge_cached_layers(cache_dir, manifest, n_colors):
+    """Merge cached plates the same way a full retrace at this N does."""
     lab_path = os.path.join(cache_dir, "labels.npz")
     if not os.path.isfile(lab_path):
         raise RuntimeError("missing label map")
@@ -12251,108 +12493,45 @@ def _merge_cached_layers(cache_dir, manifest, n_colors):
             labels = np.asarray(z["labels"], dtype=np.int32)
     except Exception as e:
         raise RuntimeError(f"corrupt label map: {e}") from e
-    palette = [np.asarray(c, dtype=np.float64) for c in (manifest.get("palette") or [])]
+    palette = manifest.get("palette") or []
     if not palette or labels.ndim != 2:
         raise RuntimeError("incomplete cache")
     if list(labels.shape) != list(manifest.get("label_shape") or list(labels.shape)):
         raise RuntimeError("label shape mismatch")
-    kept = _select_kept_inks(palette, labels, n_colors)
-    kept_set = set(kept)
-    labs = [_cie_lab(np.asarray(c, dtype=np.float64).reshape(1, 1, 3))[0, 0] for c in palette]
-    remap = {}
-    for i in range(len(palette)):
-        if i in kept_set:
-            remap[i] = i
-            continue
-        best = None
-        best_d = 1e18
-        for j in kept:
-            d = _delta_e2000(labs[i], labs[j])
-            if d < best_d or (d == best_d and (best is None or j < best)):
-                best_d = d
-                best = j
-        remap[i] = int(best)
-    merged = np.full(labels.shape, -1, np.int32)
-    ink = labels >= 0
-    if ink.any():
-        # Vector remap. Unknown labels (corrupt) fall back.
-        table = np.full(int(labels.max()) + 1, -1, np.int32)
-        for src, dst in remap.items():
-            if 0 <= src < table.size:
-                table[src] = dst
-        merged[ink] = table[labels[ink]]
-    # Which kept inks absorbed a foreign plate and must be retraced.
-    absorbed = {j for i, j in remap.items() if i != j}
-    layers = manifest.get("layers") or []
-    by_ink = {}
-    for L in layers:
-        if L.get("ink") is None:
-            continue
-        by_ink[int(L["ink"])] = L
-    sx = manifest.get("sx")
-    sy = manifest.get("sy")
-    width_in = manifest.get("width_in")
-    height_in = manifest.get("height_in")
-    if sx is None or sy is None or not width_in or not height_in:
-        raise RuntimeError("missing trace geometry")
-    order = list(kept)
-    order.sort(key=lambda i: (-lum(palette[i]), -int((merged == i).sum())))
-    out_layers = []
-    retraced = 0
-    for i in order:
-        area = int((merged == i).sum())
-        if area < 4:
-            continue
-        src = by_ink.get(i)
-        if i not in absorbed and src and src.get("paths"):
-            paths = list(src["paths"])
-        else:
-            paths = _retrace_logo_mask((merged == i).astype(np.uint8), float(sx), float(sy))
-            retraced += 1
-        if not paths:
-            continue
-        rec = {
-            "hex": to_hex(palette[i]),
-            "name": layer_name(palette[i]),
-            "paths": paths,
-            "lum": lum(palette[i]),
-            "n": area,
-        }
-        if src and src.get("opacity") is not None:
-            rec["opacity"] = float(src["opacity"])
-        out_layers.append(rec)
-    if not out_layers:
-        raise RuntimeError("merge produced no paths")
-    paper_hex = manifest.get("paper_hex")
-    svg = svg_from_layers_with_gaps(
-        out_layers, float(width_in), float(height_in), paper_hex, gap_strokes=[], overlay_strokes=[]
+    return _colour_drop_svg(
+        labels,
+        palette,
+        manifest.get("layers") or [],
+        manifest.get("sx"),
+        manifest.get("sy"),
+        manifest.get("width_in"),
+        manifest.get("height_in"),
+        manifest.get("paper_hex"),
+        n_colors,
+        manifest.get("meta") or {},
     )
-    if "<path" not in svg.lower():
-        raise RuntimeError("empty merged svg")
-    meta = dict(manifest.get("meta") or {})
-    meta["fast_drop"] = True
-    meta["cache"] = "merge"
-    meta["retraced"] = retraced
-    meta["dropped"] = int(len(palette) - len(kept))
-    meta["colors"] = len(out_layers)
-    meta["palette"] = [to_hex(palette[i]) for i in order if int((merged == i).sum()) >= 4]
-    meta["paths"] = len(re.findall(r"<path\b", svg, re.I))
-    return svg, meta
+
+
+def _natural_ink_count(meta, layers, palette):
+    """Inks the natural trace actually painted."""
+    try:
+        n = int((meta or {}).get("colors") or 0)
+    except (TypeError, ValueError):
+        n = 0
+    if n > 0:
+        return n
+    if layers:
+        return len(layers)
+    return len(palette or [])
 
 
 def _speed_from_cache(cache_dir, path, colors, inches, mode):
     t0 = time.time()
     manifest = _load_speed_manifest(cache_dir, path, inches, mode)
-    palette = manifest.get("palette") or []
     n = int(colors)
     kind = manifest.get("kind") or (manifest.get("meta") or {}).get("mode") or "logo"
-    # A full retrace at N uses the same plates as the cached run: --colors only
-    # changes the pre-classification palette, then logo_k / the art backends
-    # ignore it. Merging below that plate count would disagree with the retrace
-    # (missing ink, not a tighter fit). When the cached plate set is already
-    # larger than N AND the engine recorded that it honors N, merge.
-    honor = bool(manifest.get("engine_honors_colors"))
-    if honor and n < len(palette) and manifest.get("trace") == "logo-potrace-mask":
+    natural = _natural_ink_count(manifest.get("meta"), manifest.get("layers"), manifest.get("palette"))
+    if n < natural:
         svg, meta = _merge_cached_layers(cache_dir, manifest, n)
     else:
         svg = manifest["svg"]
@@ -12368,28 +12547,63 @@ def _speed_from_cache(cache_dir, path, colors, inches, mode):
 
 
 def vectorize(path: str, inches: float = 10.0, colors=None, mode: str = "auto", cache_dir=None, from_cache=None):
-    global _SPEED_SINK
+    global _SPEED_SINK, _LAST_PLATES
     if from_cache and colors is not None:
         try:
             return _speed_from_cache(from_cache, path, colors, inches, mode)
         except Exception as e:
             sys.stderr.write(f"speed-cache fallback: {e}\n")
+    _LAST_PLATES = None
     _SPEED_SINK = (
         {
             "cache_dir": cache_dir,
             "path": path,
             "inches": inches,
             "mode": mode,
-            "colors": colors,
+            "colors": None,
         }
         if cache_dir
         else None
     )
     try:
-        return _vectorize_body(path, inches=inches, colors=colors, mode=mode)
+        # Always trace the natural plates. --colors used to reach the
+        # pre-classification palette only, so N >= natural already matched the
+        # default SVG on logos. Dropping after the trace keeps that byte
+        # identity and gives the fast path the same plates to merge.
+        svg, meta = _vectorize_body(path, inches=inches, colors=None, mode=mode)
     finally:
+        plates = _LAST_PLATES
         _SPEED_SINK = None
-
+        _LAST_PLATES = None
+    if colors is None:
+        return svg, meta
+    try:
+        natural = int((meta or {}).get("colors") or 0)
+    except (TypeError, ValueError):
+        natural = 0
+    if natural <= 0 or int(colors) >= natural:
+        if isinstance(meta, dict):
+            meta = dict(meta)
+            meta["colors_requested"] = int(colors)
+        return svg, meta
+    try:
+        if not plates or plates.get("labels") is None:
+            raise RuntimeError("no plate map")
+        svg, meta = _colour_drop_svg(
+            plates.get("labels"),
+            plates.get("palette_rgb"),
+            plates.get("layers"),
+            plates.get("sx"),
+            plates.get("sy"),
+            plates.get("width_in"),
+            plates.get("height_in"),
+            plates.get("paper_hex") or (meta or {}).get("paper"),
+            int(colors),
+            meta,
+        )
+    except Exception as e:
+        sys.stderr.write(f"colour-drop failed: {e}\n")
+    return svg, meta
 
 def _vectorize_body(path: str, inches: float = 10.0, colors=None, mode: str = "auto"):
     t0 = time.time()
