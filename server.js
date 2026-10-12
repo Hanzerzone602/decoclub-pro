@@ -830,6 +830,18 @@ function pruneTraceCache() {
   }
   if (removed) console.log("trace-cache pruned", removed, "dirs; kept", Math.round(total / 1048576), "MB");
 }
+try {
+  const top = fs.readdirSync(DATA, { withFileTypes: true }).map(function (e) {
+    const f = path.join(DATA, e.name);
+    let b = 0; try { b = e.isDirectory() ? dirBytes(f) : fs.statSync(f).size; } catch (x) { /* ignore */ }
+    return e.name + "=" + Math.round(b / 1048576) + "MB";
+  });
+  console.log("data-dir usage", DATA, top.join(" "));
+  ["uploads", "exports"].forEach(function (n) {
+    const d = path.join(DATA, n);
+    try { console.log("data-dir", n, "entries", fs.readdirSync(d).length); } catch (x) { /* ignore */ }
+  });
+} catch (e) { console.error("data-dir usage failed", e.message); }
 try { pruneTraceCache(); } catch (e) { console.error("trace-cache prune failed", e); }
 setInterval(function () { try { pruneTraceCache(); } catch (e) { /* ignore */ } }, 15 * 60 * 1000).unref();
 
