@@ -830,6 +830,12 @@ function pruneTraceCache() {
   }
   if (removed) console.log("trace-cache pruned", removed, "dirs; kept", Math.round(total / 1048576), "MB");
 }
+/* Crashed saves leave store.json.tmp.* behind (24MB each); remove at boot. */
+try {
+  fs.readdirSync(DATA).filter(function (n) { return /^store\.json\.tmp\./.test(n); }).forEach(function (n) {
+    try { fs.unlinkSync(path.join(DATA, n)); console.log("removed stale", n); } catch (x) { /* ignore */ }
+  });
+} catch (e) { /* ignore */ }
 try {
   const top = fs.readdirSync(DATA, { withFileTypes: true }).map(function (e) {
     const f = path.join(DATA, e.name);
@@ -971,8 +977,13 @@ function save(db) {
   pruneExpiredSessions(db);
   const tmp = DB_PATH + ".tmp." + process.pid + "." + Date.now();
   // Compact JSON (no pretty indent) — smaller/faster writes; parse-compatible with prior stores.
-  fs.writeFileSync(tmp, JSON.stringify(db));
-  fs.renameSync(tmp, DB_PATH);
+  try {
+    fs.writeFileSync(tmp, JSON.stringify(db));
+    fs.renameSync(tmp, DB_PATH);
+  } catch (e) {
+    try { fs.unlinkSync(tmp); } catch (x) { /* ignore */ }
+    throw e;
+  }
 }
 function load() {
   let db;
