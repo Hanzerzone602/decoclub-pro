@@ -46,6 +46,7 @@ import subprocess
 import sys
 import tempfile
 import time
+import xml.etree.ElementTree as ET
 
 import cv2
 import numpy as np
@@ -9467,33 +9468,771 @@ def drop_invented_jpeg_slivers(assign, palette, src_rgb, paper_rgb):
     return out, meta
 
 
-def logo_potrace_mask_layers(assign, palette, sx, sy, *, min_area_px=10):
-    """Per-ink potrace of the assign mask. Evenodd compounds, no shared-crack Schneider.
+# Slider state for the logo fit. None means "not passed": smooth defaults on,
+# corners stay at potrace's alphamax 1.0. Set for the whole vectorize() call
+# so the full trace and the --from-cache retrace use the same knobs.
+_SMOOTH_CTRL = None
+_CORNERS_CTRL = None
+# Set for the rest of this process once the colour vote is actually kept.
+# --from-cache restores it from the cached smooth_sigma so a retrace uses
+# the same fit as the full run.
+_SMOOTH_APPLIED = False
+# Clean logos only move a fraction of a percent under the vote, and fitting
+# those edges at opttol 0.03 packs nodes and splits specks. The tiger's vote
+# moves about 1.3% of the canvas; that is the case this keeps.
+_SMOOTH_KEEP_FRAC = 0.010
 
-    alphamax/opttol are potrace's own defaults so corners that are actually
-    sharp stay corners and the cubic stays on the bitmap. If a fit retreats
-    off the shared seam, that ink is replaced by a marching-squares 0.5-iso
-    of a sigma<=1 blur, hard-capped to 0.8px from the unblurred contour.
+
+def _logo_alphamax():
+    corners = _CORNERS_CTRL
+    if corners is None:
+        return 1.0
+    c = min(100.0, max(0.0, float(corners)))
+    return 1.334 * (c / 100.0)
+
+
+def _logo_smooth_sigma(long_side):
+    """Blur radius for the colour vote. 0 when --smooth 0."""
+    raw = _SMOOTH_CTRL
+    slider = 43.0 if raw is None else min(100.0, max(0.0, float(raw)))
+    if slider <= 0.0:
+        return 0.0
+    return (slider / 100.0) * 6.5 * (max(float(long_side), 1.0) / 1500.0)
+
+
+def _logo_fit_knobs(long_side, applied=None):
+    """(alphamax, opttol, sigma_px) for the logo mask trace.
+
+    --smooth 0, and any vote that barely moves the plates, leave the bitmap
+    and potrace's 0.2 opttolerance alone (sigma 0 so the trace mask is not
+    hole-filled or pulled off white). A kept vote blurs by sigma and, once
+    that blur is wide enough to have removed the jogs, tightens opttolerance
+    to 0.03 so the cubic follows the smoother contour instead of weaving
+    S-waves back into it. --corners maps 0..100 onto alphamax 0..1.334;
+    omitted stays 1.0. `applied` overrides the process flag so the base fit
+    and the tight fit can be traced together.
+    """
+    alphamax = _logo_alphamax()
+    sigma = _logo_smooth_sigma(long_side)
+    use = _SMOOTH_APPLIED if applied is None else bool(applied)
+    if not use or sigma <= 0.05:
+        return alphamax, 0.2, 0.0
+    opttol = 0.03 if sigma >= 2.0 else 0.2
+    return alphamax, opttol, float(sigma)
+
+
+# Closed filled subpaths under this fraction of the artboard are specks.
+# Same cut as the gate's svg_speck_metrics (0.02%). No other speck knob.
+_SVG_SPECK_AREA_FRAC = 0.0002
+
+
+def _norm_hex(c):
+    if not c:
+        return None
+    s = str(c).strip().lower()
+    if s in ("none", "transparent"):
+        return None
+    if s.startswith("rgb"):
+        nums = re.findall(r"[\d.]+", s)
+        if len(nums) >= 3:
+            rgb = [max(0, min(255, int(float(n)))) for n in nums[:3]]
+            return "#{:02x}{:02x}{:02x}".format(*rgb)
+        return None
+    if not s.startswith("#"):
+        return None
+    s = s[1:]
+    if len(s) == 3:
+        s = "".join(ch * 2 for ch in s)
+    if len(s) >= 6:
+        s = s[:6]
+    else:
+        return None
+    return "#" + s
+
+
+def _hex_is_paper(h):
+    """Near-white fill. Matches the gate's is_paper_hex so white art is not a speck."""
+    if not h or len(h) < 7 or not h.startswith("#"):
+        return False
+    try:
+        r = int(h[1:3], 16)
+        g = int(h[3:5], 16)
+        b = int(h[5:7], 16)
+    except ValueError:
+        return False
+    return min(r, g, b) >= 245 and (max(r, g, b) - min(r, g, b)) <= 8
+
+
+def _closed_subpath_areas(d):
+    """Absolute areas of closed subpaths in an SVG path `d`.
+
+    Cubic sampling (8 steps) and the shoelace match the gate's
+    `_subpath_points` / `_poly_area`, so the speck count is the same one
+    `svg_speck_metrics` reports.
+    """
+    toks = _PATH_TOK.findall(d or "")
+    i = 0
+    cx = cy = 0.0
+    sx = sy = 0.0
+    last_c = None
+    areas = []
+    pts = None
+    cmd = "M"
+
+    def num():
+        nonlocal i
+        if i >= len(toks):
+            raise ValueError("path number underflow")
+        v = float(toks[i])
+        i += 1
+        return v
+
+    def need(n):
+        return (len(toks) - i) >= n and toks[i] not in _CMD_SPEC
+
+    def start_sub():
+        nonlocal pts
+        pts = []
+
+    def add_L(x, y):
+        nonlocal cx, cy, last_c, pts
+        if pts is None:
+            return
+        if not pts:
+            pts.append((cx, cy))
+        pts.append((x, y))
+        cx, cy = x, y
+        last_c = None
+
+    def add_C(x1, y1, x2, y2, x, y):
+        nonlocal cx, cy, last_c, pts
+        if pts is None:
+            return
+        if not pts:
+            pts.append((cx, cy))
+        p0x, p0y = cx, cy
+        for j in range(1, 9):
+            t = j / 8.0
+            u = 1.0 - t
+            pts.append((
+                u * u * u * p0x + 3 * u * u * t * x1 + 3 * u * t * t * x2 + t * t * t * x,
+                u * u * u * p0y + 3 * u * u * t * y1 + 3 * u * t * t * y2 + t * t * t * y,
+            ))
+        last_c = ("C", x2, y2)
+        cx, cy = x, y
+
+    def add_Q(x1, y1, x, y):
+        nonlocal last_c
+        c1x = cx + 2.0 / 3.0 * (x1 - cx)
+        c1y = cy + 2.0 / 3.0 * (y1 - cy)
+        c2x = x + 2.0 / 3.0 * (x1 - x)
+        c2y = y + 2.0 / 3.0 * (y1 - y)
+        add_C(c1x, c1y, c2x, c2y, x, y)
+        last_c = ("Q", x1, y1)
+
+    def close_area():
+        if not pts or len(pts) < 3:
+            return 0.0
+        acc = 0.0
+        nxt = pts[1:] + pts[:1]
+        for a, b in zip(pts, nxt):
+            acc += a[0] * b[1] - b[0] * a[1]
+        return abs(acc) * 0.5
+
+    try:
+        while i < len(toks):
+            if toks[i] in _CMD_SPEC:
+                cmd = toks[i]
+                i += 1
+            rel = cmd.islower()
+            c = cmd.upper()
+            if c == "M":
+                if not need(2):
+                    break
+                x, y = num(), num()
+                if rel:
+                    x += cx
+                    y += cy
+                cx, cy = x, y
+                sx, sy = x, y
+                start_sub()
+                last_c = None
+                cmd = "l" if rel else "L"
+                while need(2):
+                    x, y = num(), num()
+                    if rel:
+                        x += cx
+                        y += cy
+                    add_L(x, y)
+            elif c == "L":
+                while need(2):
+                    x, y = num(), num()
+                    if rel:
+                        x += cx
+                        y += cy
+                    add_L(x, y)
+            elif c == "H":
+                while True:
+                    if not need(1) or toks[i] in _CMD_SPEC:
+                        break
+                    x = num()
+                    if rel:
+                        x += cx
+                    add_L(x, cy)
+            elif c == "V":
+                while True:
+                    if not need(1) or toks[i] in _CMD_SPEC:
+                        break
+                    y = num()
+                    if rel:
+                        y += cy
+                    add_L(cx, y)
+            elif c == "C":
+                while need(6):
+                    x1, y1, x2, y2, x, y = num(), num(), num(), num(), num(), num()
+                    if rel:
+                        x1 += cx
+                        y1 += cy
+                        x2 += cx
+                        y2 += cy
+                        x += cx
+                        y += cy
+                    add_C(x1, y1, x2, y2, x, y)
+            elif c == "S":
+                while need(4):
+                    x2, y2, x, y = num(), num(), num(), num()
+                    if rel:
+                        x2 += cx
+                        y2 += cy
+                        x += cx
+                        y += cy
+                    if last_c and last_c[0] == "C":
+                        x1 = 2 * cx - last_c[1]
+                        y1 = 2 * cy - last_c[2]
+                    else:
+                        x1, y1 = cx, cy
+                    add_C(x1, y1, x2, y2, x, y)
+            elif c == "Q":
+                while need(4):
+                    x1, y1, x, y = num(), num(), num(), num()
+                    if rel:
+                        x1 += cx
+                        y1 += cy
+                        x += cx
+                        y += cy
+                    add_Q(x1, y1, x, y)
+            elif c == "T":
+                while need(2):
+                    x, y = num(), num()
+                    if rel:
+                        x += cx
+                        y += cy
+                    if last_c and last_c[0] == "Q":
+                        x1 = 2 * cx - last_c[1]
+                        y1 = 2 * cy - last_c[2]
+                    else:
+                        x1, y1 = cx, cy
+                    add_Q(x1, y1, x, y)
+            elif c == "A":
+                while need(7):
+                    _rx, _ry, _ang, _la, _sw, x, y = (
+                        num(), num(), num(), num(), num(), num(), num()
+                    )
+                    if rel:
+                        x += cx
+                        y += cy
+                    add_L(x, y)
+            elif c == "Z":
+                if pts is not None:
+                    if math.hypot(cx - sx, cy - sy) > 1e-6:
+                        add_L(sx, sy)
+                    areas.append(close_area())
+                    cx, cy = sx, sy
+                last_c = None
+            else:
+                break
+    except (ValueError, IndexError):
+        pass
+    return areas
+
+
+_CMD_SPEC = set("MmLlHhVvCcSsQqTtAaZz")
+
+
+def _svg_speck_count(svg_text):
+    """Count closed filled subpaths smaller than 0.02% of the artboard.
+
+    Paper fills and `data-name="paper-underlay"` are skipped, same as
+    `qa/corel_check.py` `svg_speck_metrics`.
+    """
+    root = ET.fromstring(svg_text)
+    vb = root.get("viewBox")
+    if vb:
+        parts = [float(x) for x in vb.replace(",", " ").split()]
+        vb_w, vb_h = parts[2], parts[3]
+    else:
+        def _len(v, default=10.0):
+            if not v:
+                return default
+            m = re.match(r"^\s*([\d.]+)", v)
+            return float(m.group(1)) if m else default
+
+        vb_w = _len(root.get("width"), 10.0)
+        vb_h = _len(root.get("height"), 10.0)
+    limit = _SVG_SPECK_AREA_FRAC * max(vb_w * vb_h, 1e-9)
+    n = 0
+
+    def walk(el, fill, data_name):
+        nonlocal n
+        f = fill
+        name = data_name
+        attr = el.get("fill")
+        if attr:
+            f = _norm_hex(attr)
+        dn = el.get("data-name")
+        if dn:
+            name = dn
+        style = el.get("style") or ""
+        for part in style.split(";"):
+            if ":" not in part:
+                continue
+            k, v = part.split(":", 1)
+            if k.strip().lower() == "fill":
+                f = _norm_hex(v.strip())
+        tag = el.tag.split("}", 1)[-1]
+        if tag == "path" and f and not _hex_is_paper(f) and name != "paper-underlay":
+            for area in _closed_subpath_areas(el.get("d") or ""):
+                if 0.0 < area < limit:
+                    n += 1
+        for ch in list(el):
+            walk(ch, f, name)
+
+    walk(root, None, "")
+    return n
+
+
+def _smooth_logo_assign(assign, palette, sigma):
+    """Colour-vote smooth of a logo label map.
+
+    Every ink, plus paper, is blurred and each pixel is given to the
+    winner, so the plates stay a partition (no gaps, no overlaps, no
+    new grey). Thin strokes and compact dark dots are pasted back from
+    the unblurred mask. The 1px stair fringe of a thick shape is not:
+    that fringe is what the vote is there to round off. Specks under
+    about 0.02% of the canvas are absorbed afterwards.
     """
     a = np.asarray(assign, dtype=np.int32)
+    if sigma <= 0.05 or a.size == 0:
+        return a
+    h, w = a.shape
+    ids = [int(v) for v in np.unique(a) if int(v) >= 0]
+    if not ids:
+        return a
+    best = cv2.GaussianBlur((a < 0).astype(np.float32), (0, 0), float(sigma))
+    out = np.full((h, w), -1, np.int32)
+    for v in ids:
+        score = cv2.GaussianBlur((a == v).astype(np.float32), (0, 0), float(sigma))
+        take = score > best
+        if not np.any(take):
+            continue
+        out[take] = v
+        best[take] = score[take]
+    del best
+
+    def _lum_of(v):
+        if v < 0 or v >= len(palette):
+            return 0.0
+        return float(lum(palette[v]))
+
+    kern = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5, 5))
+    bridge = np.ones((3, 3), np.uint8)
+    canvas = h * w
+    edge_lim = max(12, int(round(0.0002 * canvas)))
+    # Whiskers and lace stitches stick out of a thick parent. A 2px opening
+    # peels them off with the stair fringe; only the part that reaches
+    # several pixels past that fringe is pasted back.
+    for v in ids:
+        orig = (a == v).astype(np.uint8)
+        if int(orig.sum()) < 8:
+            continue
+        opened = cv2.morphologyEx(orig, cv2.MORPH_OPEN, kern)
+        if int(opened.sum()) == 0:
+            dist = np.full((h, w), 99.0, np.float32)
+        else:
+            dist = cv2.distanceTransform((opened == 0).astype(np.uint8), cv2.DIST_L2, 3)
+        protrude = ((orig > 0) & (opened == 0) & (dist >= 4.5)).astype(np.uint8)
+        if int(protrude.sum()) >= 8:
+            n, lab, stats, _ = cv2.connectedComponentsWithStats(protrude, 8)
+            keep = np.zeros((h, w), np.uint8)
+            for ci in range(1, n):
+                area = int(stats[ci, cv2.CC_STAT_AREA])
+                if area < 8:
+                    continue
+                bw = int(stats[ci, cv2.CC_STAT_WIDTH])
+                bh = int(stats[ci, cv2.CC_STAT_HEIGHT])
+                long = max(bw, bh)
+                short = max(1, min(bw, bh))
+                if long >= 12 and long / float(short) >= 2.6:
+                    keep[lab == ci] = 1
+            if int(keep.sum()):
+                grown = cv2.dilate(keep, bridge, iterations=2)
+                out[(grown > 0) & (orig > 0)] = v
+        ink_lum = _lum_of(v)
+        thick = cv2.distanceTransform(orig, cv2.DIST_L2, 3)
+        n, lab, stats, _ = cv2.connectedComponentsWithStats(orig, 8)
+        for ci in range(1, n):
+            area = int(stats[ci, cv2.CC_STAT_AREA])
+            if area < 8 or area >= edge_lim:
+                continue
+            bw = int(stats[ci, cv2.CC_STAT_WIDTH])
+            bh = int(stats[ci, cv2.CC_STAT_HEIGHT])
+            long = max(bw, bh)
+            short = max(1, min(bw, bh))
+            elong = long / float(short)
+            cm = lab == ci
+            tmax = float(thick[cm].max())
+            if tmax <= 2.5 and long >= 12 and elong >= 2.4 and (
+                ink_lum >= 160.0 or ink_lum < 55.0 or long >= 36
+            ):
+                out[cm] = v
+                continue
+            if ink_lum < 55.0 and elong < 2.8 and 14 <= area and tmax <= 10.0:
+                dil = cv2.dilate(cm.astype(np.uint8), bridge)
+                ring = (dil > 0) & (a != v)
+                pf = float(np.mean(a[ring] < 0)) if np.any(ring) else 1.0
+                if pf < 0.55:
+                    out[cm] = v
+
+    # Enclosed paper that the vote swallowed (letter counters, small holes).
+    # A large opening only loses its rim, so it is left on the smoothed edge.
+    paper = (a < 0).astype(np.uint8)
+    n, lab, stats, _ = cv2.connectedComponentsWithStats(paper, 8)
+    if n > 1:
+        border = set()
+        border.update(int(x) for x in lab[0, :] if x)
+        border.update(int(x) for x in lab[h - 1, :] if x)
+        border.update(int(x) for x in lab[:, 0] if x)
+        border.update(int(x) for x in lab[:, w - 1] if x)
+        for ci in range(1, n):
+            if ci in border:
+                continue
+            area = int(stats[ci, cv2.CC_STAT_AREA])
+            if area < 8:
+                continue
+            cm = lab == ci
+            survived = int((out[cm] < 0).sum())
+            if survived * 2 < area:
+                out[cm] = -1
+
+    # Specks after the vote. Elongated strokes and interior dark dots stay.
+    for v in ids:
+        ink_lum = _lum_of(v)
+        m = (out == v).astype(np.uint8)
+        if int(m.sum()) < 1:
+            continue
+        n, lab, stats, _ = cv2.connectedComponentsWithStats(m, 8)
+        kill = []
+        for ci in range(1, n):
+            area = int(stats[ci, cv2.CC_STAT_AREA])
+            if area >= edge_lim or area < 1:
+                continue
+            bw = int(stats[ci, cv2.CC_STAT_WIDTH])
+            bh = int(stats[ci, cv2.CC_STAT_HEIGHT])
+            long = max(bw, bh)
+            short = max(1, min(bw, bh))
+            elong = long / float(short)
+            cm = lab == ci
+            if elong >= 2.5 and long >= 12 and (ink_lum >= 160.0 or ink_lum < 55.0 or long >= 28):
+                continue
+            if ink_lum < 55.0 and area >= 12:
+                dil = cv2.dilate(cm.astype(np.uint8), bridge)
+                ring = (dil > 0) & ~cm
+                pf = float(np.mean(out[ring] < 0)) if np.any(ring) else 1.0
+                if pf < 0.65:
+                    continue
+            kill.append(cm)
+        for cm in kill:
+            dil = cv2.dilate(cm.astype(np.uint8), np.ones((5, 5), np.uint8))
+            ring = (dil > 0) & ~cm
+            neigh = out[ring]
+            ink = neigh[neigh >= 0]
+            if ink.size == 0 or float(np.mean(neigh < 0)) >= 0.5:
+                out[cm] = -1
+            else:
+                vals, counts = np.unique(ink, return_counts=True)
+                out[cm] = int(vals[int(np.argmax(counts))])
+    # White art is a coverage gate. Put every original white pixel back so
+    # the vote can round other inks without turning white into a neighbour.
+    # White specks are not counted (paper-white hex), and whiskers are white.
+    # Low-chroma grey is the same kind of thin fur: the vote dissolves it and
+    # the ink-coverage area gate is already within a percent of failing.
+    # A later pass (_despeckle_vote_plates) runs only when this vote is kept.
+    # It sees the map after this paste-back, which is what both traces use.
+    for v in ids:
+        ink_lum = _lum_of(v)
+        if v < len(palette) and _ink_is_white(palette[v]):
+            out[a == v] = v
+            continue
+        if v >= len(palette) or not (80.0 <= ink_lum < 200.0):
+            continue
+        if float(chroma_of_lab(lab_of_rgb([palette[v]])[0])) > 18.0:
+            continue
+        # Big grey plates only. Crumbs stay dropped so they do not return as specks.
+        orig = (a == v).astype(np.uint8)
+        if int(orig.sum()) < edge_lim:
+            continue
+        n, lab, stats, _ = cv2.connectedComponentsWithStats(orig, 8)
+        for ci in range(1, n):
+            if int(stats[ci, cv2.CC_STAT_AREA]) >= edge_lim:
+                out[lab == ci] = v
+    return out
+
+
+def _despeckle_vote_plates(base, smoothed, palette):
+    """Absorb vote-created islands and holes under ~0.02% of the canvas.
+
+    Called after the colour vote and the thin-line / dot paste-back, and only
+    when that vote is kept. The plates stored for the full trace and for
+    --from-cache are this map, so both fits see the same pixels.
+
+    A small component that already sits on the same ink in `base` stays, as
+    do thin strokes (whiskers, laces) and base islands (muzzle dots, eye
+    highlights, letter counters). What the vote created is removed only in
+    ways that do not jog a plate's outer edge: an enclosed crumb is filled
+    with the surrounding ink (a light or paper hole inside a darker plate
+    included), and a crumb sitting on paper is deleted. Pouring a boundary
+    crumb into the neighbouring plate is what made potrace emit extra holes.
+    """
+    base = np.asarray(base, dtype=np.int32)
+    cur = np.array(smoothed, dtype=np.int32, copy=True)
+    if cur.size == 0 or cur.shape != base.shape or cur.ndim != 2:
+        return cur
+    h, w = cur.shape
+    limit = max(12, int(round(0.0002 * h * w)))
+    kern = np.ones((3, 3), np.uint8)
+    protect = np.zeros((h, w), np.uint8)
+    # Base islands under the speck limit, plus thin strokes of any size so a
+    # whisker broken by the vote still matches.
+    for v in [int(x) for x in np.unique(base)]:
+        m = (base == v).astype(np.uint8)
+        if int(m.sum()) < 8:
+            continue
+        n, lab, stats, _ = cv2.connectedComponentsWithStats(m, 8)
+        for ci in range(1, n):
+            area = int(stats[ci, cv2.CC_STAT_AREA])
+            if area < 8:
+                continue
+            x = int(stats[ci, cv2.CC_STAT_LEFT])
+            y = int(stats[ci, cv2.CC_STAT_TOP])
+            bw = int(stats[ci, cv2.CC_STAT_WIDTH])
+            bh = int(stats[ci, cv2.CC_STAT_HEIGHT])
+            long = max(bw, bh)
+            short = max(1, min(bw, bh))
+            elong = long / float(short)
+            crop = lab[y:y + bh, x:x + bw] == ci
+            if area < limit:
+                protect[y:y + bh, x:x + bw][crop] = 1
+                continue
+            if long < 12 or elong < 2.2:
+                continue
+            dt = cv2.distanceTransform(crop.astype(np.uint8), cv2.DIST_L2, 3)
+            if int(crop.sum()) and float(np.median(dt[crop])) <= 2.6:
+                protect[y:y + bh, x:x + bw][crop] = 1
+
+    def _lum_of(v):
+        if v < 0 or v >= len(palette):
+            return 255.0
+        return float(lum(palette[v]))
+
+    nxt = cur.copy()
+    ids = [int(v) for v in np.unique(cur)]
+    for v in ids:
+        m = (cur == v).astype(np.uint8)
+        if int(m.sum()) < 1:
+            continue
+        n, lab, stats, _ = cv2.connectedComponentsWithStats(m, 8)
+        edits = []
+        ink_lum = _lum_of(v)
+        for ci in range(1, n):
+            area = int(stats[ci, cv2.CC_STAT_AREA])
+            if area < 1 or area >= limit:
+                continue
+            x = int(stats[ci, cv2.CC_STAT_LEFT])
+            y = int(stats[ci, cv2.CC_STAT_TOP])
+            bw = int(stats[ci, cv2.CC_STAT_WIDTH])
+            bh = int(stats[ci, cv2.CC_STAT_HEIGHT])
+            long = max(bw, bh)
+            short = max(1, min(bw, bh))
+            elong = long / float(short)
+            x0 = max(0, x - 1)
+            y0 = max(0, y - 1)
+            x1 = min(w, x + bw + 1)
+            y1 = min(h, y + bh + 1)
+            cm = lab[y0:y1, x0:x1] == ci
+            if not np.any(cm):
+                continue
+            base_win = base[y0:y1, x0:x1]
+            same = float(np.mean((base_win == v)[cm]))
+            on_feat = cm & (protect[y0:y1, x0:x1] > 0) & (base_win == v)
+            frac = float(on_feat.sum()) / float(area)
+            # Present in the base assignment, or a thin stroke the vote
+            # shifted a little. Designed dots and whiskers take this path.
+            if same >= 0.50 or frac >= 0.45 or (elong >= 2.4 and long >= 12 and same >= 0.35):
+                continue
+            dil = cv2.dilate(cm.astype(np.uint8), kern)
+            ring = (dil > 0) & ~cm
+            if not np.any(ring):
+                continue
+            neigh = cur[y0:y1, x0:x1][ring]
+            paper_frac = float(np.mean(neigh < 0))
+            ink_vals = neigh[neigh >= 0]
+            maj = -1
+            maj_frac = 0.0
+            if ink_vals.size:
+                vals, counts = np.unique(ink_vals, return_counts=True)
+                k = int(np.argmax(counts))
+                maj = int(vals[k])
+                maj_frac = float(counts[k]) / float(neigh.size)
+            touch = bool(x == 0 or y == 0 or x + bw >= w or y + bh >= h)
+            maj_lum = _lum_of(maj)
+            enclosed = (not touch) and maj >= 0 and maj_frac >= 0.70
+            # A light or paper crumb inside a darker plate is a hole even
+            # when the ring is a little mixed.
+            light_hole = (
+                (not touch)
+                and maj >= 0
+                and maj_frac >= 0.60
+                and ink_lum >= maj_lum + 40.0
+            )
+            on_paper = paper_frac >= 0.75 and maj_frac < 0.25
+            if enclosed or light_hole:
+                target = maj
+            elif on_paper:
+                target = -1
+            else:
+                # Boundary crumb. Leaving it beats gluing a 1px jog onto
+                # the neighbouring plate (those jogs trace as extra holes).
+                continue
+            if target == v:
+                continue
+            edits.append((y0, y1, x0, x1, cm, target))
+        for y0, y1, x0, x1, cm, target in edits:
+            nxt[y0:y1, x0:x1][cm] = target
+    return nxt
+
+
+def _cover_foreign_holes(mask, labels, palette, ink, limit):
+    """Fill enclosed holes that are a darker ink, for the trace mask only.
+
+    A dark dot on a lighter plate is its own path, drawn later. The hole it
+    punches is a second speck. Covering that hole here leaves the dot on top.
+    Paper counters (lettering) and lighter inks such as white are not covered,
+    or the plate would paint over them.
+    """
+    m = (np.asarray(mask) > 0).astype(np.uint8)
+    if int(m.sum()) < 8 or limit < 2 or ink < 0 or ink >= len(palette):
+        return m
+    plate_lum = float(lum(palette[ink]))
+    inv = (m == 0).astype(np.uint8)
+    n, lab, stats, _ = cv2.connectedComponentsWithStats(inv, 8)
+    if n <= 1:
+        return m
+    h, w = m.shape
+    border = set(int(x) for x in lab[0, :] if int(x))
+    border.update(int(x) for x in lab[h - 1, :] if int(x))
+    border.update(int(x) for x in lab[:, 0] if int(x))
+    border.update(int(x) for x in lab[:, w - 1] if int(x))
+    labels = np.asarray(labels)
+    for ci in range(1, n):
+        if ci in border:
+            continue
+        area = int(stats[ci, cv2.CC_STAT_AREA])
+        if area < 1 or area >= int(limit):
+            continue
+        cm = lab == ci
+        vals = labels[cm]
+        if float(np.mean(vals < 0)) > 0.35:
+            continue
+        ink_vals = vals[vals >= 0]
+        if ink_vals.size == 0:
+            continue
+        darker_px = np.zeros(cm.shape, dtype=bool)
+        darker = 0
+        for v in np.unique(ink_vals):
+            iv = int(v)
+            if iv < 0 or iv >= len(palette):
+                continue
+            if float(lum(palette[iv])) < plate_lum - 8.0:
+                darker_px |= labels == iv
+                darker += int(np.sum(ink_vals == v))
+        if darker < 0.6 * int(area):
+            continue
+        # Only the darker ink. White or other light pixels in the same
+        # hole stay uncovered so a later plate cannot paint over them.
+        m[cm & darker_px] = 1
+    return m
+
+
+def logo_potrace_mask_layers(assign, palette, sx, sy, *, min_area_px=10, fit=None):
+    """Per-ink potrace of the assign mask. Evenodd compounds, no shared-crack Schneider.
+
+    alphamax/opttol follow the smooth/corners sliders. With smoothing off they
+    are potrace's own defaults so corners that are actually sharp stay corners
+    and the cubic stays on the bitmap. If a fit retreats off the shared seam,
+    that ink is replaced by a marching-squares 0.5-iso of a sigma<=1 blur,
+    hard-capped to 0.8px from the unblurred contour.
+
+    `fit` is an explicit (alphamax, opttol, sigma) tuple. The speck guard
+    passes one for the tight fit and one for the base fit so the two traces
+    do not share the process-wide smooth flag.
+    """
+    a = np.asarray(assign, dtype=np.int32)
+    if fit is None:
+        alphamax, opttol, _sigma = _logo_fit_knobs(max(a.shape) if a.size else 1)
+    else:
+        alphamax, opttol, _sigma = fit
     order = list(range(len(palette)))
     order.sort(key=lambda i: (-lum(palette[i]), -int((a == i).sum())))
     layers = []
     iso_n = 0
     # p75 gap above this (px) means the cubic left the pixel crack.
     gap_trigger = 1.8
+    # 1px ring outside white, excluding low-chroma grey. Dark plates step
+    # back and white takes the ring, so the seam stays closed and the
+    # antialiased dark edge does not land on source white.
+    white_m = np.zeros(a.shape, np.uint8)
+    grey_m = np.zeros(a.shape, np.uint8)
+    if _sigma > 0.05:
+        for j, c in enumerate(palette):
+            ink_lum = float(lum(c))
+            if _ink_is_white(c):
+                white_m[a == j] = 1
+            elif 80.0 <= ink_lum < 200.0 and float(chroma_of_lab(lab_of_rgb([c])[0])) <= 18.0:
+                grey_m[a == j] = 1
+    white_ban = None
+    if int(white_m.sum()):
+        white_ban = cv2.dilate(white_m, np.ones((3, 3), np.uint8))
+        white_ban[grey_m > 0] = 0
     for ink in order:
         area = int((a == ink).sum())
         if area < int(min_area_px):
             continue
         mask = (a == ink).astype(np.uint8)
+        if _sigma > 0.05:
+            mask = _cover_foreign_holes(mask, a, palette, ink, max(12, int(0.0002 * a.size)))
+            if white_ban is not None:
+                ink_lum = float(lum(palette[ink]))
+                if _ink_is_white(palette[ink]):
+                    mask[white_ban > 0] = 1
+                elif ink_lum < 80.0 or float(chroma_of_lab(lab_of_rgb([palette[ink]])[0])) > 18.0:
+                    mask[white_ban > 0] = 0
         paths = potrace_paths(
             mask,
             sx,
             sy,
             scale=1,
-            alphamax=1.0,
-            opttol=0.2,
+            alphamax=alphamax,
+            opttol=opttol,
             turdsize=0,
             smooth=0.0,
         )
@@ -9522,6 +10261,30 @@ def logo_potrace_mask_layers(assign, palette, sx, sy, *, min_area_px=10):
         "iso_fallback": iso_n,
         "colors": len(layers),
     }
+
+
+def _logo_mask_svg(labels, palette, sx, sy, width_in, height_in, paper_hex, min_area_px, fit):
+    """Potrace one assign map and wrap it in the logo SVG. None when empty."""
+    glayers, gaux = logo_potrace_mask_layers(
+        np.asarray(labels, dtype=np.int32),
+        palette,
+        sx,
+        sy,
+        min_area_px=min_area_px,
+        fit=fit,
+    )
+    gpaths = sum(len(L.get("paths") or []) for L in glayers)
+    if not glayers or gpaths < 1:
+        return None
+    svg = svg_from_layers_with_gaps(
+        glayers,
+        width_in,
+        height_in,
+        paper_hex,
+        gap_strokes=[],
+        overlay_strokes=[],
+    )
+    return svg, glayers, gaux
 
 
 def svg_from_layers(layers, width_in, height_in, paper_hex=None):
@@ -12358,8 +13121,9 @@ def _layers_by_ink(layers, palette):
 
 def _retrace_logo_mask(mask, sx, sy):
     """Same per-ink fit as logo_potrace_mask_layers, including the iso fallback."""
+    alphamax, opttol, _sigma = _logo_fit_knobs(max(np.asarray(mask).shape) if np.size(mask) else 1)
     paths = potrace_paths(
-        mask, sx, sy, scale=1, alphamax=1.0, opttol=0.2, turdsize=0, smooth=0.0
+        mask, sx, sy, scale=1, alphamax=alphamax, opttol=opttol, turdsize=0, smooth=0.0
     )
     if paths:
         try:
@@ -12373,7 +13137,422 @@ def _retrace_logo_mask(mask, sx, sy):
     return paths
 
 
-def _colour_drop_svg(labels, palette, layers, sx, sy, width_in, height_in, paper_hex, n, base_meta=None):
+class ColourPickError(Exception):
+    """User colour choice does not match the natural inks. Carries a fallback SVG."""
+
+    def __init__(self, message, svg=None, meta=None):
+        super().__init__(message)
+        self.svg = svg
+        self.meta = meta
+
+
+# Nearest-ink snap for --merge / --keep. Farther than this is a user error.
+_COLOUR_PICK_DE = 10.0
+
+
+def _parse_hex_token(tok):
+    raw = str(tok).strip()
+    if not raw:
+        raise ColourPickError("empty colour")
+    s = raw.lower()
+    if s.startswith("#"):
+        s = s[1:]
+    if len(s) == 3 and all(c in "0123456789abcdef" for c in s):
+        s = "".join(c * 2 for c in s)
+    if len(s) != 6 or any(c not in "0123456789abcdef" for c in s):
+        raise ColourPickError(f"bad hex '{raw}'")
+    rgb = np.array([int(s[0:2], 16), int(s[2:4], 16), int(s[4:6], 16)], dtype=np.float64)
+    return "#" + s, rgb
+
+
+def _parse_merge_spec(spec):
+    text = str(spec).strip()
+    if not text:
+        raise ColourPickError("empty --merge")
+    out = []
+    for part in text.split(","):
+        part = part.strip()
+        if not part:
+            continue
+        if "=" not in part:
+            raise ColourPickError(f"--merge entry '{part}' is not SRC=DST")
+        src_s, dst_s = part.split("=", 1)
+        sh, sr = _parse_hex_token(src_s)
+        dh, dr = _parse_hex_token(dst_s)
+        out.append((sh, sr, dh, dr))
+    if not out:
+        raise ColourPickError("empty --merge")
+    return out
+
+
+def _parse_keep_spec(spec):
+    text = str(spec).strip()
+    if not text:
+        raise ColourPickError("empty --keep")
+    out = []
+    for part in text.split(","):
+        part = part.strip()
+        if not part:
+            continue
+        out.append(_parse_hex_token(part))
+    if not out:
+        raise ColourPickError("empty --keep")
+    return out
+
+
+def _plate_inks(labels, palette, layers):
+    """Palette index, hex, CIE Lab, and pixel area for each traced ink."""
+    labels = np.asarray(labels)
+    palette = [np.asarray(c, dtype=np.float64).reshape(3) for c in palette]
+    hexes = [to_hex(c).lower() for c in palette]
+    labs = [_cie_lab(np.asarray(c, dtype=np.float64).reshape(1, 1, 3))[0, 0] for c in palette]
+    by_ink = _layers_by_ink(layers, palette) if layers else {}
+    areas = {i: int((labels == i).sum()) for i in range(len(palette))}
+    if by_ink:
+        alive = [i for i in sorted(by_ink) if areas.get(i, 0) > 0]
+    else:
+        alive = [i for i in range(len(palette)) if areas.get(i, 0) > 0]
+    return palette, hexes, labs, areas, alive
+
+
+def _format_ink_list(hexes, alive):
+    return ", ".join(hexes[i] for i in alive)
+
+
+def _match_ink(user_hex, rgb, hexes, labs, alive):
+    """Exact hex, else nearest natural ink within CIEDE2000 ≤ 10."""
+    if not alive:
+        raise ColourPickError("no natural inks to match")
+    for i in alive:
+        if hexes[i] == user_hex:
+            return i
+    src_lab = _cie_lab(np.asarray(rgb, dtype=np.float64).reshape(1, 1, 3))[0, 0]
+    best_i = None
+    best_d = None
+    for i in alive:
+        d = _delta_e2000(src_lab, labs[i])
+        if best_d is None or d < best_d - 1e-9 or (abs(d - best_d) <= 1e-9 and (best_i is None or i < best_i)):
+            best_d = d
+            best_i = i
+    listing = _format_ink_list(hexes, alive)
+    if best_d is None or best_d > _COLOUR_PICK_DE:
+        near = ""
+        if best_i is not None and best_d is not None:
+            near = f" (nearest {hexes[best_i]} ΔE {best_d:.2f})"
+        raise ColourPickError(
+            f"'{user_hex}' matches no natural ink within ΔE {_COLOUR_PICK_DE:.0f}{near}. Natural inks: {listing}"
+        )
+    return best_i
+
+
+def _resolve_user_request(labels, palette, layers, merge, keep, colors):
+    """Map --merge / --keep hexes onto alive natural inks."""
+    _palette, hexes, labs, areas, alive = _plate_inks(labels, palette, layers)
+    if not alive:
+        raise ColourPickError("no natural inks")
+    listing = _format_ink_list(hexes, alive)
+    merge_spec = _parse_merge_spec(merge) if merge else []
+    keep_spec = _parse_keep_spec(keep) if keep else None
+    if keep_spec is not None and colors is None:
+        raise ColourPickError("--keep requires --colors N")
+    forced_raw = {}
+    forced_hex = []
+    for sh, sr, dh, dr in merge_spec:
+        src = _match_ink(sh, sr, hexes, labs, alive)
+        dst = _match_ink(dh, dr, hexes, labs, alive)
+        if src == dst:
+            raise ColourPickError(
+                f"--merge '{sh}={dh}' resolves to the same natural ink {hexes[src]}. Natural inks: {listing}"
+            )
+        if src in forced_raw and forced_raw[src] != dst:
+            raise ColourPickError(
+                f"--merge gives {hexes[src]} two destinations ({hexes[forced_raw[src]]} and {hexes[dst]}). Natural inks: {listing}"
+            )
+        forced_raw[src] = dst
+        forced_hex.append(f"{hexes[src]}={hexes[dst]}")
+    resolved = {}
+    for src in forced_raw:
+        seen = []
+        cur = src
+        while cur in forced_raw:
+            if cur in seen:
+                cycle = " -> ".join(hexes[i] for i in seen + [cur])
+                raise ColourPickError(f"--merge has a cycle ({cycle}). Natural inks: {listing}")
+            seen.append(cur)
+            cur = forced_raw[cur]
+        resolved[src] = cur
+    keep_ids = None
+    keep_hex = []
+    if keep_spec is not None:
+        keep_ids = []
+        for kh, kr in keep_spec:
+            idx = _match_ink(kh, kr, hexes, labs, alive)
+            if idx not in keep_ids:
+                keep_ids.append(idx)
+                keep_hex.append(hexes[idx])
+        if colors is not None and len(keep_ids) > int(colors):
+            raise ColourPickError(
+                f"--keep lists {len(keep_ids)} inks but --colors is {int(colors)}. Natural inks: {listing}"
+            )
+    return {
+        "forced": resolved,
+        "forced_hex": forced_hex,
+        "keep": keep_ids,
+        "keep_hex": keep_hex,
+        "hexes": hexes,
+        "requested": None if colors is None else int(colors),
+    }
+
+
+def _ink_is_protected(i, labels, labs):
+    """Light text or a thin light keyline. The automatic drop will not erase it."""
+    if float(labs[i][0]) < 58.0:
+        return False
+    return bool(_thin_light_structure(np.asarray(labels) == i))
+
+
+def _auto_merge_dst(src, alive, labs, labels, thin_cache):
+    """Where `_pick_merge` would send `src`. None when every destination is guarded."""
+    legal = []
+    for dst in alive:
+        if dst == src:
+            continue
+        if _erases_light_keyline(src, dst, labels, labs):
+            continue
+        if _hides_keyline(src, dst, labels, labs, thin_cache):
+            continue
+        d = _delta_e2000(labs[src], labs[dst])
+        fam = 0 if _same_hue_family(labs[src], labs[dst]) else 1
+        legal.append((d, fam, int(dst)))
+    if not legal:
+        return None
+    best = min(c[0] for c in legal)
+    family = [c for c in legal if c[1] == 0 and c[0] <= best * 1.25 + 6.0]
+    pool = family if family else legal
+    pool.sort()
+    return int(pool[0][2])
+
+
+def _nearest_kept(src, survivors, labs):
+    """Nearest survivor. Same hue-family preference as the automatic drop, no guard."""
+    legal = []
+    for dst in survivors:
+        if dst == src:
+            continue
+        d = _delta_e2000(labs[src], labs[dst])
+        fam = 0 if _same_hue_family(labs[src], labs[dst]) else 1
+        legal.append((d, fam, int(dst)))
+    if not legal:
+        raise RuntimeError("no kept ink to merge into")
+    best = min(c[0] for c in legal)
+    family = [c for c in legal if c[1] == 0 and c[0] <= best * 1.25 + 6.0]
+    pool = family if family else legal
+    pool.sort()
+    return int(pool[0][2])
+
+
+def _natural_ink_list(labels, palette, layers):
+    """Swatch records for the natural plates, before any user or automatic drop."""
+    _palette, hexes, labs, areas, alive = _plate_inks(labels, palette, layers)
+    if not alive:
+        return []
+    painted = sum(int(areas[i]) for i in alive) or 1
+    labels_arr = np.asarray(labels)
+    thin_cache = {}
+    targets = {i: _auto_merge_dst(i, alive, labs, labels_arr, thin_cache) for i in alive}
+    choice = _pick_merge(list(alive), areas, labs, labels_arr) if len(alive) >= 2 else None
+    next_src = None if choice is None else int(choice[0])
+    if choice is not None:
+        targets[int(choice[0])] = int(choice[1])
+    recs = []
+    for i in alive:
+        dst = targets.get(i)
+        recs.append(
+            {
+                "hex": hexes[i],
+                "area_pct": round(100.0 * float(areas[i]) / float(painted), 2),
+                "merge_target": None if dst is None else hexes[dst],
+                "protected": bool(_ink_is_protected(i, labels_arr, labs)),
+                "next_drop": bool(i == next_src),
+                "_area": int(areas[i]),
+            }
+        )
+    recs.sort(key=lambda r: (-r["_area"], r["hex"]))
+    for rec in recs:
+        del rec["_area"]
+    return recs
+
+
+def _with_inks(meta, labels, palette, layers):
+    """Attach the natural ink list. Failure leaves meta unchanged (SVG is already built)."""
+    if not isinstance(meta, dict) or labels is None or palette is None:
+        return meta
+    try:
+        recs = _natural_ink_list(labels, palette, layers)
+    except Exception:
+        return meta
+    if not recs:
+        return meta
+    out = dict(meta)
+    out["inks"] = recs
+    return out
+
+
+def _merge_erases_protected(src, dst, labels, labs, thin_cache):
+    if _erases_light_keyline(src, dst, labels, labs):
+        return True
+    if _hides_keyline(src, dst, labels, labs, thin_cache):
+        return True
+    return False
+
+
+def _seal_absorbed_cracks(labels, absorbed):
+    """Fill 1px paper cracks inside a plate that just absorbed another ink.
+
+    Separate paths used to cover a paper pixel sitting between two inks. The
+    retraced union does not. Exterior paper and wide counters stay empty.
+    Other inks are not painted over. Default colour-drop does not call this.
+    """
+    if not absorbed:
+        return labels
+    ext = _exterior_paper_mask(labels)
+    kernel = np.ones((3, 3), np.uint8)
+    for ink in sorted(int(i) for i in absorbed):
+        mask = (labels == ink).astype(np.uint8)
+        if int(mask.sum()) < 4:
+            continue
+        # Gaps inside this plate (both sides became the same ink).
+        closed = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, kernel)
+        add = (closed > 0) & (labels < 0) & ~ext
+        if np.any(add):
+            labels[add] = ink
+        # Paper pixel sitting between this plate and a different ink.
+        other = ((labels >= 0) & (labels != ink)).astype(np.uint8)
+        if int(other.sum()) == 0:
+            continue
+        near_ink = cv2.dilate(mask, kernel)
+        near_other = cv2.dilate(other, kernel)
+        bridge = (labels < 0) & ~ext & (near_ink > 0) & (near_other > 0)
+        if np.any(bridge):
+            labels[bridge] = ink
+    return labels
+
+
+def _apply_user_plan(labels, palette, alive, areas, n_req, user):
+    """Apply --merge / --keep. Returns the plate state the shared emitter expects.
+
+    A user merge is not blocked by the light-keyline guard. Warnings are returned
+    and printed only after a non-empty SVG is built.
+    """
+    palette = [np.asarray(c, dtype=np.float64).reshape(3) for c in palette]
+    labs = [_cie_lab(np.asarray(c, dtype=np.float64).reshape(1, 1, 3))[0, 0] for c in palette]
+    labels = np.array(labels, dtype=np.int32, copy=True)
+    orig = labels.copy()
+    areas = {int(k): int(v) for k, v in areas.items()}
+    alive = [int(i) for i in alive]
+    natural = len(alive)
+    absorbed = set()
+    warnings = []
+    thin_cache = {}
+    hexes = user["hexes"]
+    forced = {int(s): int(d) for s, d in (user.get("forced") or {}).items()}
+    keep = user.get("keep")
+
+    def _warn(src, dst):
+        if _merge_erases_protected(src, dst, orig, labs, thin_cache):
+            pair = (hexes[src], hexes[dst])
+            if pair not in warnings:
+                warnings.append(pair)
+
+    if forced:
+        base = labels.copy()
+        for src in sorted(forced):
+            dst = forced[src]
+            if src not in alive:
+                continue
+            _warn(src, dst)
+            labels[base == src] = int(dst)
+            if src in alive:
+                alive.remove(src)
+            absorbed.add(int(dst))
+        areas = {i: int((labels == i).sum()) for i in range(len(palette))}
+        alive = [i for i in alive if areas.get(i, 0) > 0]
+        for dst in forced.values():
+            if areas.get(int(dst), 0) > 0 and int(dst) not in alive:
+                alive.append(int(dst))
+        alive = sorted(set(alive))
+
+    if keep is not None:
+        pinned = []
+        for i in keep:
+            i = int(i)
+            if i in alive and i not in pinned and i not in forced:
+                pinned.append(i)
+        for dst in forced.values():
+            dst = int(dst)
+            if dst in alive and dst not in pinned:
+                pinned.append(dst)
+        target = natural if n_req is None else int(n_req)
+        if n_req is not None and len(pinned) > int(n_req):
+            listing = ", ".join(hexes[i] for i in pinned)
+            raise ColourPickError(
+                f"--keep and --merge retain {len(pinned)} inks ({listing}) but --colors is {int(n_req)}"
+            )
+        if len(pinned) < target:
+            rest = [i for i in alive if i not in pinned]
+
+            def _rank(i):
+                prot = 1 if _ink_is_protected(i, orig, labs) else 0
+                imp = _ink_importance(i, alive, areas, labs)
+                return (prot, imp[0], imp[1])
+
+            rest.sort(key=_rank, reverse=True)
+            for i in rest:
+                if len(pinned) >= target:
+                    break
+                pinned.append(i)
+        pinned_set = set(pinned)
+        base = labels.copy()
+        for src in [i for i in alive if i not in pinned_set]:
+            dst = _nearest_kept(src, pinned, labs)
+            _warn(src, dst)
+            labels[base == src] = int(dst)
+            absorbed.add(int(dst))
+        labels = _seal_absorbed_cracks(labels, absorbed)
+        alive = [i for i in pinned if int((labels == i).sum()) > 0]
+        areas = {i: int((labels == i).sum()) for i in alive}
+        return labels, alive, areas, absorbed, len(alive), natural, labs, warnings
+
+    if n_req is not None:
+        n = int(n_req)
+        if n < 1:
+            raise RuntimeError("bad colour count")
+        areas = {i: int((labels == i).sum()) for i in alive}
+        guard = 0
+        while len(alive) > n and guard < 32:
+            guard += 1
+            choice = _pick_merge(alive, areas, labs, labels)
+            if choice is None:
+                break
+            src, dst = choice
+            if src == dst or src not in alive or dst not in alive:
+                break
+            labels[labels == src] = dst
+            areas[dst] = int(areas.get(dst, 0) + areas.get(src, 0))
+            areas[src] = 0
+            alive.remove(src)
+            absorbed.add(dst)
+        if len(alive) > n:
+            raise RuntimeError("could not drop to %d inks without erasing light text" % n)
+    labels = _seal_absorbed_cracks(labels, absorbed)
+    areas = {i: int((labels == i).sum()) for i in alive}
+    alive = [i for i in alive if areas.get(i, 0) > 0]
+    if not alive:
+        raise RuntimeError("merge produced no inks")
+    return labels, alive, areas, absorbed, len(alive), natural, labs, warnings
+
+
+def _colour_drop_svg(labels, palette, layers, sx, sy, width_in, height_in, paper_hex, n, base_meta=None, merge=None, keep=None):
     """Merge least-important inks until `n` remain, then retrace the plates that grew.
 
     Importance is area times CIEDE2000 distance to the nearest other ink, so a
@@ -12390,33 +13569,53 @@ def _colour_drop_svg(labels, palette, layers, sx, sy, width_in, height_in, paper
         raise RuntimeError("incomplete plates")
     if not width_in or not height_in:
         raise RuntimeError("missing trace geometry")
-    n = int(n)
+    # Default --colors path (merge and keep both absent) is the original loop.
+    # _colour_req / _user_note stay empty so the emitted meta matches that path.
+    _colour_req = None
+    _user_note = None
+    _warnings = []
     by_ink = _layers_by_ink(layers, palette)
     areas = {i: int((labels == i).sum()) for i in range(len(palette))}
     alive = [i for i in sorted(by_ink) if areas.get(i, 0) > 0]
-    if n < 1:
-        raise RuntimeError("bad colour count")
-    if n >= len(alive):
-        raise RuntimeError("nothing to drop")
-    labs = [_cie_lab(np.asarray(c, dtype=np.float64).reshape(1, 1, 3))[0, 0] for c in palette]
-    natural = len(alive)
-    absorbed = set()
-    guard = 0
-    while len(alive) > n and guard < 32:
-        guard += 1
-        choice = _pick_merge(alive, areas, labs, labels)
-        if choice is None:
-            break
-        src, dst = choice
-        if src == dst or src not in alive or dst not in alive:
-            break
-        labels[labels == src] = dst
-        areas[dst] = int(areas.get(dst, 0) + areas.get(src, 0))
-        areas[src] = 0
-        alive.remove(src)
-        absorbed.add(dst)
-    if len(alive) > n:
-        raise RuntimeError("could not drop to %d inks without erasing light text" % n)
+    if merge is None and keep is None:
+        n = int(n)
+        if n < 1:
+            raise RuntimeError("bad colour count")
+        if n >= len(alive):
+            raise RuntimeError("nothing to drop")
+        labs = [_cie_lab(np.asarray(c, dtype=np.float64).reshape(1, 1, 3))[0, 0] for c in palette]
+        natural = len(alive)
+        absorbed = set()
+        guard = 0
+        while len(alive) > n and guard < 32:
+            guard += 1
+            choice = _pick_merge(alive, areas, labs, labels)
+            if choice is None:
+                break
+            src, dst = choice
+            if src == dst or src not in alive or dst not in alive:
+                break
+            labels[labels == src] = dst
+            areas[dst] = int(areas.get(dst, 0) + areas.get(src, 0))
+            areas[src] = 0
+            alive.remove(src)
+            absorbed.add(dst)
+        if len(alive) > n:
+            raise RuntimeError("could not drop to %d inks without erasing light text" % n)
+    else:
+        user = _resolve_user_request(labels, palette, layers, merge, keep, n)
+        labels, alive, areas, absorbed, n, natural, labs, _warnings = _apply_user_plan(
+            labels, palette, alive, areas, n, user
+        )
+        if user.get("requested") is not None:
+            _colour_req = int(user["requested"])
+        _user_note = {}
+        if user.get("forced_hex"):
+            _user_note["merge"] = list(user["forced_hex"])
+        if user.get("keep_hex"):
+            _user_note["keep"] = list(user["keep_hex"])
+        if n < 1:
+            raise RuntimeError("merge produced no inks")
     # Fold any painted speck that never became its own layer into the nearest survivor.
     for i in range(len(palette)):
         if i in alive or int((labels == i).sum()) == 0:
@@ -12477,14 +13676,20 @@ def _colour_drop_svg(labels, palette, layers, sx, sy, width_in, height_in, paper
     meta["retraced"] = retraced
     meta["dropped"] = int(natural - len(out_layers))
     meta["colors"] = len(out_layers)
-    meta["colors_requested"] = n
+    meta["colors_requested"] = n if _colour_req is None else _colour_req
     meta["palette"] = [L["hex"] for L in out_layers]
     meta["paths"] = len(re.findall(r"<path\b", svg, re.I))
+    if _user_note:
+        for key, val in _user_note.items():
+            meta[key] = val
+    for src_hex, dst_hex in _warnings:
+        sys.stderr.write(
+            f"colour-pick warning: merging {src_hex} into {dst_hex} erases a protected light keyline or text\n"
+        )
     return svg, meta
 
 
-def _merge_cached_layers(cache_dir, manifest, n_colors):
-    """Merge cached plates the same way a full retrace at this N does."""
+def _load_cached_labels(cache_dir, manifest):
     lab_path = os.path.join(cache_dir, "labels.npz")
     if not os.path.isfile(lab_path):
         raise RuntimeError("missing label map")
@@ -12493,11 +13698,19 @@ def _merge_cached_layers(cache_dir, manifest, n_colors):
             labels = np.asarray(z["labels"], dtype=np.int32)
     except Exception as e:
         raise RuntimeError(f"corrupt label map: {e}") from e
-    palette = manifest.get("palette") or []
-    if not palette or labels.ndim != 2:
+    if labels.ndim != 2:
         raise RuntimeError("incomplete cache")
     if list(labels.shape) != list(manifest.get("label_shape") or list(labels.shape)):
         raise RuntimeError("label shape mismatch")
+    return labels
+
+
+def _merge_cached_layers(cache_dir, manifest, n_colors, merge=None, keep=None):
+    """Merge cached plates the same way a full retrace at this N does."""
+    labels = _load_cached_labels(cache_dir, manifest)
+    palette = manifest.get("palette") or []
+    if not palette:
+        raise RuntimeError("incomplete cache")
     return _colour_drop_svg(
         labels,
         palette,
@@ -12509,6 +13722,8 @@ def _merge_cached_layers(cache_dir, manifest, n_colors):
         manifest.get("paper_hex"),
         n_colors,
         manifest.get("meta") or {},
+        merge=merge,
+        keep=keep,
     )
 
 
@@ -12525,14 +13740,56 @@ def _natural_ink_count(meta, layers, palette):
     return len(palette or [])
 
 
-def _speed_from_cache(cache_dir, path, colors, inches, mode):
+def _ink_document(labels, palette, layers):
+    recs = _natural_ink_list(labels, palette, layers)
+    if not recs:
+        raise ColourPickError("no natural inks")
+    return {"colors": len(recs), "inks": recs}
+
+
+def _speed_from_cache(cache_dir, path, colors, inches, mode, merge=None, keep=None, list_inks=False):
+    global _SMOOTH_APPLIED
     t0 = time.time()
     manifest = _load_speed_manifest(cache_dir, path, inches, mode)
+    # Retrace must use the fit the cached paths were built with. The vote
+    # decision is not recomputed here; the cached smooth_sigma is that bit.
+    try:
+        _SMOOTH_APPLIED = float((manifest.get("meta") or {}).get("smooth_sigma") or 0.0) > 0.05
+    except (TypeError, ValueError):
+        _SMOOTH_APPLIED = False
+    palette = manifest.get("palette") or []
+    layers = manifest.get("layers") or []
+    if list_inks or merge or keep:
+        try:
+            labels = _load_cached_labels(cache_dir, manifest)
+        except ColourPickError:
+            raise
+        except Exception as e:
+            raise RuntimeError(str(e)) from e
+        if list_inks:
+            return "", _ink_document(labels, palette, layers)
+        try:
+            svg, meta = _merge_cached_layers(
+                cache_dir, manifest, colors, merge=merge, keep=keep
+            )
+        except ColourPickError as e:
+            if e.svg is None:
+                e.svg = manifest.get("svg") or ""
+                e.meta = manifest.get("meta")
+            raise
+        meta = _with_inks(meta, labels, palette, layers)
+        meta["ms"] = int((time.time() - t0) * 1000)
+        return svg, meta
     n = int(colors)
     kind = manifest.get("kind") or (manifest.get("meta") or {}).get("mode") or "logo"
-    natural = _natural_ink_count(manifest.get("meta"), manifest.get("layers"), manifest.get("palette"))
+    natural = _natural_ink_count(manifest.get("meta"), layers, palette)
     if n < natural:
         svg, meta = _merge_cached_layers(cache_dir, manifest, n)
+        try:
+            labels = _load_cached_labels(cache_dir, manifest)
+        except Exception:
+            labels = None
+        meta = _with_inks(meta, labels, palette, layers)
     else:
         svg = manifest["svg"]
         meta = dict(manifest.get("meta") or {})
@@ -12542,16 +13799,30 @@ def _speed_from_cache(cache_dir, path, colors, inches, mode):
         meta["dropped"] = 0
         meta["colors_requested"] = n
         meta["kind"] = kind
+        labels = None
+        try:
+            labels = _load_cached_labels(cache_dir, manifest)
+        except Exception:
+            labels = None
+        meta = _with_inks(meta, labels, palette, layers)
     meta["ms"] = int((time.time() - t0) * 1000)
     return svg, meta
 
 
-def vectorize(path: str, inches: float = 10.0, colors=None, mode: str = "auto", cache_dir=None, from_cache=None):
-    global _SPEED_SINK, _LAST_PLATES
-    if from_cache and colors is not None:
+def vectorize(path: str, inches: float = 10.0, colors=None, mode: str = "auto", cache_dir=None, from_cache=None, merge=None, keep=None, list_inks=False, smooth=None, corners=None):
+    global _SPEED_SINK, _LAST_PLATES, _SMOOTH_CTRL, _CORNERS_CTRL, _SMOOTH_APPLIED
+    _SMOOTH_CTRL = smooth
+    _CORNERS_CTRL = corners
+    _SMOOTH_APPLIED = False
+    if from_cache and (colors is not None or merge or keep or list_inks):
         try:
-            return _speed_from_cache(from_cache, path, colors, inches, mode)
+            return _speed_from_cache(
+                from_cache, path, colors, inches, mode, merge=merge, keep=keep, list_inks=list_inks
+            )
+        except ColourPickError:
+            raise
         except Exception as e:
+            _SMOOTH_APPLIED = False
             sys.stderr.write(f"speed-cache fallback: {e}\n")
     _LAST_PLATES = None
     _SPEED_SINK = (
@@ -12575,8 +13846,41 @@ def vectorize(path: str, inches: float = 10.0, colors=None, mode: str = "auto", 
         plates = _LAST_PLATES
         _SPEED_SINK = None
         _LAST_PLATES = None
+    plate_labels = None if not plates else plates.get("labels")
+    plate_palette = None if not plates else plates.get("palette_rgb")
+    plate_layers = None if not plates else plates.get("layers")
+    if list_inks:
+        if plate_labels is None or plate_palette is None:
+            raise ColourPickError("no ink map for --list-inks", svg=svg, meta=meta)
+        return "", _ink_document(plate_labels, plate_palette, plate_layers)
+    if merge or keep:
+        try:
+            if plate_labels is None or plate_palette is None:
+                raise RuntimeError("no plate map")
+            svg, meta = _colour_drop_svg(
+                plate_labels,
+                plate_palette,
+                plate_layers,
+                plates.get("sx"),
+                plates.get("sy"),
+                plates.get("width_in"),
+                plates.get("height_in"),
+                plates.get("paper_hex") or (meta or {}).get("paper"),
+                None if colors is None else int(colors),
+                meta,
+                merge=merge,
+                keep=keep,
+            )
+        except ColourPickError as e:
+            if e.svg is None:
+                e.svg = svg
+                e.meta = meta
+            raise
+        except Exception as e:
+            sys.stderr.write(f"colour-drop failed: {e}\n")
+        return svg, _with_inks(meta, plate_labels, plate_palette, plate_layers)
     if colors is None:
-        return svg, meta
+        return svg, _with_inks(meta, plate_labels, plate_palette, plate_layers)
     try:
         natural = int((meta or {}).get("colors") or 0)
     except (TypeError, ValueError):
@@ -12585,14 +13889,14 @@ def vectorize(path: str, inches: float = 10.0, colors=None, mode: str = "auto", 
         if isinstance(meta, dict):
             meta = dict(meta)
             meta["colors_requested"] = int(colors)
-        return svg, meta
+        return svg, _with_inks(meta, plate_labels, plate_palette, plate_layers)
     try:
-        if not plates or plates.get("labels") is None:
+        if plate_labels is None or plate_palette is None:
             raise RuntimeError("no plate map")
         svg, meta = _colour_drop_svg(
-            plates.get("labels"),
-            plates.get("palette_rgb"),
-            plates.get("layers"),
+            plate_labels,
+            plate_palette,
+            plate_layers,
             plates.get("sx"),
             plates.get("sy"),
             plates.get("width_in"),
@@ -12603,7 +13907,7 @@ def vectorize(path: str, inches: float = 10.0, colors=None, mode: str = "auto", 
         )
     except Exception as e:
         sys.stderr.write(f"colour-drop failed: {e}\n")
-    return svg, meta
+    return svg, _with_inks(meta, plate_labels, plate_palette, plate_layers)
 
 def _vectorize_body(path: str, inches: float = 10.0, colors=None, mode: str = "auto"):
     t0 = time.time()
@@ -13085,27 +14389,98 @@ def _vectorize_body(path: str, inches: float = 10.0, colors=None, mode: str = "a
         assign, palette, src_white, alpha=a_white
     )
     if kind == "logo" and glyph is None and ov_mask is None:
+        global _SMOOTH_APPLIED
+        trace_assign = assign
+        _sig_try = _logo_smooth_sigma(max(assign.shape) if assign.size else 1)
+        _SMOOTH_APPLIED = False
+        # The vote map, after despeckle, when the vote actually moved the
+        # plates. None means this image stays on the base fit and is traced once.
+        smoothed_labels = None
+        if _sig_try > 0.05:
+            try:
+                smoothed = _smooth_logo_assign(assign, palette, _sig_try)
+                moved = float(np.mean(np.asarray(smoothed) != np.asarray(assign)))
+                # A vote that only nudges edges is not worth the tighter fit:
+                # it is what packed nodes and specks on clean logos. The
+                # despeckle runs after that decision so it cannot pull a
+                # clean logo over the line, and the stored plates are what
+                # --from-cache retraces.
+                if moved >= _SMOOTH_KEEP_FRAC:
+                    try:
+                        smoothed = _despeckle_vote_plates(assign, smoothed, palette)
+                    except Exception as e:
+                        sys.stderr.write(f"logo despeckle skipped: {e}\n")
+                    smoothed_labels = smoothed
+            except Exception as e:
+                sys.stderr.write(f"logo smooth skipped: {e}\n")
+                smoothed_labels = None
+        long_side = max(assign.shape) if assign.size else 1
+        min_area_px = max(4 if keylined else 10, int(0.00003 * assign.size))
+        paper_hex = to_hex(paper_rgb)
         try:
-            glayers, gaux = logo_potrace_mask_layers(
-                assign.astype(np.int32),
-                palette,
-                sx,
-                sy,
-                min_area_px=max(4 if keylined else 10, int(0.00003 * assign.size)),
-            )
-            gpaths = sum(len(L.get("paths") or []) for L in glayers)
-            if glayers and gpaths >= 1:
-                paper_hex = to_hex(paper_rgb)
+            built = None
+            if smoothed_labels is not None:
+                # Second trace only when the vote is kept. Both fits are the
+                # SVGs this image just produced. Keep the tight one only when
+                # it does not add closed specks. A per-plate mix would open
+                # the shared seam (the two fits do not land on the same crack),
+                # so a miss replaces the whole image with the base fit.
+                fit_s = _logo_fit_knobs(long_side, applied=True)
+                fit_u = _logo_fit_knobs(long_side, applied=False)
+
+                def _one(labels, fit):
+                    try:
+                        return _logo_mask_svg(
+                            labels, palette, sx, sy, width_in, height_in,
+                            paper_hex, min_area_px, fit,
+                        )
+                    except Exception as e:
+                        sys.stderr.write(f"logo potrace mask failed: {e}\n")
+                        return None
+
+                from concurrent.futures import ThreadPoolExecutor
+                with ThreadPoolExecutor(max_workers=2) as pool:
+                    fut_s = pool.submit(_one, smoothed_labels, fit_s)
+                    fut_u = pool.submit(_one, assign, fit_u)
+                    res_s = fut_s.result()
+                    res_u = fut_u.result()
+                def _count(res):
+                    if res is None:
+                        return None
+                    try:
+                        return _svg_speck_count(res[0])
+                    except Exception as e:
+                        sys.stderr.write(f"logo speck count failed: {e}\n")
+                        return None
+
+                n_s = _count(res_s)
+                n_u = _count(res_u)
+                if res_s is not None and res_u is not None and n_s is not None and n_u is not None and n_s <= n_u:
+                    _SMOOTH_APPLIED = True
+                    trace_assign = smoothed_labels
+                    built = res_s
+                elif res_u is not None:
+                    _SMOOTH_APPLIED = False
+                    trace_assign = assign
+                    built = res_u
+                    if n_s is not None and n_u is not None and n_s > n_u:
+                        sys.stderr.write(f"logo smooth fallback: specks {n_s} > {n_u}\n")
+                elif res_s is not None:
+                    _SMOOTH_APPLIED = True
+                    trace_assign = smoothed_labels
+                    built = res_s
+            else:
+                _SMOOTH_APPLIED = False
+                built = _logo_mask_svg(
+                    assign, palette, sx, sy, width_in, height_in, paper_hex,
+                    min_area_px, _logo_fit_knobs(long_side, applied=False),
+                )
+            if built is not None:
+                svg, glayers, gaux = built
+                _amax, _opt, _sig = _logo_fit_knobs(long_side)
+                gpaths = sum(len(L.get("paths") or []) for L in glayers)
                 # Whisker ridges are already in the keyline assign mask.
                 # A second Schneider stroke on top doubles them.
-                svg = svg_from_layers_with_gaps(
-                    glayers,
-                    width_in,
-                    height_in,
-                    paper_hex,
-                    gap_strokes=[],
-                    overlay_strokes=[],
-                )
                 n_paths = len(re.findall(r"<path\b", svg, re.I)) or gpaths
                 meta = {
                     "engine": "decoclub-vector",
@@ -13129,13 +14504,16 @@ def _vectorize_body(path: str, inches: float = 10.0, colors=None, mode: str = "a
                     "jpeg_solidify": solid_meta or {"applied": False},
                     "jpeg_invented_sliver": sliver_meta or {"applied": False},
                     "polish": {},
+                    "smooth_sigma": round(float(_sig), 3),
+                    "smooth_opttol": _opt,
+                    "smooth_alphamax": round(float(_amax), 3),
                 }
                 return _speed_finish(
                     svg,
                     meta,
                     kind=kind,
                     trace="logo-potrace-mask",
-                    labels=np.asarray(assign, dtype=np.int16),
+                    labels=np.asarray(trace_assign, dtype=np.int16),
                     palette_rgb=np.asarray(palette, dtype=np.float64).reshape(-1, 3),
                     layers=glayers,
                     width_in=width_in,
@@ -13146,6 +14524,7 @@ def _vectorize_body(path: str, inches: float = 10.0, colors=None, mode: str = "a
                 )
         except Exception as e:
             sys.stderr.write(f"logo potrace mask failed: {e}\n")
+            _SMOOTH_APPLIED = False
             pass
 
     def emit(mask, rgb_c, *, alphamax=1.0, opttol=0.2, turdsize=2, smooth=0.55, opacity=None, suffix=""):
@@ -13333,27 +14712,113 @@ def _vectorize_body(path: str, inches: float = 10.0, colors=None, mode: str = "a
     )
 
 
+def _write_svg(path, svg):
+    if not path:
+        return
+    if not svg or "<path" not in str(svg).lower():
+        sys.stderr.write("colour-pick error: refused to write an empty SVG\n")
+        return
+    os.makedirs(os.path.dirname(os.path.abspath(path)) or ".", exist_ok=True)
+    with open(path, "w", encoding="utf-8") as f:
+        f.write(svg)
+
+
 def main():
     ap = argparse.ArgumentParser(description="DecoClub local raster→SVG")
     ap.add_argument("--input", "-i", required=True)
-    ap.add_argument("--output", "-o", required=True)
+    ap.add_argument("--output", "-o", default=None)
     ap.add_argument("--colors", type=int, default=None)
     ap.add_argument("--inches", type=float, default=10.0)
     ap.add_argument("--mode", default="auto", choices=["auto", "logo", "art", "poster"])
     ap.add_argument("--cache-dir", default=None, help="Save pre-quantisation plates for a later colour drop")
     ap.add_argument("--from-cache", default=None, help="With --colors N, reuse a cache and drop inks")
-    args = ap.parse_args()
-    svg, meta = vectorize(
-        args.input,
-        inches=args.inches,
-        colors=args.colors,
-        mode=args.mode,
-        cache_dir=args.cache_dir,
-        from_cache=args.from_cache,
+    ap.add_argument(
+        "--merge",
+        default=None,
+        help="Force dropped inks: SRC=DST[,SRC=DST...] with #rrggbb. Drops SRC even without --colors",
     )
-    os.makedirs(os.path.dirname(os.path.abspath(args.output)) or ".", exist_ok=True)
-    with open(args.output, "w", encoding="utf-8") as f:
-        f.write(svg)
+    ap.add_argument(
+        "--keep",
+        default=None,
+        help="With --colors N, comma-separated #rrggbb inks that survive. The rest merge into the nearest kept ink",
+    )
+    ap.add_argument(
+        "--list-inks",
+        action="store_true",
+        help="Print natural ink JSON to stdout and exit. No SVG is written",
+    )
+    ap.add_argument(
+        "--smooth",
+        type=float,
+        default=None,
+        help="Outline smooth 0-100. 0 is the unsmoothed fit. Default is on.",
+    )
+    ap.add_argument(
+        "--corners",
+        type=float,
+        default=None,
+        help="Corner sharpness 0-100 (potrace alphamax). Default leaves alphamax at 1.0.",
+    )
+    args, unknown = ap.parse_known_args()
+    if unknown:
+        sys.stderr.write("ignored unknown flags: " + " ".join(unknown) + "\n")
+
+    def _clip_slider(value, name):
+        if value is None:
+            return None
+        clipped = max(0.0, min(100.0, float(value)))
+        if clipped != float(value):
+            sys.stderr.write(f"{name} {value} clamped to {clipped:g}\n")
+        return clipped
+
+    smooth = _clip_slider(args.smooth, "--smooth")
+    corners = _clip_slider(args.corners, "--corners")
+    merge = str(args.merge).strip() if args.merge else None
+    keep = str(args.keep).strip() if args.keep else None
+    if merge == "":
+        merge = None
+    if keep == "":
+        keep = None
+    if keep and args.colors is None and not args.list_inks:
+        sys.stderr.write("colour-pick error: --keep requires --colors N\n")
+        return 2
+    if not args.list_inks and not args.output:
+        sys.stderr.write("colour-pick error: --output is required unless --list-inks is set\n")
+        return 2
+    try:
+        if merge:
+            _parse_merge_spec(merge)
+        if keep:
+            _parse_keep_spec(keep)
+    except ColourPickError as e:
+        sys.stderr.write(f"colour-pick error: {e}\n")
+        return 2
+    try:
+        svg, meta = vectorize(
+            args.input,
+            inches=args.inches,
+            colors=args.colors,
+            mode=args.mode,
+            cache_dir=args.cache_dir,
+            from_cache=args.from_cache,
+            merge=merge,
+            keep=keep,
+            list_inks=bool(args.list_inks),
+            smooth=smooth,
+            corners=corners,
+        )
+    except ColourPickError as e:
+        sys.stderr.write(f"colour-pick error: {e}\n")
+        if not args.list_inks:
+            _write_svg(args.output, e.svg)
+        return 2
+    if args.list_inks:
+        sys.stdout.write(json.dumps(meta) + "\n")
+        return 0
+    if not svg or "<path" not in str(svg).lower():
+        sys.stderr.write("colour-pick error: refused to write an empty SVG\n")
+        return 1
+    _write_svg(args.output, svg)
     sys.stdout.write(json.dumps(meta) + "\n")
     return 0
 
