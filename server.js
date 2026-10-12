@@ -798,6 +798,41 @@ function attachTraceCache(opts, job, body) {
   return opts;
 }
 
+/* Trace cache is regenerable; keep it from filling the data volume (ENOSPC 2026-10-12). */
+const TRACE_CACHE_MAX_AGE_MS = 6 * 3600 * 1000;
+const TRACE_CACHE_MAX_BYTES = 150 * 1024 * 1024;
+function dirBytes(d) {
+  let n = 0;
+  try {
+    for (const e of fs.readdirSync(d, { withFileTypes: true })) {
+      const f = path.join(d, e.name);
+      if (e.isDirectory()) n += dirBytes(f);
+      else { try { n += fs.statSync(f).size; } catch (x) { /* ignore */ } }
+    }
+  } catch (x) { /* ignore */ }
+  return n;
+}
+function pruneTraceCache() {
+  const root = path.join(DATA, "trace-cache");
+  let ents;
+  try { ents = fs.readdirSync(root, { withFileTypes: true }).filter(function (e) { return e.isDirectory(); }); } catch (e) { return; }
+  const now = Date.now();
+  const dirs = ents.map(function (e) {
+    const d = path.join(root, e.name);
+    let m = 0; try { m = fs.statSync(d).mtimeMs; } catch (x) { /* ignore */ }
+    return { d: d, m: m, b: dirBytes(d) };
+  }).sort(function (a, b) { return b.m - a.m; });
+  let total = 0, removed = 0;
+  for (const x of dirs) {
+    if (now - x.m > TRACE_CACHE_MAX_AGE_MS || total + x.b > TRACE_CACHE_MAX_BYTES) {
+      try { fs.rmSync(x.d, { recursive: true, force: true }); removed++; } catch (e) { /* ignore */ }
+    } else total += x.b;
+  }
+  if (removed) console.log("trace-cache pruned", removed, "dirs; kept", Math.round(total / 1048576), "MB");
+}
+try { pruneTraceCache(); } catch (e) { console.error("trace-cache prune failed", e); }
+setInterval(function () { try { pruneTraceCache(); } catch (e) { /* ignore */ } }, 15 * 60 * 1000).unref();
+
 function scheduleVectorize(jobId) {
   /* Upload stays snappy: do NOT auto-vectorize. User clicks Vectorize. */
   return;
