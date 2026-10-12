@@ -848,6 +848,24 @@ try {
     try { console.log("data-dir", n, "entries", fs.readdirSync(d).length); } catch (x) { /* ignore */ }
   });
 } catch (e) { console.error("data-dir usage failed", e.message); }
+/* Uploads older than 30 days are deleted (David OK 2026-10-12); volume is 500 MB. */
+const UPLOAD_MAX_AGE_MS = 30 * 24 * 3600 * 1000;
+function pruneOldUploads() {
+  let ents; try { ents = fs.readdirSync(UPLOADS, { withFileTypes: true }); } catch (e) { return; }
+  const now = Date.now(); let n = 0, freed = 0;
+  for (const e of ents) {
+    const f = path.join(UPLOADS, e.name);
+    try {
+      const st = fs.statSync(f);
+      if (now - st.mtimeMs <= UPLOAD_MAX_AGE_MS) continue;
+      const b = e.isDirectory() ? dirBytes(f) : st.size;
+      fs.rmSync(f, { recursive: true, force: true }); n++; freed += b;
+    } catch (x) { /* ignore */ }
+  }
+  console.log("uploads pruned", n, "older than 30d; freed", Math.round(freed / 1048576), "MB");
+}
+try { pruneOldUploads(); } catch (e) { console.error("upload prune failed", e.message); }
+setInterval(function () { try { pruneOldUploads(); } catch (e) { /* ignore */ } }, 6 * 3600 * 1000).unref();
 try { pruneTraceCache(); } catch (e) { console.error("trace-cache prune failed", e); }
 setInterval(function () { try { pruneTraceCache(); } catch (e) { /* ignore */ } }, 15 * 60 * 1000).unref();
 
