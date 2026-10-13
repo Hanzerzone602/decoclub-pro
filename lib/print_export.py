@@ -3,10 +3,10 @@
 TIFF / PNG (300 DPI at true print size) with optional DTF white underbase.
 
 Underbase rules (DTF): white only under fully opaque pixels, choked in
-by 0.25-0.5 px so no white shows at the edges.
+by 1-4 px (default 2) so no white shows at the edges.
 
 usage: print_export.py FORMAT in.svg out.file --width-in W [--height-in H]
-       [--dpi 300] [--underbase] [--choke 0.35]
+       [--dpi 300] [--underbase] [--choke 2]
 """
 import argparse, io, math, re, subprocess, sys, xml.etree.ElementTree as ET
 
@@ -42,7 +42,7 @@ def underbase(img, choke):
     import numpy as np
     from PIL import Image
     from scipy import ndimage
-    choke = min(0.5, max(0.25, float(choke)))
+    choke = min(4.0, max(1.0, float(choke)))
     alpha = np.asarray(img.getchannel("A"))
     solid = alpha >= 255
     # distance (px) from each solid pixel to nearest non-solid pixel
@@ -192,7 +192,7 @@ def main():
     ap.add_argument("svg"); ap.add_argument("out")
     ap.add_argument("--width-in", type=float, default=0); ap.add_argument("--height-in", type=float, default=0)
     ap.add_argument("--dpi", type=int, default=300); ap.add_argument("--underbase", action="store_true")
-    ap.add_argument("--choke", type=float, default=0.35)
+    ap.add_argument("--choke", type=float, default=2.0)
     a = ap.parse_args()
     root = ET.parse(a.svg).getroot()
     if a.format == "dxf":
@@ -211,7 +211,7 @@ def main():
                 ub = underbase(img, a.choke)
                 ub.info["dpi"] = dpi
                 img.save(buf, "TIFF", dpi=dpi, compression="tiff_lzw", save_all=True, append_images=[ub],
-                         description="DecoClub Pro: page 1 art RGBA, page 2 DTF white underbase (choked %.2fpx)" % min(0.5, max(0.25, a.choke)))
+                         description="DecoClub Pro: page 1 art RGBA, page 2 DTF white underbase (choked %.2fpx)" % min(4.0, max(1.0, a.choke)))
             else:
                 img.save(buf, "TIFF", dpi=dpi, compression="tiff_lzw")
         data = buf.getvalue()

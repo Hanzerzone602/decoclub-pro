@@ -1394,7 +1394,7 @@ function printExport(svgAbs, fmt, o) {
   const py = process.env.INVENT_WARP_PYTHON && fs.existsSync(process.env.INVENT_WARP_PYTHON) ? process.env.INVENT_WARP_PYTHON : "python3";
   const args = [path.join(__dirname, "lib", "print_export.py"), fmt, tmpIn, tmpOut, "--width-in", String(Number(o.widthIn) || 10), "--dpi", "300"];
   if (Number(o.heightIn)) args.push("--height-in", String(Number(o.heightIn)));
-  if (o.underbase) args.push("--underbase", "--choke", "0.35");
+  if (o.underbase) args.push("--underbase", "--choke", "2");
   return new Promise(function (resolve, reject) {
     execFile(py, args, { timeout: 120000, maxBuffer: 1 << 20 }, function (err, _so, se) {
       try {
