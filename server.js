@@ -1066,7 +1066,7 @@ function ensureDemoJob(db) {
 }
 
 
-const MIME = { ".html": "text/html; charset=utf-8", ".css": "text/css; charset=utf-8", ".js": "text/javascript; charset=utf-8", ".svg": "image/svg+xml", ".png": "image/png", ".jpg": "image/jpeg", ".jpeg": "image/jpeg", ".gif": "image/gif", ".webp": "image/webp", ".pdf": "application/pdf", ".json": "application/json", ".plt": "application/vnd.hp-hpgl", ".txt": "text/plain; charset=utf-8", ".eps": "application/postscript", ".dst": "application/octet-stream", ".exp": "application/octet-stream", ".pes": "application/octet-stream", ".csv": "text/csv; charset=utf-8" };
+const MIME = { ".html": "text/html; charset=utf-8", ".css": "text/css; charset=utf-8", ".js": "text/javascript; charset=utf-8", ".svg": "image/svg+xml", ".png": "image/png", ".jpg": "image/jpeg", ".jpeg": "image/jpeg", ".gif": "image/gif", ".webp": "image/webp", ".pdf": "application/pdf", ".dxf": "application/dxf", ".tiff": "image/tiff", ".json": "application/json", ".plt": "application/vnd.hp-hpgl", ".txt": "text/plain; charset=utf-8", ".eps": "application/postscript", ".dst": "application/octet-stream", ".exp": "application/octet-stream", ".pes": "application/octet-stream", ".csv": "text/csv; charset=utf-8" };
 function send(res, code, body, headers) {
   headers = headers || {};
   const payload = Buffer.isBuffer(body) ? body : Buffer.from(body || "");
@@ -1382,6 +1382,30 @@ function canSeeJob(user, job) {
   if (!user || !job) return false;
   if (canRunFloor(user)) return job.shop_id === user.shop_id;
   return job.client_id === user.id;
+}
+// DXF / PDF / TIFF / 300-DPI PNG (+ DTF white underbase) from the production SVG.
+function printExport(svgAbs, fmt, o) {
+  const { execFile } = require("child_process");
+  const os = require("os");
+  const svgText = stripPaperUnderlaySvg(fs.readFileSync(svgAbs, "utf8"));
+  const tmpIn = path.join(os.tmpdir(), "plx-" + uid() + ".svg");
+  const tmpOut = tmpIn.replace(/\.svg$/, "." + fmt);
+  fs.writeFileSync(tmpIn, svgText);
+  const py = process.env.INVENT_WARP_PYTHON && fs.existsSync(process.env.INVENT_WARP_PYTHON) ? process.env.INVENT_WARP_PYTHON : "python3";
+  const args = [path.join(__dirname, "lib", "print_export.py"), fmt, tmpIn, tmpOut, "--width-in", String(Number(o.widthIn) || 10), "--dpi", "300"];
+  if (Number(o.heightIn)) args.push("--height-in", String(Number(o.heightIn)));
+  if (o.underbase) args.push("--underbase", "--choke", "0.35");
+  return new Promise(function (resolve, reject) {
+    execFile(py, args, { timeout: 120000, maxBuffer: 1 << 20 }, function (err, _so, se) {
+      try {
+        if (err) return reject(new Error(String(se || err.message)));
+        resolve(fs.readFileSync(tmpOut));
+      } finally {
+        try { fs.unlinkSync(tmpIn); } catch (e) {}
+        try { fs.unlinkSync(tmpOut); } catch (e) {}
+      }
+    });
+  });
 }
 function download(res, filename, body, type) {
   send(res, 200, body, { "Content-Type": type, "Content-Disposition": 'attachment; filename="' + filename + '"' });
@@ -2480,6 +2504,17 @@ async function handleApi(req, res, url) {
       const abs = path.join(UPLOADS, path.basename(job.file_path));
       if (fs.existsSync(abs)) {
         return download(res, "decoclub-" + job.id.slice(0, 8) + "-art.png", fs.readFileSync(abs), "image/png");
+      }
+    }
+    const printFmt = { "art.dxf": ["dxf", "application/dxf"], "art.pdf": ["pdf", "application/pdf"], "art.tiff": ["tiff", "image/tiff"], "art-dtf.tiff": ["tiff", "image/tiff", true], "art-300dpi.png": ["png", "image/png"], "art-underbase.png": ["underbase", "image/png"] }[expFile[2]];
+    if (printFmt && job.vector_svg) {
+      const abs = path.join(UPLOADS, path.basename(job.vector_svg));
+      if (!fs.existsSync(abs)) return json(res, 404, { error: "Vector art not found" });
+      try {
+        const out = await printExport(abs, printFmt[0], { widthIn: job.width_in, heightIn: job.height_in, underbase: !!printFmt[2] });
+        return download(res, "decoclub-" + job.id.slice(0, 8) + "-" + expFile[2], out, printFmt[1]);
+      } catch (err) {
+        return json(res, 500, { error: "Print export failed: " + String(err && err.message || err).slice(0, 300) });
       }
     }
     if (expFile[2] === "art.eps" && job.vector_eps) {

@@ -932,8 +932,16 @@ async function fillArt(el, job, shopControls) {
         ${shopControls && (layers.length || job.vector_svg) ? `<div class="export-grid export-hero art-dl">
           <a href="/api/export/${job.id}/art.svg">Download SVG</a>
           <a href="/api/export/${job.id}/art.eps">Download EPS</a>
+          <a href="/api/export/${job.id}/art.pdf">Download PDF</a>
+          <a href="/api/export/${job.id}/art.dxf">Download DXF</a>
         </div>
-        <p class="muted">Production SVG / EPS · real curves</p>` : ""}
+        <div class="export-grid art-dl">
+          <a href="/api/export/${job.id}/art-300dpi.png" title="Transparent PNG, 300 DPI at print size">PNG 300 DPI</a>
+          <a href="/api/export/${job.id}/art.tiff" title="Transparent TIFF, 300 DPI at print size">TIFF 300 DPI</a>
+          <a href="/api/export/${job.id}/art-dtf.tiff" title="TIFF page 2 = white underbase, choked 0.35 px, none under semi-transparent pixels">DTF TIFF + white</a>
+          <a href="/api/export/${job.id}/art-underbase.png" title="White underbase only, choked 0.35 px">White underbase</a>
+        </div>
+        <p class="muted">Vector: SVG / EPS / PDF / DXF (laser + cutter) · Raster: 300 DPI at true print size, transparent · DTF white choked in, none under soft edges</p>` : ""}
         ${shopControls && job.file_path && !job.vector_svg ? `<div class="export-grid export-hero art-dl">
           <a href="/api/export/${job.id}/art.png" id="dlArtPng">Download PNG</a>
         </div>
@@ -2159,6 +2167,10 @@ function fillProduce(el, job, shopControls) {
     <div class="export-grid export-hero">
       <a href="/api/export/${job.id}/art.svg">SVG</a>
       <a href="/api/export/${job.id}/art.eps">EPS</a>
+      <a href="/api/export/${job.id}/art.pdf">PDF</a>
+      <a href="/api/export/${job.id}/art.dxf">DXF</a>
+      <a href="/api/export/${job.id}/art.tiff">TIFF 300</a>
+      <a href="/api/export/${job.id}/art-dtf.tiff">DTF TIFF + white</a>
       ${canDigitize() ? `<a href="/api/export/${job.id}/design.dst">DST</a>
       <a href="/api/export/${job.id}/design.exp">EXP</a>
       <a href="/api/export/${job.id}/design.pes">PES</a>` : ""}
