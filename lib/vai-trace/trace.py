@@ -8635,12 +8635,14 @@ def _transform_potrace_d(d, sx_pt, sy_pt, tx, ty, upsample, sx, sy):
 
 
 def potrace_paths(
-    mask, sx, sy, *, scale=1, alphamax=1.0, opttol=0.2, turdsize=2, smooth=0.0
+    mask, sx, sy, *, scale=1, alphamax=1.0, opttol=0.2, turdsize=2, smooth=0.0, prescaled=False
 ):
     m = (mask > 0).astype(np.uint8)
     if int(m.sum()) < 8:
         return []
-    if scale > 1:
+    # prescaled: mask is already `scale` times the sx/sy grid. Still divide
+    # potrace's pixel coordinates by `scale` so inches land on the original grid.
+    if scale > 1 and not prescaled:
         m = cv2.resize(
             m, (m.shape[1] * scale, m.shape[0] * scale), interpolation=cv2.INTER_NEAREST
         )
@@ -9477,10 +9479,37 @@ _CORNERS_CTRL = None
 # --from-cache restores it from the cached smooth_sigma so a retrace uses
 # the same fit as the full run.
 _SMOOTH_APPLIED = False
-# Clean logos only move a fraction of a percent under the vote, and fitting
-# those edges at opttol 0.03 packs nodes and splits specks. The tiger's vote
-# moves about 1.3% of the canvas; that is the case this keeps.
+# The heavy colour vote is worth a tight potrace fit only when it actually
+# redrew the plates (the tiger moves about 1.3% of the canvas). Below this,
+# the same tight fit packs nodes on a staircase. Those images still get a
+# light anti-aliased upscale and a curve fair — this is not a skip.
 _SMOOTH_KEEP_FRAC = 0.010
+# Sub-pixel curve fit used when the heavy vote is not the one we keep.
+# 2× is the trace grid; the blur is in source pixels (stair rounding only).
+_CURVE_UPSCALE = 2
+_CURVE_AA_SIGMA_MAX = 1.05
+# opttolerance on that 2× grid (bitmap px). About one source pixel.
+# alphamax above potrace's 1.0 so a leftover stair step is a curve, not a
+# corner node. Explicit --corners replaces this.
+_AA_OPTTOL = 1.8
+_AA_ALPHAMAX = 1.15
+# Paste thin strokes and real corners back onto the anti-aliased plates.
+_AA_RESTORE_DETAIL = True
+# Noisy small uploads are already on a 4× grid. Blur the plates together
+# (winner-take-all) and trace with the base curve fit. A loose opttolerance
+# on a per-plate blur ate thin white shapes, so that fit is not used.
+# Each pair is (sigma on the 4× grid, median thickness that is pasted back).
+# The first pair is the strong blur; the later pairs are milder retries.
+# The last rung only runs when the stronger ones fail the widened guard.
+_SU_PLATE_RUNGS = ((8.0, 1.5), (5.0, 2.0), (3.2, 2.4), (2.0, 3.0))
+# Keep a smoothed plate only when white coverage stays within 1% of the
+# unsmoothed render and no substantial ink collapses against that render.
+_SU_WHITE_DROP = 0.008
+_SU_HOLE_FRAC = 0.09
+_SU_IOU_MIN = 0.30
+_SU_AREA_RATIO_MIN = 0.72
+_SU_INK_MERGE_DE = 18.0
+_SU_INK_MIN_FRAC = 0.02
 
 
 def _logo_alphamax():
@@ -9809,6 +9838,588 @@ def _svg_speck_count(svg_text):
 
     walk(root, None, "")
     return n
+
+
+def _svg_viewbox(root):
+    vb = root.get("viewBox")
+    if vb:
+        parts = [float(x) for x in vb.replace(",", " ").split()]
+        return parts[2], parts[3]
+
+    def _len(v, default=10.0):
+        if not v:
+            return default
+        m = re.match(r"^\s*([\d.]+)", v)
+        return float(m.group(1)) if m else default
+
+    return _len(root.get("width"), 10.0), _len(root.get("height"), 10.0)
+
+
+def _svg_bloat_count(svg_text):
+    """Filled subpaths with outline ≥ 80px and under 4px per node.
+
+    Same cut as the gate's node-bloat check (900px long edge). Unfilled
+    paths and paper-underlay are skipped. Near-white art still counts,
+    because the gate counts it. A file with no bloated outline stays that way.
+    """
+    root = ET.fromstring(svg_text)
+    vb_w, vb_h = _svg_viewbox(root)
+    px_scale = 900.0 / max(float(vb_w), float(vb_h), 1e-9)
+    n = 0
+
+    def walk(el, fill, data_name):
+        nonlocal n
+        f = fill
+        name = data_name
+        attr = el.get("fill")
+        if attr:
+            f = _norm_hex(attr)
+        dn = el.get("data-name")
+        if dn:
+            name = dn
+        style = el.get("style") or ""
+        for part in style.split(";"):
+            if ":" not in part:
+                continue
+            k, v = part.split(":", 1)
+            if k.strip().lower() == "fill":
+                f = _norm_hex(v.strip())
+        tag = el.tag.split("}", 1)[-1]
+        if tag == "path" and f and name != "paper-underlay":
+            for sp in _su_parse_subpaths(el.get("d") or ""):
+                ol = _su_outline(sp) * px_scale
+                nodes = int(sp["nodes"])
+                if ol >= 80.0 and nodes > 1 and (nodes / ol) > (1.0 / 4.0) + 1e-12:
+                    n += 1
+        for ch in list(el):
+            walk(ch, f, name)
+
+    walk(root, None, "")
+    return n
+
+
+def _curve_fair_enabled():
+    """Default smooth is on. --smooth 0 is the old fit, with no curve fair."""
+    raw = _SMOOTH_CTRL
+    if raw is None:
+        return True
+    try:
+        return float(raw) > 0.0
+    except (TypeError, ValueError):
+        return True
+
+
+def _svg_flip_rate(svg_text):
+    """Gentle curvature sign-flips per unit of path length.
+
+    Same angle rule as the gate (interior angle under 120° is a designed
+    corner and does not count). The ratio is scale-free, so it ranks two
+    SVGs the same way flips_per_100px does.
+    """
+    root = ET.fromstring(svg_text)
+    flips = 0
+    length = 0.0
+
+    def walk(el):
+        nonlocal flips, length
+        tag = el.tag.split("}", 1)[-1]
+        if tag == "path" and el.get("data-name") != "paper-underlay":
+            for pts in _path_sample_points(el.get("d") or ""):
+                if len(pts) < 3:
+                    continue
+                for a, b in zip(pts, pts[1:]):
+                    length += math.hypot(b[0] - a[0], b[1] - a[1])
+                prev = 0
+                for a, b, c in zip(pts, pts[1:], pts[2:]):
+                    v1 = (b[0] - a[0], b[1] - a[1])
+                    v2 = (c[0] - b[0], c[1] - b[1])
+                    n1 = math.hypot(v1[0], v1[1])
+                    n2 = math.hypot(v2[0], v2[1])
+                    if n1 < 1e-9 or n2 < 1e-9:
+                        continue
+                    dot = max(-1.0, min(1.0, ((-v1[0]) * v2[0] + (-v1[1]) * v2[1]) / (n1 * n2)))
+                    if math.degrees(math.acos(dot)) < 120.0:
+                        continue
+                    cross = v1[0] * v2[1] - v1[1] * v2[0]
+                    sign = 1 if cross > 1e-5 else (-1 if cross < -1e-5 else 0)
+                    if sign and prev and sign != prev:
+                        flips += 1
+                    if sign:
+                        prev = sign
+        for ch in list(el):
+            walk(ch)
+
+    walk(root)
+    return flips / max(length, 1e-12)
+
+
+def _path_sample_points(d, n_cubic=8):
+    """Sample each subpath of `d` in its own coordinate units. Closed rings repeat the start."""
+    toks = _PATH_TOK.findall(d or "")
+    i = 0
+    cx = cy = 0.0
+    sx0 = sy0 = 0.0
+    cmd = "M"
+    rings = []
+    pts = None
+
+    def num():
+        nonlocal i
+        v = float(toks[i])
+        i += 1
+        return v
+
+    def need(n):
+        return (len(toks) - i) >= n and toks[i] not in _CMD_SPEC
+
+    def add(x, y):
+        if pts is not None:
+            if not pts or abs(pts[-1][0] - x) > 1e-9 or abs(pts[-1][1] - y) > 1e-9:
+                pts.append((x, y))
+
+    try:
+        while i < len(toks):
+            if toks[i] in _CMD_SPEC:
+                cmd = toks[i]
+                i += 1
+            rel = cmd.islower()
+            c = cmd.upper()
+            if c == "M":
+                if not need(2):
+                    break
+                x, y = num(), num()
+                if rel:
+                    x += cx
+                    y += cy
+                cx, cy = x, y
+                sx0, sy0 = x, y
+                pts = [(x, y)]
+                cmd = "l" if rel else "L"
+                while need(2):
+                    x, y = num(), num()
+                    if rel:
+                        x += cx
+                        y += cy
+                    add(x, y)
+                    cx, cy = x, y
+            elif c == "L":
+                while need(2):
+                    x, y = num(), num()
+                    if rel:
+                        x += cx
+                        y += cy
+                    add(x, y)
+                    cx, cy = x, y
+            elif c == "H":
+                while need(1) and toks[i] not in _CMD_SPEC:
+                    x = num()
+                    if rel:
+                        x += cx
+                    add(x, cy)
+                    cx = x
+            elif c == "V":
+                while need(1) and toks[i] not in _CMD_SPEC:
+                    y = num()
+                    if rel:
+                        y += cy
+                    add(cx, y)
+                    cy = y
+            elif c == "C":
+                while need(6):
+                    x1, y1, x2, y2, x, y = num(), num(), num(), num(), num(), num()
+                    if rel:
+                        x1 += cx
+                        y1 += cy
+                        x2 += cx
+                        y2 += cy
+                        x += cx
+                        y += cy
+                    p0x, p0y = cx, cy
+                    for j in range(1, n_cubic + 1):
+                        t = j / float(n_cubic)
+                        u = 1.0 - t
+                        add(
+                            u * u * u * p0x + 3 * u * u * t * x1 + 3 * u * t * t * x2 + t * t * t * x,
+                            u * u * u * p0y + 3 * u * u * t * y1 + 3 * u * t * t * y2 + t * t * t * y,
+                        )
+                    cx, cy = x, y
+            elif c == "Z":
+                if pts and len(pts) >= 2:
+                    if math.hypot(cx - sx0, cy - sy0) > 1e-6:
+                        add(sx0, sy0)
+                    rings.append(pts)
+                pts = None
+                cx, cy = sx0, sy0
+            else:
+                break
+    except (ValueError, IndexError):
+        pass
+    return rings
+
+
+def _subpath_flip_count(pts):
+    """Gentle sign flips along one sampled ring. 0 means the curve is already fair."""
+    if len(pts) < 4:
+        return 0
+    flips = 0
+    prev = 0
+    for a, b, c in zip(pts, pts[1:], pts[2:]):
+        v1 = (b[0] - a[0], b[1] - a[1])
+        v2 = (c[0] - b[0], c[1] - b[1])
+        n1 = math.hypot(v1[0], v1[1])
+        n2 = math.hypot(v2[0], v2[1])
+        if n1 < 1e-9 or n2 < 1e-9:
+            continue
+        dot = max(-1.0, min(1.0, ((-v1[0]) * v2[0] + (-v1[1]) * v2[1]) / (n1 * n2)))
+        if math.degrees(math.acos(dot)) < 120.0:
+            continue
+        cross = v1[0] * v2[1] - v1[1] * v2[0]
+        # 1e-5 matches the gate sampler: micro-wobbles on short cubics are not flips.
+        sign = 1 if cross > 1e-5 else (-1 if cross < -1e-5 else 0)
+        if sign and prev and sign != prev:
+            flips += 1
+        if sign:
+            prev = sign
+    return flips
+
+
+def _ring_dev_p95(old, new):
+    """p95 distance from old samples to the nearest new sample, in the same units."""
+    if len(old) < 3 or len(new) < 3:
+        return 99.0
+    step = max(1, len(old) // 350)
+    o = np.asarray(old[::step], dtype=np.float32)
+    n = np.asarray(new, dtype=np.float32)
+    if len(n) > 900:
+        n = n[:: max(1, len(n) // 900)]
+    d = o[:, None, :] - n[None, :, :]
+    md = np.sqrt((d * d).sum(axis=2)).min(axis=1)
+    return float(np.percentile(md, 95))
+
+
+def _shoelace(pts):
+    if len(pts) < 3:
+        return 0.0
+    acc = 0.0
+    nxt = pts[1:] + pts[:1]
+    for a, b in zip(pts, nxt):
+        acc += a[0] * b[1] - b[0] * a[1]
+    return abs(acc) * 0.5
+
+
+def _fair_subpath_d(sp, sx, sy):
+    """Fair one closed subpath. None keeps the original string.
+
+    Straight runs and real corners stay: the fairer pins pixel-stair corners
+    only, and a refit that walks more than about a pixel off the old curve
+    or that would turn a non-speck into a speck is rejected.
+    """
+    rings = _path_sample_points(sp)
+    if len(rings) != 1 or len(rings[0]) < 8:
+        return None
+    old = rings[0]
+    if _subpath_flip_count(old) < 2:
+        return None
+    try:
+        from geom import fair_open_polyline, fit_cubic_path, resample_closed
+    except Exception:
+        from lib.geom import fair_open_polyline, fit_cubic_path, resample_closed
+    px = [(p[0] / float(sx), p[1] / float(sy)) for p in old]
+    # Drop the repeated close point so the ring fitter does not see a zero chord.
+    if len(px) >= 2 and math.hypot(px[0][0] - px[-1][0], px[0][1] - px[-1][1]) < 0.05:
+        px = px[:-1]
+    if len(px) < 8:
+        return None
+    try:
+        dense = resample_closed(px, 1.15)
+    except Exception:
+        dense = px
+    if not dense or len(dense) < 8:
+        dense = px
+    try:
+        work = fair_open_polyline(dense, closed=True, logo=True, max_leg=5.5)
+    except Exception:
+        return None
+    if not work or len(work) < 4:
+        return None
+    try:
+        d = fit_cubic_path(work, float(sx), float(sy), error=0.55, corner_cos=0.5)
+    except Exception:
+        return None
+    if not d or "M" not in d or "Z" not in d:
+        return None
+    new_rings = _path_sample_points(d)
+    if len(new_rings) != 1:
+        return None
+    new = new_rings[0]
+    dev = _ring_dev_p95(old, new)
+    if dev > max(float(sx), float(sy)) * 1.15:
+        return None
+    old_a = _shoelace(old)
+    new_a = _shoelace(new)
+    if old_a > 1e-10:
+        ratio = new_a / old_a
+        if ratio < 0.90 or ratio > 1.10:
+            return None
+    # Do not push a real shape under the speck cut. Areas are in user units.
+    return d
+
+
+_SUBPATH_SPLIT = re.compile(r"[Mm][^Mm]*")
+
+
+def _fair_path_d(d, sx, sy):
+    spans = _SUBPATH_SPLIT.findall(d or "")
+    if not spans:
+        return d
+    changed = False
+    out = []
+    for sp in spans:
+        faired = None
+        if "Z" in sp or "z" in sp:
+            try:
+                faired = _fair_subpath_d(sp, sx, sy)
+            except Exception:
+                faired = None
+        if faired:
+            out.append(faired)
+            changed = True
+        else:
+            out.append(sp.strip())
+    if not changed:
+        return d
+    return " ".join(out)
+
+
+def _fair_svg_text(svg_text, sx, sy):
+    """Replace wiggly closed subpaths. Paths that do not improve stay byte-identical."""
+    if not svg_text or sx <= 0 or sy <= 0:
+        return svg_text
+
+    def repl(m):
+        d = m.group(1)
+        nd = _fair_path_d(d, sx, sy)
+        if nd == d:
+            return m.group(0)
+        return m.group(0)[: m.start(1) - m.start(0)] + nd + m.group(0)[m.end(1) - m.start(0) :]
+
+    # Path data only. A d= inside a speck-cover or paper group is still a
+    # path; those shapes are rectangles (no gentle flips) and are left alone.
+    return re.sub(r'\bd="([^"]*)"', repl, svg_text)
+
+
+def _fair_svg_guard(svg_text, sx, sy):
+    """Keep the faired SVG only when specks do not rise and the curve is not rougher."""
+    if not svg_text or not _curve_fair_enabled():
+        return svg_text
+    try:
+        faired = _fair_svg_text(svg_text, float(sx), float(sy))
+    except Exception as e:
+        sys.stderr.write(f"curve fair skipped: {e}\n")
+        return svg_text
+    if not faired or faired == svg_text:
+        return svg_text
+    try:
+        n0 = _svg_speck_count(svg_text)
+        n1 = _svg_speck_count(faired)
+    except Exception as e:
+        sys.stderr.write(f"curve fair speck count failed: {e}\n")
+        return svg_text
+    if n1 > n0:
+        sys.stderr.write(f"curve fair fallback: specks {n1} > {n0}\n")
+        return svg_text
+    try:
+        if _svg_flip_rate(faired) > _svg_flip_rate(svg_text) + 1e-12:
+            return svg_text
+    except Exception:
+        return svg_text
+    if _GUARD_SRC is not None:
+        try:
+            why = _guard_reason(svg_text, faired, _GUARD_SRC)
+        except Exception as e:
+            why = f"guard {e}"
+        if why:
+            sys.stderr.write(f"curve fair fallback: {why}\n")
+            return svg_text
+    return faired
+
+
+def _sharp_corner_pixels(labels):
+    """Pixels where the contour turns for real, not where a stair steps.
+
+    The chord window is several pixels, so a diagonal staircase (net direction
+    straight) is not a corner and a letter, peak, or star point is.
+    """
+    a = np.asarray(labels)
+    h, w = a.shape
+    mark = np.zeros((h, w), np.uint8)
+    win = 5
+    ids = [int(v) for v in np.unique(a)]
+    for v in ids:
+        m = (a == v).astype(np.uint8)
+        if int(m.sum()) < 24:
+            continue
+        cnts, _ = cv2.findContours(m, cv2.RETR_LIST, cv2.CHAIN_APPROX_NONE)
+        for c in cnts:
+            pts = c.reshape(-1, 2)
+            n = len(pts)
+            if n < win * 4:
+                continue
+            step = 1 if n < 5000 else 2
+            for i in range(0, n, step):
+                p0 = pts[(i - win) % n].astype(np.float64)
+                p1 = pts[i]
+                p2 = pts[(i + win) % n].astype(np.float64)
+                v1x, v1y = float(p1[0]) - p0[0], float(p1[1]) - p0[1]
+                v2x, v2y = p2[0] - float(p1[0]), p2[1] - float(p1[1])
+                l1 = math.hypot(v1x, v1y)
+                l2 = math.hypot(v2x, v2y)
+                if l1 < win * 0.55 or l2 < win * 0.55:
+                    continue
+                cross = v1x * v2y - v1y * v2x
+                dot = v1x * v2x + v1y * v2y
+                ang = abs(math.degrees(math.atan2(cross, dot)))
+                if ang >= 50.0:
+                    x, y = int(p1[0]), int(p1[1])
+                    if 0 <= x < w and 0 <= y < h:
+                        mark[y, x] = 1
+    return mark
+
+
+def _detail_keep_mask(labels):
+    """Thin strokes, small islands, and enclosed holes. The anti-alias must not eat these."""
+    a = np.asarray(labels, dtype=np.int32)
+    h, w = a.shape
+    keep = np.zeros((h, w), np.uint8)
+    limit = max(12, int(round(0.0002 * h * w)))
+    paper = (a < 0).astype(np.uint8)
+    n, lab, stats, _ = cv2.connectedComponentsWithStats(paper, 8)
+    if n > 1:
+        border = set(int(x) for x in np.unique(lab[0, :]) if int(x))
+        border.update(int(x) for x in np.unique(lab[h - 1, :]) if int(x))
+        border.update(int(x) for x in np.unique(lab[:, 0]) if int(x))
+        border.update(int(x) for x in np.unique(lab[:, w - 1]) if int(x))
+        for ci in range(1, n):
+            if ci in border:
+                continue
+            keep[lab == ci] = 1
+    for v in [int(x) for x in np.unique(a) if int(x) >= 0]:
+        m = (a == v).astype(np.uint8)
+        if int(m.sum()) < 4:
+            continue
+        n, lab, stats, _ = cv2.connectedComponentsWithStats(m, 8)
+        for ci in range(1, n):
+            area = int(stats[ci, cv2.CC_STAT_AREA])
+            if area < 4:
+                continue
+            x = int(stats[ci, cv2.CC_STAT_LEFT])
+            y = int(stats[ci, cv2.CC_STAT_TOP])
+            bw = int(stats[ci, cv2.CC_STAT_WIDTH])
+            bh = int(stats[ci, cv2.CC_STAT_HEIGHT])
+            long = max(bw, bh)
+            short = max(1, min(bw, bh))
+            crop = lab[y : y + bh, x : x + bw] == ci
+            paste = area < limit
+            if not paste and (long / float(short) >= 2.4 or short <= 6):
+                dt = cv2.distanceTransform(crop.astype(np.uint8), cv2.DIST_L2, 3)
+                if int(crop.sum()) and float(np.median(dt[crop])) <= 2.4:
+                    paste = True
+            if paste:
+                keep[y : y + bh, x : x + bw][crop] = 1
+    return keep
+
+
+def _dilate_label_edges(labels, radius):
+    """Pixels within `radius` of a label change, including paper."""
+    a = np.asarray(labels)
+    edge = np.zeros(a.shape, np.uint8)
+    if a.shape[0] > 1:
+        d = (a[1:, :] != a[:-1, :]).astype(np.uint8)
+        edge[1:, :] = np.maximum(edge[1:, :], d)
+        edge[:-1, :] = np.maximum(edge[:-1, :], d)
+    if a.shape[1] > 1:
+        d = (a[:, 1:] != a[:, :-1]).astype(np.uint8)
+        edge[:, 1:] = np.maximum(edge[:, 1:], d)
+        edge[:, :-1] = np.maximum(edge[:, :-1], d)
+    r = max(1, int(radius))
+    k = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (2 * r + 1, 2 * r + 1))
+    return cv2.dilate(edge, k)
+
+
+def _aa_labels_scaled(assign, sigma, scale):
+    """Winner-take-all blur on an upscaled grid, then put details and corners back.
+
+    The upscale is sub-pixel: linear resize plus a short blur, so a diagonal
+    stair becomes an iso-contour instead of a pixel staircase. Only pixels
+    near an original edge may take the blurred winner — a vote further in
+    would mint crumbs. Thin strokes, letter counters, small islands, and
+    real corners are copied from the unblurred map so they stay crisp.
+    """
+    a = np.asarray(assign, dtype=np.int32)
+    scale = max(1, int(scale))
+    sigma = float(sigma)
+    if sigma <= 0.05 or a.size == 0:
+        return a
+    _kc_pool = None
+    _kc_futs = None
+    if _AA_RESTORE_DETAIL:
+        from concurrent.futures import ThreadPoolExecutor as _KTP
+        _kc_pool = _KTP(max_workers=2)
+        _kc_futs = (_kc_pool.submit(_detail_keep_mask, a), _kc_pool.submit(_sharp_corner_pixels, a))
+    if scale == 1:
+        h, w = a.shape
+        ids = [int(v) for v in np.unique(a) if int(v) >= 0]
+        if not ids:
+            if _kc_pool is not None:
+                _kc_pool.shutdown(wait=True)
+            return a
+        best = cv2.GaussianBlur((a < 0).astype(np.float32), (0, 0), sigma)
+        hi = np.full((h, w), -1, np.int32)
+        for v in ids:
+            score = cv2.GaussianBlur((a == v).astype(np.float32), (0, 0), sigma)
+            take = score > best
+            if np.any(take):
+                hi[take] = v
+                best[take] = score[take]
+        sig_hi = sigma
+        src_up = a
+    else:
+        sig_hi = max(0.6, sigma * scale * 0.9)
+        hi = _su_partition_upsample(a, scale, sig_hi).astype(np.int32)
+        src_up = cv2.resize(
+            a.astype(np.int16),
+            (a.shape[1] * scale, a.shape[0] * scale),
+            interpolation=cv2.INTER_NEAREST,
+        ).astype(np.int32)
+    rad = int(math.ceil(float(sig_hi) * 2.2 + 1.0))
+    band = _dilate_label_edges(src_up, rad)
+    if not _AA_RESTORE_DETAIL:
+        hi = hi.copy()
+        outside = band == 0
+        if np.any(outside):
+            hi[outside] = src_up[outside]
+        return hi
+    hi = hi.copy()
+    outside = band == 0
+    if np.any(outside):
+        hi[outside] = src_up[outside]
+    keep = _kc_futs[0].result()
+    corners = _kc_futs[1].result()
+    _kc_pool.shutdown(wait=True)
+    if np.any(corners):
+        disk = cv2.dilate(corners, cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (3, 3)))
+        keep = np.maximum(keep, disk)
+    if np.any(keep):
+        if scale == 1:
+            hi[keep > 0] = a[keep > 0]
+        else:
+            k_up = cv2.resize(
+                keep,
+                (a.shape[1] * scale, a.shape[0] * scale),
+                interpolation=cv2.INTER_NEAREST,
+            )
+            hi[k_up > 0] = src_up[k_up > 0]
+    return hi
 
 
 def _smooth_logo_assign(assign, palette, sigma):
@@ -10173,7 +10784,7 @@ def _cover_foreign_holes(mask, labels, palette, ink, limit):
     return m
 
 
-def logo_potrace_mask_layers(assign, palette, sx, sy, *, min_area_px=10, fit=None):
+def logo_potrace_mask_layers(assign, palette, sx, sy, *, min_area_px=10, fit=None, trace_scale=1):
     """Per-ink potrace of the assign mask. Evenodd compounds, no shared-crack Schneider.
 
     alphamax/opttol follow the smooth/corners sliders. With smoothing off they
@@ -10185,18 +10796,28 @@ def logo_potrace_mask_layers(assign, palette, sx, sy, *, min_area_px=10, fit=Non
     `fit` is an explicit (alphamax, opttol, sigma) tuple. The speck guard
     passes one for the tight fit and one for the base fit so the two traces
     do not share the process-wide smooth flag.
+
+    `trace_scale` > 1 means `assign` is already that many times the sx/sy grid
+    (a sub-pixel anti-aliased upsample). Coordinates are divided back down.
     """
     a = np.asarray(assign, dtype=np.int32)
+    trace_scale = max(1, int(trace_scale))
+    mask_blur = 0.0
     if fit is None:
         alphamax, opttol, _sigma = _logo_fit_knobs(max(a.shape) if a.size else 1)
     else:
-        alphamax, opttol, _sigma = fit
+        alphamax, opttol, _sigma = fit[0], fit[1], fit[2]
+        if len(fit) > 3:
+            mask_blur = float(fit[3])
+    sx_m = float(sx) / float(trace_scale)
+    sy_m = float(sy) / float(trace_scale)
     order = list(range(len(palette)))
     order.sort(key=lambda i: (-lum(palette[i]), -int((a == i).sum())))
     layers = []
     iso_n = 0
-    # p75 gap above this (px) means the cubic left the pixel crack.
-    gap_trigger = 1.8
+    # p75 gap above this many mask pixels means the cubic left the crack.
+    # The mask may already be a 2× grid, so 1.8 source pixels is 1.8*scale.
+    gap_trigger = 1.8 * float(trace_scale)
     # 1px ring outside white, excluding low-chroma grey. Dark plates step
     # back and white takes the ring, so the seam stays closed and the
     # antialiased dark edge does not land on source white.
@@ -10230,19 +10851,20 @@ def logo_potrace_mask_layers(assign, palette, sx, sy, *, min_area_px=10, fit=Non
             mask,
             sx,
             sy,
-            scale=1,
+            scale=trace_scale,
             alphamax=alphamax,
             opttol=opttol,
             turdsize=0,
-            smooth=0.0,
+            smooth=mask_blur,
+            prescaled=trace_scale > 1,
         )
         if paths:
             try:
-                gap = _boundary_curve_gap_px(mask, paths, sx, sy)
+                gap = _boundary_curve_gap_px(mask, paths, sx_m, sy_m)
             except Exception:
                 gap = 0.0
             if gap > gap_trigger:
-                iso_paths = _iso_capped_paths(mask, sx, sy, sigma=0.8, cap_px=0.8)
+                iso_paths = _iso_capped_paths(mask, sx_m, sy_m, sigma=0.8, cap_px=0.8)
                 if iso_paths:
                     paths = iso_paths
                     iso_n += 1
@@ -10263,7 +10885,7 @@ def logo_potrace_mask_layers(assign, palette, sx, sy, *, min_area_px=10, fit=Non
     }
 
 
-def _logo_mask_svg(labels, palette, sx, sy, width_in, height_in, paper_hex, min_area_px, fit):
+def _logo_mask_svg(labels, palette, sx, sy, width_in, height_in, paper_hex, min_area_px, fit, trace_scale=1):
     """Potrace one assign map and wrap it in the logo SVG. None when empty."""
     glayers, gaux = logo_potrace_mask_layers(
         np.asarray(labels, dtype=np.int32),
@@ -10272,6 +10894,7 @@ def _logo_mask_svg(labels, palette, sx, sy, width_in, height_in, paper_hex, min_
         sy,
         min_area_px=min_area_px,
         fit=fit,
+        trace_scale=trace_scale,
     )
     gpaths = sum(len(L.get("paths") or []) for L in glayers)
     if not glayers or gpaths < 1:
@@ -10657,6 +11280,8 @@ def vectorize_busy_type_poster(rgb, paper, paper_rgb, inches, kind, t0, h0, w0, 
         "keyline": False,
         "shared_edge": False,
         "busy_type_poster": True,
+        "trace_sx": sx,
+        "trace_sy": sy,
         "plate_lock": True,
         "vector_graph": pmeta.get("vector_graph"),
         "shared_seams": pmeta.get("shared_seams", 0),
@@ -10899,6 +11524,8 @@ def vectorize_vtracer(
         "work": [ww, wh],
         "up": 1,
         "inches": [width_in, height_in],
+        "trace_sx": width_in / float(ww),
+        "trace_sy": height_in / float(wh),
         "ms": int((time.time() - t0) * 1000),
         "paper": to_hex(paper_rgb),
         "overlay": False,
@@ -11165,6 +11792,8 @@ def vectorize_soft_flat(rgb, paper, paper_rgb, inches, kind, t0, h0, w0, rec_err
                 "primitives": aux.get("primitives"),
                 "shared_seams": aux.get("shared_seams"),
                 "polish": {},
+                "trace_sx": sx,
+                "trace_sy": sy,
             }
             return svg, meta
     except Exception as e:
@@ -11228,6 +11857,8 @@ def vectorize_soft_flat(rgb, paper, paper_rgb, inches, kind, t0, h0, w0, rec_err
                 "adjacency": len(adj),
                 "vector_graph": "lite-plates",
                 "polish": polish_stats,
+                "trace_sx": sx,
+                "trace_sy": sy,
             }
     except Exception:
         plates_svg = None
@@ -11292,6 +11923,8 @@ def vectorize_soft_flat(rgb, paper, paper_rgb, inches, kind, t0, h0, w0, rec_err
             "adjacency": len(adj),
             "vector_graph": "lite-snap",
             "polish": polish_stats,
+            "trace_sx": sx,
+            "trace_sy": sy,
         }
         return svg, meta
     except Exception:
@@ -11355,6 +11988,8 @@ def vectorize_soft_flat(rgb, paper, paper_rgb, inches, kind, t0, h0, w0, rec_err
         "shared_edge": True,
         "vector_graph": "fallback-plates",
         "polish": polish_stats,
+        "trace_sx": sx,
+        "trace_sy": sy,
     }
     return svg, meta
 
@@ -12043,6 +12678,8 @@ def vectorize_plate_poster(rgb, paper, paper_rgb, inches, kind, t0, h0, w0, rec_
             "keyline_strokes": vg_aux.get("keyline_strokes"),
             "emblem_cycles": vg_aux.get("emblem_cycles"),
             "polish": {},
+            "trace_sx": sx,
+            "trace_sy": sy,
         }
         return svg, meta
 
@@ -12068,6 +12705,8 @@ def vectorize_plate_poster(rgb, paper, paper_rgb, inches, kind, t0, h0, w0, rec_
         "keyline": False,
         "vector_graph": "plate-empty",
         "polish": {},
+        "trace_sx": sx,
+        "trace_sy": sy,
     }
     return svg, meta
 
@@ -12563,7 +13202,7 @@ def _su_relax_bloat(svg, px_scale):
     return "".join(lines)
 
 
-def _su_rasterize(svg_text, rw, rh):
+def _su_rasterize(svg_text, rw, rh, bg="white"):
     rsvg = shutil.which("rsvg-convert")
     if not rsvg:
         return None
@@ -12573,15 +13212,29 @@ def _su_rasterize(svg_text, rw, rh):
         png = os.path.join(td, "r.png")
         with open(sp, "w", encoding="utf-8") as f:
             f.write(svg_text)
+        cmd = [rsvg, "-u", "-w", str(int(rw)), "-h", str(int(rh))]
+        # A flat background colour does not match the gate's alpha composite.
+        if str(bg).lower() != "#9aa8c0":
+            cmd += ["--background-color", str(bg)]
+        cmd += [sp, "-o", png]
         r = subprocess.run(
-            [rsvg, "-u", "-w", str(int(rw)), "-h", str(int(rh)), "--background-color", "white", sp, "-o", png],
+            cmd,
             capture_output=True,
             text=True,
             timeout=60,
         )
         if r.returncode != 0 or not os.path.isfile(png):
             return None
-        return np.array(Image.open(png).convert("RGB"), dtype=np.uint8)
+        im = Image.open(png)
+        # The gate composites transparent SVG pixels over #9aa8c0. Passing that
+        # colour as a flat background does not match the antialiased edge, and
+        # the white-hull number drifts by enough to hide a 1% drop.
+        if str(bg).lower() == "#9aa8c0":
+            rgba = np.array(im.convert("RGBA"), dtype=np.float32)
+            a = rgba[..., 3:4] / 255.0
+            rgb = rgba[..., :3] * a + np.array([154.0, 168.0, 192.0], dtype=np.float32) * (1.0 - a)
+            return np.clip(np.round(rgb), 0, 255).astype(np.uint8)
+        return np.array(im.convert("RGB"), dtype=np.uint8)
     finally:
         try:
             for fn in os.listdir(td):
@@ -12660,7 +13313,7 @@ def _su_cover_specks(svg, src_rgb):
     return svg.replace("</svg>", "\n".join(block) + "\n</svg>", 1), nspeck
 
 
-def _su_trace_svg(labels, palette, h0, w0, inches=10.0):
+def _su_trace_svg(labels, palette, h0, w0, inches=10.0, alphamax=1.333, opttol=0.8, smooth=1.1):
     if w0 >= h0:
         width_in = float(inches)
         height_in = float(inches) * (h0 / float(w0))
@@ -12679,7 +13332,7 @@ def _su_trace_svg(labels, palette, h0, w0, inches=10.0):
             continue
         mask = (labels == ink).astype(np.uint8)
         paths = potrace_paths(
-            mask, sx, sy, scale=1, alphamax=1.333, opttol=0.8, turdsize=4, smooth=1.1
+            mask, sx, sy, scale=1, alphamax=alphamax, opttol=opttol, turdsize=4, smooth=smooth
         )
         if not paths:
             continue
@@ -12694,6 +13347,1105 @@ def _su_trace_svg(labels, palette, h0, w0, inches=10.0):
         )
     svg = svg_from_layers(layers, width_in, height_in, "#ffffff")
     return svg, width_in, height_in, len(layers)
+
+
+def _su_partition_smooth(labels, palette, sigma, thin_dt):
+    """Blur every plate together, then put thin shapes and lost white back.
+
+    Independent per-plate blur shrinks thin strokes and opens gaps. Winner-take-all
+    keeps one ink per pixel. Components thinner than `thin_dt` (or smaller than a
+    speck) are copied from the unsmoothed plates. White ink is painted back until
+    its area is within 1% of the unsmoothed white. A blur-only crumb is returned
+    to the ink that was there before the blur.
+    """
+    a = np.asarray(labels, dtype=np.int32)
+    h, w = a.shape
+    ids = [int(v) for v in np.unique(a) if int(v) >= 0]
+    sig = float(sigma)
+    best = cv2.GaussianBlur((a < 0).astype(np.float32), (0, 0), sig)
+    out = np.full((h, w), -1, np.int32)
+    for v in ids:
+        score = cv2.GaussianBlur((a == v).astype(np.float32), (0, 0), sig)
+        take = score > best
+        if np.any(take):
+            out[take] = v
+            best[take] = score[take]
+    white_ids = set()
+    for v in ids:
+        try:
+            if _ink_is_white(palette[v]):
+                white_ids.add(v)
+        except Exception:
+            continue
+    limit = max(12, int(round(0.0002 * h * w)))
+    for v in ids:
+        m = (a == v).astype(np.uint8)
+        if int(m.sum()) < 4:
+            continue
+        n, lab, stats, _ = cv2.connectedComponentsWithStats(m, 8)
+        for ci in range(1, n):
+            area = int(stats[ci, cv2.CC_STAT_AREA])
+            if area < 4:
+                continue
+            x = int(stats[ci, cv2.CC_STAT_LEFT])
+            y = int(stats[ci, cv2.CC_STAT_TOP])
+            bw = int(stats[ci, cv2.CC_STAT_WIDTH])
+            bh = int(stats[ci, cv2.CC_STAT_HEIGHT])
+            crop = lab[y:y + bh, x:x + bw] == ci
+            paste = area < limit
+            if not paste:
+                dt = cv2.distanceTransform(crop.astype(np.uint8), cv2.DIST_L2, 3)
+                if float(np.median(dt[crop])) <= float(thin_dt):
+                    paste = True
+            if paste:
+                out[y:y + bh, x:x + bw][crop] = v
+    paper = (a < 0).astype(np.uint8)
+    n, lab, stats, _ = cv2.connectedComponentsWithStats(paper, 8)
+    if n > 1:
+        border = set(int(x) for x in np.unique(lab[0]) if int(x))
+        border.update(int(x) for x in np.unique(lab[-1]) if int(x))
+        border.update(int(x) for x in np.unique(lab[:, 0]) if int(x))
+        border.update(int(x) for x in np.unique(lab[:, -1]) if int(x))
+        for ci in range(1, n):
+            if ci not in border:
+                out[lab == ci] = -1
+    for v in white_ids:
+        orig = a == v
+        cur = out == v
+        need = int(orig.sum() * 0.99) - int(cur.sum())
+        if need <= 0 or not np.any(orig):
+            continue
+        lost = orig & ~cur
+        if not np.any(lost):
+            continue
+        src = cur.astype(np.uint8)
+        if int(src.sum()) == 0:
+            src = orig.astype(np.uint8)
+        dist = cv2.distanceTransform((src == 0).astype(np.uint8), cv2.DIST_L2, 3)
+        ys, xs = np.where(lost)
+        order = np.argsort(dist[ys, xs], kind="mergesort")
+        take = order[:need]
+        out[ys[take], xs[take]] = v
+    return out
+
+
+def _su_trim_specks_once(svg, drop_n):
+    """Lift the smallest speck subpaths just past the speck cut.
+
+    Deleting them punches holes in an ink. Dust that would need more than
+    about 2.2× is removed; anything larger is scaled about its centroid so
+    the ink stays and the shape is no longer a speck. Paper fills stay.
+    """
+    if drop_n <= 0:
+        return svg
+    m = re.search(r'viewBox="\s*([-\d.]+)\s+([-\d.]+)\s+([-\d.]+)\s+([-\d.]+)\s*"', svg)
+    if not m:
+        return svg
+    limit = _SVG_SPECK_AREA_FRAC * max(float(m.group(3)) * float(m.group(4)), 1e-9)
+    lines = svg.splitlines(keepends=True)
+    cur_paper = False
+    specks = []
+    parsed = {}
+    for li, line in enumerate(lines):
+        if "<g" in line and 'fill="' in line:
+            fm = re.search(r'\bfill="([^"]+)"', line)
+            cur_paper = bool(fm and _hex_is_paper(_norm_hex(fm.group(1))))
+        if "</g>" in line:
+            cur_paper = False
+        if 'd="' not in line or cur_paper or "paper-underlay" in line:
+            continue
+        pfm = re.search(r'<path\b[^>]*\bfill="([^"]+)"', line)
+        if pfm and _hex_is_paper(_norm_hex(pfm.group(1))):
+            continue
+        pre, rest = line.split('d="', 1)
+        d, post = rest.split('"', 1)
+        spans = _SUBPATH_SPLIT.findall(d)
+        if not spans:
+            continue
+        parsed[li] = [pre, spans, post]
+        for si, sp in enumerate(spans):
+            try:
+                areas = _closed_subpath_areas(sp)
+            except Exception:
+                continue
+            if len(areas) == 1 and 0.0 < areas[0] < limit:
+                specks.append((areas[0], li, si))
+    if not specks:
+        return svg
+    specks.sort()
+    ops = {}
+    for area, li, si in specks[:drop_n]:
+        grow = (limit * 1.08 / max(area, 1e-12)) ** 0.5
+        ops.setdefault(li, {})[si] = grow if grow <= 2.2 else None
+    for li, by_si in ops.items():
+        pre, spans, post = parsed[li]
+        kept = []
+        for i, sp in enumerate(spans):
+            if i not in by_si:
+                kept.append(sp.strip())
+                continue
+            grow = by_si[i]
+            if grow is None:
+                continue
+            subs = _su_parse_subpaths(sp)
+            if not subs:
+                kept.append(sp.strip())
+                continue
+            kept.append(_su_rebuild_sub(subs[0], grow))
+        lines[li] = (pre + 'd="' + " ".join(kept) + '"' + post) if kept else ""
+    return "".join(lines)
+
+
+def _su_trim_extra_specks(svg, keep_n):
+    """Remove only the excess smallest specks, so the count is not above `keep_n`."""
+    try:
+        keep_n = int(keep_n)
+    except (TypeError, ValueError):
+        return svg
+    for _ in range(3):
+        try:
+            n = _svg_speck_count(svg)
+        except Exception:
+            return svg
+        if n <= keep_n:
+            return svg
+        nxt = _su_trim_specks_once(svg, n - keep_n)
+        if nxt == svg:
+            return svg
+        svg = nxt
+    return svg
+
+
+def _su_clear_near_bloat(svg):
+    """Grow an outline that sits just under 4px/node, and only by a hair.
+
+    A path that would need more than about 8% is left alone so the guard can
+    reject it. The base trace is never passed through here.
+    """
+    m = re.search(r'viewBox="\s*([-\d.]+)\s+([-\d.]+)\s+([-\d.]+)\s+([-\d.]+)\s*"', svg)
+    if not m:
+        return svg
+    px_scale = 900.0 / max(float(m.group(3)), float(m.group(4)), 1e-9)
+
+    def factor(sp):
+        ol = _su_outline(sp) * px_scale
+        nodes = sp["nodes"]
+        if ol >= 80.0 and nodes > 1 and (nodes / max(ol, 1e-6)) > (0.25 + 1e-12):
+            grow = (4.02 * nodes) / max(ol, 1e-6)
+            if 1.0 < grow <= 1.08:
+                return grow
+        return 1.0
+
+    def fix_d(d):
+        subs = _su_parse_subpaths(d)
+        if not subs or not any(factor(sp) > 1.01 for sp in subs):
+            return d
+        return " ".join(_su_rebuild_sub(sp, factor(sp)) for sp in subs)
+
+    lines = []
+    for line in svg.splitlines(keepends=True):
+        if 'd="' in line and "paper-underlay" not in line:
+            pre, rest = line.split('d="', 1)
+            d, post = rest.split('"', 1)
+            line = pre + 'd="' + fix_d(d) + '"' + post
+        lines.append(line)
+    return "".join(lines)
+
+
+def _su_white_target(src_rgb):
+    """Source white inside the art hull. Same cut as the gate's white-hull check."""
+    lab = _su_cie_lab(src_rgb)
+    h0, w0 = lab.shape[:2]
+    bw = max(2, min(12, h0 // 40))
+    border = np.concatenate(
+        [
+            lab[:bw].reshape(-1, 3),
+            lab[-bw:].reshape(-1, 3),
+            lab[:, :bw].reshape(-1, 3),
+            lab[:, -bw:].reshape(-1, 3),
+        ]
+    )
+    bc = np.median(border, axis=0)
+    near = (np.sqrt(np.sum((lab - bc[None, None, :]) ** 2, axis=2)) < 5.0).astype(np.uint8)
+    _n, blabels, bstats, _ = cv2.connectedComponentsWithStats(near, 4)
+    border_ids = np.unique(np.concatenate([blabels[0, :], blabels[-1, :], blabels[:, 0], blabels[:, -1]]))
+    paper = np.zeros((h0, w0), dtype=bool)
+    for ci in border_ids:
+        ci = int(ci)
+        if ci > 0 and int(bstats[ci, cv2.CC_STAT_AREA]) >= max(100, int(0.02 * h0 * w0)):
+            paper[blabels == ci] = True
+    white = (lab[..., 0] >= 88.0) & (np.hypot(lab[..., 1], lab[..., 2]) < 25.0) & (~paper)
+    ys, xs = np.where(~paper)
+    if ys.size < 20 or int(white.sum()) < 20:
+        return None
+    hull = cv2.convexHull(np.column_stack([xs, ys]).astype(np.int32))
+    hull_mask = np.zeros((h0, w0), np.uint8)
+    cv2.fillConvexPoly(hull_mask, hull, 1)
+    target = white & (hull_mask > 0)
+    if int(target.sum()) < 20:
+        return None
+    return target
+
+
+def _su_white_cov(target, rend_rgb):
+    if target is None:
+        return 1.0
+    clab = _su_cie_lab(rend_rgb)
+    covered = (clab[..., 0] >= 78.0) & (np.hypot(clab[..., 1], clab[..., 2]) < 22.0)
+    return float((target & covered).sum()) / float(max(int(target.sum()), 1))
+
+
+# Widened smooth guard. Decisions use the source image and the two SVGs only.
+# Raster specks use the gate's 900px viewBox render over white. Ink and white
+# use the source size, long edge capped at 900.
+_GUARD_SRC = None
+_GUARD_ALPHA = None
+_GUARD_PREP = None
+_GUARD_IOU_DROP = 0.01
+_GUARD_WHITE_DROP = 0.01
+_GUARD_IOU_MIN = 0.70
+_GUARD_AREA_MAX = 0.25
+_GUARD_WLOSS_MAX = 0.05
+_GUARD_LONG = 900
+# Same cut as qa speck_metrics SPECK_AREA_FRAC. The island test is
+# `8 <= area < frac * pixels`, not `area < limit_px`. limit_px is the
+# floor of that product (and at least 8), so an island of exactly
+# limit_px still counts when the product has a fraction.
+_GUARD_SPECK_FRAC = 0.0001
+
+
+def _guard_clear():
+    global _GUARD_PREP
+    _GUARD_PREP = {}
+
+
+def _guard_strip_hints(svg_text):
+    text = re.sub(
+        r"""\sshape-rendering\s*=\s*(?:"[^"]*"|'[^']*')""",
+        "",
+        svg_text or "",
+        flags=re.I,
+    )
+    return re.sub(r"(?i)shape-rendering\s*:\s*[^;\"'}]+\s*;?", "", text)
+
+
+def _guard_view_wh(svg_text):
+    """Render size check_one uses: long edge 900, viewBox aspect."""
+    vb_w = vb_h = None
+    m = re.search(r'viewBox="([^"]*)"', svg_text or "")
+    if m:
+        parts = [p for p in m.group(1).replace(",", " ").split() if p]
+        if len(parts) >= 4:
+            try:
+                vb_w = float(parts[2])
+                vb_h = float(parts[3])
+            except ValueError:
+                vb_w = vb_h = None
+    if not vb_w or not vb_h or vb_w <= 0 or vb_h <= 0:
+        return _GUARD_LONG, _GUARD_LONG
+    aspect = float(vb_w) / max(float(vb_h), 1e-9)
+    if aspect >= 1.0:
+        return _GUARD_LONG, max(1, int(round(_GUARD_LONG / aspect)))
+    return max(1, int(round(_GUARD_LONG * aspect))), _GUARD_LONG
+
+
+def _guard_rgba(svg_text, rw, rh):
+    """One rsvg pass, transparent background. Callers composite it."""
+    rsvg = shutil.which("rsvg-convert")
+    if not rsvg:
+        return None
+    td = tempfile.mkdtemp(prefix="guard-ras-")
+    try:
+        sp = os.path.join(td, "t.svg")
+        png = os.path.join(td, "r.png")
+        with open(sp, "w", encoding="utf-8") as f:
+            f.write(_guard_strip_hints(svg_text))
+        r = subprocess.run(
+            [rsvg, "-u", "-w", str(int(rw)), "-h", str(int(rh)), sp, "-o", png],
+            capture_output=True,
+            text=True,
+            timeout=60,
+        )
+        if r.returncode != 0 or not os.path.isfile(png):
+            return None
+        return np.array(Image.open(png).convert("RGBA"), dtype=np.uint8)
+    finally:
+        try:
+            for fn in os.listdir(td):
+                os.remove(os.path.join(td, fn))
+            os.rmdir(td)
+        except Exception:
+            pass
+
+
+def _guard_white_render(svg_text, rw, rh):
+    """RGB render check_one uses for speck_metrics.
+
+    rsvg over white, shape-rendering hints stripped, nearest-neighbour
+    resize when the pixmap is not exactly rw×rh.
+    """
+    rsvg = shutil.which("rsvg-convert")
+    if not rsvg:
+        return None
+    td = tempfile.mkdtemp(prefix="guard-w-")
+    try:
+        sp = os.path.join(td, "t.svg")
+        png = os.path.join(td, "r.png")
+        with open(sp, "w", encoding="utf-8") as f:
+            f.write(_guard_strip_hints(svg_text))
+        r = subprocess.run(
+            [
+                rsvg,
+                "-u",
+                "-w",
+                str(int(rw)),
+                "-h",
+                str(int(rh)),
+                "--background-color",
+                "white",
+                sp,
+                "-o",
+                png,
+            ],
+            capture_output=True,
+            text=True,
+            timeout=120,
+        )
+        if r.returncode != 0 or not os.path.isfile(png):
+            return None
+        rend = np.array(Image.open(png).convert("RGB"), dtype=np.uint8)
+        if rend.shape[1] != int(rw) or rend.shape[0] != int(rh):
+            rend = cv2.resize(rend, (int(rw), int(rh)), interpolation=cv2.INTER_NEAREST)
+        return rend
+    finally:
+        try:
+            for fn in os.listdir(td):
+                os.remove(os.path.join(td, fn))
+            os.rmdir(td)
+        except Exception:
+            pass
+
+
+def _guard_over(rgba, bg):
+    a = rgba[..., 3:4].astype(np.float32) / 255.0
+    rgb = rgba[..., :3].astype(np.float32) * a + np.asarray(bg, np.float32) * (1.0 - a)
+    return np.clip(np.round(rgb), 0, 255).astype(np.uint8)
+
+
+def _guard_nearest(data, cents):
+    idx = np.empty(data.shape[0], dtype=np.int32)
+    mind = np.empty(data.shape[0], dtype=np.float64)
+    C = np.asarray(cents, dtype=np.float64)
+    step = 100000
+
+    def _chunk(start):
+        stop = min(start + step, data.shape[0])
+        delta = data[start:stop, None, :] - C[None, :, :]
+        d2 = np.sum(delta * delta, axis=2)
+        idx[start:stop] = np.argmin(d2, axis=1).astype(np.int32)
+        mind[start:stop] = np.min(d2, axis=1)
+
+    starts = list(range(0, data.shape[0], step))
+    if len(starts) <= 1:
+        for st in starts:
+            _chunk(st)
+    else:
+        from concurrent.futures import ThreadPoolExecutor as _NTP
+        with _NTP(max_workers=4) as ex:
+            list(ex.map(_chunk, starts))
+    return idx, mind
+
+
+def _guard_paper_mask(src_lab):
+    """Same paper test as the gate's source_paper_mask."""
+    chroma = np.sqrt(src_lab[..., 1] ** 2 + src_lab[..., 2] ** 2)
+    base = (src_lab[..., 0] > 90.0) & (chroma < 10.0)
+    h, w = src_lab.shape[:2]
+    border = np.concatenate(
+        [src_lab[0, :, :], src_lab[-1, :, :], src_lab[:, 0, :], src_lab[:, -1, :]],
+        axis=0,
+    )
+    bc = np.median(border, axis=0)
+    bd = np.sqrt(np.sum((border - bc[None, :]) ** 2, axis=1))
+    uniform_light = float(bc[0]) > 80.0 and float(np.percentile(bd, 90)) < 12.0
+    if uniform_light:
+        d = np.sqrt(np.sum((src_lab - bc[None, None, :]) ** 2, axis=2))
+        base = base | ((src_lab[..., 0] > 75.0) & (d < 12.0))
+    border_d = np.sqrt(np.sum((border - bc[None, :]) ** 2, axis=1))
+    if float(np.mean(border_d < 3.0)) >= 0.70:
+        d = np.sqrt(np.sum((src_lab - bc[None, None, :]) ** 2, axis=2))
+        near = (d < 3.0).astype(np.uint8)
+        _ncc, labels, stats, _ = cv2.connectedComponentsWithStats(near, 4)
+        border_ids = np.unique(
+            np.concatenate([labels[0, :], labels[-1, :], labels[:, 0], labels[:, -1]])
+        )
+        for ci in border_ids:
+            ci = int(ci)
+            if ci <= 0:
+                continue
+            if int(stats[ci, cv2.CC_STAT_AREA]) >= max(100, int(0.02 * h * w)):
+                base[labels == ci] = True
+    return base
+
+
+def _guard_svg_palette(svg_text):
+    """Non-paper path fills and the paper hex, in check_one's order.
+
+    Fills inherit from parent groups. A style `fill` wins over the attribute.
+    `data-name="paper-underlay"` sets the paper colour and is not an ink.
+    """
+    try:
+        root = ET.fromstring(svg_text)
+    except ET.ParseError:
+        return [], "#ffffff"
+    palette = []
+    paper = "#ffffff"
+
+    def walk(el, fill, data_name):
+        nonlocal paper
+        f = fill
+        name = data_name
+        attr = el.get("fill")
+        if attr is not None:
+            f = _norm_hex(attr)
+        style = el.get("style") or ""
+        for part in style.split(";"):
+            if ":" not in part:
+                continue
+            k, v = part.split(":", 1)
+            if k.strip().lower() == "fill":
+                f = _norm_hex(v.strip())
+        dn = el.get("data-name")
+        if dn:
+            name = dn
+        tag = el.tag.split("}", 1)[-1]
+        if tag == "path":
+            if name == "paper-underlay" and f:
+                paper = f
+            elif f and f not in palette and not _hex_is_paper(f):
+                palette.append(f)
+        for ch in list(el):
+            walk(ch, f, name)
+
+    walk(root, None, "")
+    return palette, paper
+
+
+def _guard_speck_source(src_rgb, rw, rh):
+    """Source pixels speck_metrics sees: alpha over white, then cubic resize."""
+    rgb = np.asarray(src_rgb)
+    alpha = None
+    if (
+        _GUARD_ALPHA is not None
+        and rgb is _GUARD_SRC
+        and getattr(_GUARD_ALPHA, "shape", None) is not None
+        and _GUARD_ALPHA.shape[:2] == rgb.shape[:2]
+    ):
+        alpha = _GUARD_ALPHA
+    if alpha is not None and int(np.min(alpha)) < 255:
+        im = Image.fromarray(np.dstack([np.ascontiguousarray(rgb[:, :, :3]), alpha]), "RGBA")
+        bg = Image.new("RGBA", im.size, (255, 255, 255, 255))
+        bg.alpha_composite(im)
+        im = bg.convert("RGB")
+    else:
+        im = Image.fromarray(np.ascontiguousarray(rgb[:, :, :3]), "RGB")
+    arr = np.array(im, dtype=np.uint8)
+    if arr.shape[1] != int(rw) or arr.shape[0] != int(rh):
+        arr = cv2.resize(arr, (int(rw), int(rh)), interpolation=cv2.INTER_CUBIC)
+    return arr
+
+
+def _guard_ink_wh(src_rgb):
+    """Ink and white raster. Source size, long edge capped at 900.
+
+    The coverage gate renders at the source size. Capping the long edge
+    keeps a large upload on the same small raster as the speck gate.
+    """
+    h, w = int(src_rgb.shape[0]), int(src_rgb.shape[1])
+    long = max(h, w, 1)
+    if long <= _GUARD_LONG:
+        return w, h
+    scale = float(_GUARD_LONG) / float(long)
+    return max(1, int(round(w * scale))), max(1, int(round(h * scale)))
+
+
+def _guard_prep(src_rgb, rw, rh):
+    """Source inks at the guard raster. Cached for every candidate of this image."""
+    global _GUARD_PREP
+    if not isinstance(_GUARD_PREP, dict):
+        _GUARD_PREP = {}
+    key = (int(rw), int(rh), int(src_rgb.shape[0]), int(src_rgb.shape[1]))
+    hit = _GUARD_PREP.get(key)
+    if hit is not None:
+        return hit
+    src = src_rgb
+    if src.shape[1] != rw or src.shape[0] != rh:
+        src = cv2.resize(src, (int(rw), int(rh)), interpolation=cv2.INTER_CUBIC)
+    src_lab = _su_cie_lab(src)
+    paper = _guard_paper_mask(src_lab)
+    h, w = src_lab.shape[:2]
+    npx = int(h * w)
+    all_lab = src_lab.reshape(-1, 3)
+    nonpaper = ~paper
+    coords = np.flatnonzero(nonpaper.reshape(-1))
+    inks = []
+    src_ink = np.full((h, w), -1, np.int32)
+    paper_c = np.array([100.0, 0.0, 0.0], dtype=np.float64)
+    if paper.any():
+        paper_c = src_lab[paper].mean(axis=0)
+    if coords.size:
+        sample_n = min(int(coords.size), 24000)
+        if coords.size > sample_n:
+            pick = np.linspace(0, coords.size - 1, sample_n, dtype=np.int64)
+            sample_idx = coords[pick]
+        else:
+            sample_idx = coords
+        sample = all_lab[sample_idx].astype(np.float32)
+        k = min(12, max(2, int(round(np.sqrt(max(sample.shape[0], 1) / 2500.0)))))
+        k = min(k, int(sample.shape[0]))
+        if k >= 1 and sample.shape[0] >= k:
+            cv2.setRNGSeed(0)
+            crit = (cv2.TERM_CRITERIA_EPS + cv2.TERM_CRITERIA_MAX_ITER, 40, 0.25)
+            _co, _lb, centers = cv2.kmeans(
+                sample, int(k), None, crit, 1, cv2.KMEANS_PP_CENTERS
+            )
+            centers = centers.astype(np.float64)
+            labels, _mind = _guard_nearest(all_lab, centers)
+            labels[paper.reshape(-1)] = -1
+            groups = []
+            for j in range(centers.shape[0]):
+                m = labels == j
+                if np.any(m):
+                    groups.append([all_lab[m].mean(axis=0), int(m.sum())])
+            while len(groups) > 1:
+                best = None
+                for i in range(len(groups)):
+                    for j in range(i + 1, len(groups)):
+                        d = float(np.linalg.norm(groups[i][0] - groups[j][0]))
+                        if best is None or d < best[0]:
+                            best = (d, i, j)
+                if best is None or best[0] >= 10.0:
+                    break
+                _d, i, j = best
+                ci, ni = groups[i]
+                cj, nj = groups[j]
+                groups[i] = [(ci * ni + cj * nj) / float(ni + nj), ni + nj]
+                groups.pop(j)
+            kept = []
+            if groups:
+                group_centers = np.stack([g[0] for g in groups], axis=0)
+                group_labels, _gm = _guard_nearest(all_lab, group_centers)
+                for gi, (center, count) in enumerate(groups):
+                    if count < 0.01 * npx:
+                        continue
+                    cmask = (group_labels == gi) & (~paper.reshape(-1))
+                    ncc, _cc, stats, _cent = cv2.connectedComponentsWithStats(
+                        cmask.reshape(h, w).astype(np.uint8), 8
+                    )
+                    largest = int(stats[1:, cv2.CC_STAT_AREA].max()) if ncc > 1 else 0
+                    cchroma = float(np.hypot(center[1], center[2]))
+                    if center[0] > 60.0 and cchroma < 35.0 and largest < 0.005 * npx:
+                        continue
+                    kept.append([center, count])
+            if kept:
+                centers = np.stack([g[0] for g in kept], axis=0)
+                src_i, src_d2 = _guard_nearest(all_lab, centers)
+                src_i[src_d2 > 35.0 ** 2] = -1
+                src_i[paper.reshape(-1)] = -1
+                src_ink = src_i.reshape(h, w)
+                inks = [c for c, _n in kept]
+    ink_bool = src_ink >= 0
+    edge = cv2.dilate(ink_bool.astype(np.uint8), np.ones((3, 3), np.uint8), iterations=1).astype(bool)
+    edge = edge & ~cv2.erode(ink_bool.astype(np.uint8), np.ones((3, 3), np.uint8), iterations=1).astype(bool)
+    prep = {
+        "key": key,
+        "src": src,
+        "src_lab": src_lab,
+        "src_ink": src_ink,
+        "valid": ~edge,
+        "centers": None if not inks else np.stack(inks, axis=0),
+        "paper_c": paper_c,
+        "white_target": _su_white_target(src),
+        "scores": {},
+        "speck_src": _guard_speck_source(src_rgb, rw, rh),
+    }
+    _GUARD_PREP[key] = prep
+    return prep
+
+
+def _guard_count_opened(sub, src_de, frac, y0, x0):
+    """Count speck islands in an opened mask crop. `sub` is src_de[y0:, x0:]."""
+    if int(sub.sum()) < 8:
+        return 0
+    nlab, labels, stats, _ = cv2.connectedComponentsWithStats(sub, connectivity=4)
+    de = src_de[y0 : y0 + sub.shape[0], x0 : x0 + sub.shape[1]]
+    nspeck = 0
+    for li in range(1, nlab):
+        a = int(stats[li, cv2.CC_STAT_AREA])
+        if not (8 <= a < frac):
+            continue
+        lx = int(stats[li, cv2.CC_STAT_LEFT])
+        ly = int(stats[li, cv2.CC_STAT_TOP])
+        lw = int(stats[li, cv2.CC_STAT_WIDTH])
+        lh = int(stats[li, cv2.CC_STAT_HEIGHT])
+        blob = labels[ly : ly + lh, lx : lx + lw] == li
+        if float(np.median(de[ly : ly + lh, lx : lx + lw][blob])) >= 15.0:
+            continue
+        nspeck += 1
+    return nspeck
+
+
+def _guard_open_window(mask, src_de, ker, frac, x, y, bw, bh):
+    """Speck islands inside one box. The open matches a full-frame 3×3 open.
+
+    OpenCV's morphology border is foreground, so a tight crop keeps edge
+    pixels the full frame would erode. Two pixels of the real mask are
+    included around the box. The outer ring of that pad is the only place
+    the crop border can turn on, and it is dropped unless that side is the
+    image edge (where the full frame uses the same border).
+    """
+    h, w = mask.shape[:2]
+    if bw <= 0 or bh <= 0:
+        return 0
+    rad = 2
+    x0 = x - rad if x >= rad else 0
+    y0 = y - rad if y >= rad else 0
+    x1 = x + bw + rad if x + bw + rad <= w else w
+    y1 = y + bh + rad if y + bh + rad <= h else h
+    sub = np.ascontiguousarray(mask[y0:y1, x0:x1])
+    sub = cv2.morphologyEx(sub, cv2.MORPH_OPEN, ker)
+    if y0 > 0:
+        sub[0, :] = 0
+    if x0 > 0:
+        sub[:, 0] = 0
+    if y1 < h:
+        sub[-1, :] = 0
+    if x1 < w:
+        sub[:, -1] = 0
+    return _guard_count_opened(sub, src_de, frac, y0, x0)
+
+
+def _guard_mask_specks(mask, src_de, ker, frac):
+    """Islands in one fill mask. Same count as open and CC on the full frame.
+
+    A fill that is scattered across a large box is split on a coarse grid.
+    Cells more than a couple of cells apart cannot meet inside a 3×3 open,
+    so each group is opened on its own box and the counts add.
+    """
+    h, w = mask.shape[:2]
+    x, y, bw, bh = cv2.boundingRect(mask)
+    if bw <= 0 or bh <= 0:
+        return 0
+    n_px = int(mask.sum())
+    # Dense or already small: one window is the full-frame open.
+    if bw * bh <= 8192 or n_px * 12 >= bw * bh:
+        return _guard_open_window(mask, src_de, ker, frac, x, y, bw, bh)
+    S = 32
+    ys, xs = np.nonzero(mask)
+    if ys.size < 8 and y > 0 and x > 0 and y + bh < h and x + bw < w:
+        return 0
+    gh = (h + S - 1) // S
+    gw = (w + S - 1) // S
+    cells = np.zeros((gh, gw), np.uint8)
+    cy = ys // S
+    cx = xs // S
+    cells[cy, cx] = 1
+    cells = cv2.dilate(cells, np.ones((3, 3), np.uint8), borderType=cv2.BORDER_CONSTANT, borderValue=0)
+    nlab, clab, _, _ = cv2.connectedComponentsWithStats(cells, connectivity=8)
+    if nlab <= 2:
+        return _guard_open_window(mask, src_de, ker, frac, x, y, bw, bh)
+    comp = clab[cy, cx]
+    order = np.argsort(comp, kind="mergesort")
+    comp_s = comp[order]
+    ys_s = ys[order]
+    xs_s = xs[order]
+    breaks = np.flatnonzero(comp_s[1:] != comp_s[:-1]) + 1
+    starts = np.concatenate(([0], breaks))
+    ends = np.concatenate((breaks, [comp_s.shape[0]]))
+    nspeck = 0
+    for a, b in zip(starts, ends):
+        ci = int(comp_s[a])
+        if ci <= 0:
+            continue
+        y_a = int(ys_s[a:b].min())
+        y_b = int(ys_s[a:b].max()) + 1
+        x_a = int(xs_s[a:b].min())
+        x_b = int(xs_s[a:b].max()) + 1
+        n_here = b - a
+        inset = y_a > 0 and x_a > 0 and y_b < h and x_b < w
+        if n_here < 9 and inset:
+            continue
+        # The box of a curved group can cover a distant island. That island
+        # is another cell-group and is at least a few cells away, so it does
+        # not change this open. Drop it here or it would be counted twice.
+        rad = 2
+        x0 = x_a - rad if x_a >= rad else 0
+        y0 = y_a - rad if y_a >= rad else 0
+        x1 = x_b + rad if x_b + rad <= w else w
+        y1 = y_b + rad if y_b + rad <= h else h
+        window = np.array(mask[y0:y1, x0:x1], copy=True)
+        yy, xx = np.ogrid[y0:y1, x0:x1]
+        foreign = clab[yy // S, xx // S] != ci
+        if np.any(foreign):
+            window[foreign] = 0
+        # The window is already the 2px pad. Sides on the image edge keep
+        # the foreground border; the other outer ring is the crop border.
+        sub = cv2.morphologyEx(np.ascontiguousarray(window), cv2.MORPH_OPEN, ker)
+        if y0 > 0:
+            sub[0, :] = 0
+        if x0 > 0:
+            sub[:, 0] = 0
+        if y1 < h:
+            sub[-1, :] = 0
+        if x1 < w:
+            sub[:, -1] = 0
+        nspeck += _guard_count_opened(sub, src_de, frac, y0, x0)
+    return nspeck
+
+
+def _guard_raster_specks(rend, src, svg_text):
+    """Count the same islands speck_metrics counts.
+
+    Palette and paper come from the SVG the way check_one collects them.
+    A pixel within CIE76 10 of a non-paper fill, 3×3 opened, 4-connected,
+    area in [8, 0.01% of the raster), whose source median ΔE to the paper
+    hex is under 15, is one speck. limit_px is max(8, floor(0.01% of the
+    raster)); the area test uses the unfloored product, so an island of
+    exactly limit_px still counts when that product is not an integer.
+    """
+    palette, paper_hex = _guard_svg_palette(svg_text)
+    pal = [h for h in palette if h and not _hex_is_paper(h) and h != paper_hex]
+    if not pal:
+        return 0
+    h, w = rend.shape[:2]
+    area = int(h) * int(w)
+    frac = _GUARD_SPECK_FRAC * area
+    rend_lab = _su_cie_lab(rend)
+    src_lab = _su_cie_lab(src)
+    paper_rgb = _su_hex_rgb(paper_hex).astype(np.float64).reshape(1, 1, 3)
+    paper_lab = _su_cie_lab(paper_rgb)[0, 0]
+    src_de = _su_de76(src_lab, paper_lab)
+    ker = np.ones((3, 3), dtype=np.uint8)
+    rgb = np.array(
+        [[int(hx[1:3], 16), int(hx[3:5], 16), int(hx[5:7], 16)] for hx in pal],
+        dtype=np.float64,
+    )
+    labs = np.ascontiguousarray(_su_cie_lab(rgb.reshape(1, -1, 3))[0])
+    flat = np.ascontiguousarray(rend_lab.reshape(-1, 3))
+    # Squared distance is ||a||^2 + ||b||^2 - 2 a·b. A float32 product is
+    # enough to decide pixels that are not within 0.05 of the dE 10 cut
+    # (squared 100). Pixels on that cut are redone with the subtract form,
+    # which is the gate's de76 < 10.
+    flat32 = np.ascontiguousarray(flat.astype(np.float32))
+    labs32 = np.ascontiguousarray(labs.astype(np.float32))
+    half_r = np.einsum("ij,ij->i", flat32, flat32) * np.float32(0.5)
+    half_m = np.float32(0.025)
+    nspeck = 0
+    chunk = 96
+    n_pix = flat32.shape[0]
+    buf = np.empty((n_pix, chunk), np.float32)
+    for start in range(0, len(pal), chunk):
+        nk = min(chunk, len(pal) - start)
+        pk32 = np.ascontiguousarray(labs32[start : start + nk])
+        pk = labs[start : start + nk]
+        p2 = np.einsum("ij,ij->i", pk32, pk32)
+        if nk == chunk:
+            np.dot(flat32, pk32.T, out=buf)
+            dot = buf
+        else:
+            dot = np.empty((n_pix, nk), np.float32)
+            np.dot(flat32, pk32.T, out=dot)
+        # delta = 0.5 * (100 - d^2). Positive means inside the dE 10 ball.
+        dot -= half_r[:, None]
+        dot -= ((p2 - np.float32(100.0)) * np.float32(0.5))[None, :]
+        inside = dot > half_m
+        band = np.abs(dot) <= half_m
+        if np.any(band):
+            for j in range(nk):
+                idx = np.flatnonzero(band[:, j])
+                if idx.size == 0:
+                    continue
+                diff = flat[idx] - pk[j]
+                inside[idx, j] = np.einsum("ij,ij->i", diff, diff) < 100.0
+        masks = inside.reshape(h, w, nk)
+        for j in range(nk):
+            col = masks[:, :, j]
+            if int(col.sum()) < 8:
+                continue
+            mask = np.ascontiguousarray(col, dtype=np.uint8)
+            nspeck += _guard_mask_specks(mask, src_de, ker, frac)
+    return nspeck
+
+
+def _guard_ink_rows(rend, prep):
+    centers = prep["centers"]
+    if centers is None or len(centers) == 0:
+        return []
+    rend_lab = _su_cie_lab(rend).reshape(-1, 3)
+    choices = np.vstack([centers, np.asarray(prep["paper_c"], dtype=np.float64)[None, :]])
+    labels, _mind = _guard_nearest(rend_lab, choices)
+    rend_ink = labels.reshape(rend.shape[:2])
+    paper_i = len(centers)
+    valid = prep["valid"]
+    src_ink = prep["src_ink"]
+    rows = []
+    for i in range(len(centers)):
+        sm = (src_ink == i) & valid
+        rm = (rend_ink == i) & valid
+        source_area = int(sm.sum())
+        render_area = int(rm.sum())
+        union = int(np.logical_or(sm, rm).sum())
+        inter = int(np.logical_and(sm, rm).sum())
+        rows.append(
+            {
+                "iou": inter / float(max(union, 1)),
+                "area": abs(render_area - source_area) / float(max(source_area, 1)),
+                "wloss": int(np.logical_and(sm, rend_ink == paper_i).sum()) / float(max(source_area, 1)),
+            }
+        )
+    return rows
+
+
+def _guard_score(svg_text, prep, rw, rh, parts=("specks", "white", "inks")):
+    """Guard metrics for one SVG at one raster size. Only the requested parts
+    are computed; each part is cached per (svg, size) so values are identical
+    to computing them all at once."""
+    key = hashlib.md5((svg_text or "").encode("utf-8")).hexdigest()
+    ck = (key, int(rw), int(rh))
+    hit = prep["scores"].get(ck)
+    if hit is None:
+        hit = {}
+        prep["scores"][ck] = hit
+    if any(p in ("white", "inks") and p not in hit for p in parts):
+        rgba = _guard_rgba(svg_text, rw, rh)
+        if rgba is None:
+            return None
+        if rgba.shape[0] != rh or rgba.shape[1] != rw:
+            rgba = cv2.resize(rgba, (int(rw), int(rh)), interpolation=cv2.INTER_NEAREST)
+        if "white" in parts and "white" not in hit:
+            blue = _guard_over(rgba, (154.0, 168.0, 192.0))
+            hit["white"] = _su_white_cov(prep["white_target"], blue)
+        if "inks" in parts and "inks" not in hit:
+            white = _guard_over(rgba, (255.0, 255.0, 255.0))
+            hit["inks"] = _guard_ink_rows(white, prep)
+    if "specks" in parts and "specks" not in hit:
+        speck_rend = _guard_white_render(svg_text, rw, rh)
+        if speck_rend is None:
+            return None
+        hit["specks"] = _guard_raster_specks(speck_rend, prep["speck_src"], svg_text)
+    return hit
+
+
+def _guard_reason(base_svg, alt_svg, src_rgb):
+    """Why `alt_svg` must not replace `base_svg`, or None when it may.
+
+    Vector specks must not rise. Raster specks (the gate's speck_metrics
+    count: white-background render, same palette and paper, same limit)
+    must not rise. A source ink that passes the gate may lose at most 0.01
+    IoU, or 0.02 when it already sits at or above 0.85. Area error may rise
+    by at most two points while it stays under the 25% cut. An ink that
+    already fails may lose 0.03 IoU or gain 0.05 area error. A pass must
+    not become a fail on the gate's
+    0.70 / 25% / 5% cuts. White-hull coverage, measured at source size,
+    must not drop by more than one point and must not cross under 95%.
+    """
+    if not base_svg or not alt_svg or src_rgb is None:
+        return "empty"
+    try:
+        if _svg_speck_count(alt_svg) > _svg_speck_count(base_svg):
+            return "vector specks"
+    except Exception as e:
+        return f"vector specks {e}"
+    speck_w, speck_h = _guard_view_wh(base_svg)
+    ink_w, ink_h = _guard_ink_wh(src_rgb)
+    try:
+        def _at(w, h, svg, parts):
+            prep = _guard_prep(src_rgb, w, h)
+            return _guard_score(svg, prep, w, h, parts)
+
+        same = (speck_w, speck_h) == (ink_w, ink_h)
+        _guard_prep(src_rgb, ink_w, ink_h)
+        if not same:
+            _guard_prep(src_rgb, speck_w, speck_h)
+        ink_parts = ("specks", "white", "inks") if same else ("white", "inks")
+        from concurrent.futures import ThreadPoolExecutor as _GTP
+        with _GTP(max_workers=4) as _gp:
+            fb = _gp.submit(_at, ink_w, ink_h, base_svg, ink_parts)
+            fa = _gp.submit(_at, ink_w, ink_h, alt_svg, ink_parts)
+            if not same:
+                fbs = _gp.submit(_at, speck_w, speck_h, base_svg, ("specks",))
+                fas = _gp.submit(_at, speck_w, speck_h, alt_svg, ("specks",))
+            b = fb.result()
+            a = fa.result()
+            if same:
+                bs, as_ = b, a
+            else:
+                bs = fbs.result()
+                as_ = fas.result()
+    except Exception as e:
+        return f"guard {e}"
+    if b is None or a is None or bs is None or as_ is None:
+        return "raster"
+    if int(as_["specks"]) > int(bs["specks"]):
+        return f"raster specks {bs['specks']}->{as_['specks']}"
+    if float(a["white"]) < float(b["white"]) - float(_GUARD_WHITE_DROP):
+        return f"white {b['white']:.3f}->{a['white']:.3f}"
+    if float(b["white"]) >= 0.95 and float(a["white"]) < 0.95:
+        return f"white cut {b['white']:.3f}->{a['white']:.3f}"
+    if len(a["inks"]) != len(b["inks"]):
+        return "ink count"
+    for bi, ai in zip(b["inks"], a["inks"]):
+        if float(bi["iou"]) >= _GUARD_IOU_MIN and float(ai["iou"]) < _GUARD_IOU_MIN:
+            return f"iou cut {bi['iou']:.3f}->{ai['iou']:.3f}"
+        if float(bi["area"]) <= _GUARD_AREA_MAX and float(ai["area"]) > _GUARD_AREA_MAX:
+            return f"area cut {bi['area']:.3f}->{ai['area']:.3f}"
+        if float(bi["wloss"]) <= _GUARD_WLOSS_MAX and float(ai["wloss"]) > _GUARD_WLOSS_MAX:
+            return f"white-loss cut {bi['wloss']:.3f}->{ai['wloss']:.3f}"
+        # Tight margin near the gate cut. Far above that cut, two points
+        # still cannot become a new fail. An ink already over the cut can
+        # drift a little without adding a new reason.
+        if float(bi["iou"]) >= 0.85:
+            iou_lim = 0.02
+        elif float(bi["iou"]) >= _GUARD_IOU_MIN:
+            iou_lim = _GUARD_IOU_DROP
+        else:
+            iou_lim = 0.03
+        if float(bi["area"]) <= 0.10:
+            area_lim = 0.02
+        elif float(bi["area"]) <= _GUARD_AREA_MAX:
+            # Two points while still under the 25% cut. The cut check above
+            # rejects an actual cross, so this cannot add a new area fail.
+            area_lim = 0.02
+        else:
+            # Already over the 25% cut. A few more points stay the same
+            # failure and must not force a fallback that grows specks.
+            area_lim = 0.05
+        if float(ai["iou"]) < float(bi["iou"]) - iou_lim:
+            return f"iou {bi['iou']:.3f}->{ai['iou']:.3f}"
+        if float(ai["area"]) > float(bi["area"]) + area_lim:
+            return f"area {bi['area']:.3f}->{ai['area']:.3f}"
+    return None
+
+
+def _su_svg_ink_fills(svg):
+    found = []
+    for h in re.findall(r'fill="(#[0-9A-Fa-f]{6})"', svg or ""):
+        n = _norm_hex(h)
+        if n and n not in found and not _hex_is_paper(n):
+            found.append(n)
+    return found
+
+
+def _su_plate_loss(base_svg, alt_svg, src_rgb):
+    """Why the smoothed render loses ink against the unsmoothed one, or None.
+
+    White coverage uses the gate's source-white hull. Per-ink IoU merges fills
+    closer than dE 18, then rejects an ink that covers at least 2% of the
+    unsmoothed render when that ink collapses. Boundary smoothing alone does
+    not collapse an ink, so a fair curve still passes.
+    """
+    h, w = src_rgb.shape[:2]
+    base_r = _su_rasterize(base_svg, w, h, bg="#9aa8c0")
+    alt_r = _su_rasterize(alt_svg, w, h, bg="#9aa8c0")
+    if base_r is None or alt_r is None:
+        return "raster"
+    if base_r.shape[0] != h or base_r.shape[1] != w:
+        base_r = cv2.resize(base_r, (w, h), interpolation=cv2.INTER_NEAREST)
+    if alt_r.shape[0] != h or alt_r.shape[1] != w:
+        alt_r = cv2.resize(alt_r, (w, h), interpolation=cv2.INTER_NEAREST)
+    bc = _su_white_cov(_su_white_target(src_rgb), base_r)
+    ac = _su_white_cov(_su_white_target(src_rgb), alt_r)
+    if ac < bc - float(_SU_WHITE_DROP):
+        return f"white {bc:.3f}->{ac:.3f}"
+    bg = _su_cie_lab(np.array([[[154, 168, 192]]], dtype=np.uint8))[0, 0]
+    bde = _su_de76(_su_cie_lab(base_r), bg)
+    ade = _su_de76(_su_cie_lab(alt_r), bg)
+    base_ink = bde > 18.0
+    hole = float((base_ink & (ade < 12.0)).sum()) / float(max(int(base_ink.sum()), 1))
+    if hole > float(_SU_HOLE_FRAC):
+        return f"holes {hole:.3f}"
+    fills = _su_svg_ink_fills(base_svg) + [h for h in _su_svg_ink_fills(alt_svg) if h not in _su_svg_ink_fills(base_svg)]
+    if len(fills) < 1:
+        return None
+    rgb = np.stack([_su_hex_rgb(hx) for hx in fills], axis=0)
+    lab = _su_cie_lab(rgb.reshape(1, -1, 3))[0]
+    parent = list(range(len(fills)))
+
+    def find(i):
+        while parent[i] != i:
+            parent[i] = parent[parent[i]]
+            i = parent[i]
+        return i
+
+    merge = float(_SU_INK_MERGE_DE)
+    for i in range(len(fills)):
+        for j in range(i + 1, len(fills)):
+            if float(np.linalg.norm(lab[i] - lab[j])) < merge:
+                parent[find(j)] = find(i)
+    groups = {}
+    for i in range(len(fills)):
+        groups.setdefault(find(i), []).append(i)
+
+    def assign(rend):
+        rlab = _su_cie_lab(rend).reshape(-1, 3)
+        delta = rlab[:, None, :] - lab[None, :, :]
+        d2 = np.sum(delta * delta, axis=2)
+        idx = np.argmin(d2, axis=1)
+        md = np.sqrt(d2[np.arange(idx.shape[0]), idx])
+        bgd = _su_de76(rlab, bg)
+        out = idx.reshape(rend.shape[:2]).copy()
+        bad = (md > 22.0) | (bgd < 14.0)
+        out[bad.reshape(rend.shape[:2])] = -1
+        return out
+
+    bi = assign(base_r)
+    ai = assign(alt_r)
+    n = float(h * w)
+    floor = float(_SU_INK_MIN_FRAC) * n
+    for members in groups.values():
+        sm = np.isin(bi, members)
+        rm = np.isin(ai, members)
+        sa = int(sm.sum())
+        if sa < floor:
+            continue
+        ra = int(rm.sum())
+        inter = int(np.logical_and(sm, rm).sum())
+        union = int(np.logical_or(sm, rm).sum())
+        iou = inter / float(max(union, 1))
+        ratio = ra / float(sa)
+        if iou < float(_SU_IOU_MIN):
+            return f"iou {iou:.2f}"
+        if ratio < float(_SU_AREA_RATIO_MIN):
+            return f"area {ratio:.2f}"
+    return None
+
+
+def _su_accept_plate(base_svg, alt_svg, src_rgb):
+    """Trim extra specks, clear a hair of bloat, then keep the plate or say why not."""
+    if not alt_svg or not base_svg:
+        return None, "empty"
+    try:
+        keep_n = _svg_speck_count(base_svg)
+        alt_svg = _su_trim_extra_specks(alt_svg, keep_n)
+        alt_svg = _su_clear_near_bloat(alt_svg)
+        alt_svg, ncover = _su_cover_specks(alt_svg, src_rgb)
+        if ncover:
+            alt_svg, _ncover = _su_cover_specks(alt_svg, src_rgb)
+        if _svg_speck_count(alt_svg) > keep_n:
+            return None, "specks"
+        if _svg_bloat_count(alt_svg) > _svg_bloat_count(base_svg):
+            return None, "bloat"
+        if not (_svg_flip_rate(alt_svg) < _svg_flip_rate(base_svg) - 1e-12):
+            return None, "flips"
+        loss = _su_plate_loss(base_svg, alt_svg, src_rgb)
+        if loss:
+            return None, loss
+        wide = _guard_reason(base_svg, alt_svg, src_rgb)
+        if wide:
+            return None, wide
+    except Exception as e:
+        return None, f"guard {e}"
+    return alt_svg, None
 
 
 def _vectorize_small_soft(path, inches, t0):
@@ -12714,14 +14466,136 @@ def _vectorize_small_soft(path, inches, t0):
     up = _su_partition_upsample(shade, 4, 0.0)
     up = _su_drop_round_crumbs(up, rgb, max_area=160)
     up, pal = restore_white_art_ink(up, pal, rgb)
-    svg, width_in, height_in, ncolors = _su_trace_svg(up, pal, h0, w0, inches=inches)
-    if svg.count("<path") < 2:
+
+    def _finish_su(raw):
+        if not raw or raw.count("<path") < 2:
+            return None
+        out = _su_relax_bloat(raw, 900.0 / float(inches if inches else 10.0))
+        out, nspeck = _su_cover_specks(out, rgb)
+        if nspeck:
+            out, _ns = _su_cover_specks(out, rgb)
+        return out
+
+    # Previous fit, and (unless --smooth 0) the same plates blurred together.
+    # --smooth 0 is the previous fit alone. A rung that loses white ink or
+    # coverage is retried milder, then the previous fit.
+    def _run_su(am, ot, sm, labels=None):
+        raw, wi, hi, nc = _su_trace_svg(
+            up if labels is None else labels,
+            pal,
+            h0,
+            w0,
+            inches=inches,
+            alphamax=am,
+            opttol=ot,
+            smooth=sm,
+        )
+        return _finish_su(raw), wi, hi, nc
+
+    def _run_plate(sigma, thin, am):
+        labmap = _su_partition_smooth(up, pal, sigma, thin)
+        svg_p, _wi, _hi, nc = _run_su(am, 0.8, 0.0, labmap)
+        return svg_p, nc
+
+    smooth_curve = "base"
+    used_opt, used_am = 0.8, 1.333
+    used_sigma = 0.0
+    base_hold = None
+    base_nc = None
+    plate_am = _logo_alphamax() if _CORNERS_CTRL is not None else 1.333
+    if _curve_fair_enabled():
+        sigma0, thin0 = _SU_PLATE_RUNGS[0]
+        try:
+            from concurrent.futures import ThreadPoolExecutor
+            with ThreadPoolExecutor(max_workers=2) as pool:
+                fut_b = pool.submit(_run_su, 1.333, 0.8, 1.1)
+                fut_a = pool.submit(_run_plate, sigma0, thin0, plate_am)
+                svg, width_in, height_in, ncolors = fut_b.result()
+                alt, alt_nc = fut_a.result()
+        except Exception as e:
+            sys.stderr.write(f"small smooth skipped: {e}\n")
+            svg, width_in, height_in, ncolors = _run_su(1.333, 0.8, 1.1)
+            alt, alt_nc = None, None
+        if svg and alt:
+            base_hold = svg
+            base_nc = ncolors
+            kept, why = _su_accept_plate(svg, alt, rgb)
+            if kept is not None:
+                svg = kept
+                smooth_curve = "aa"
+                used_am = plate_am
+                used_sigma = float(sigma0)
+                ncolors = alt_nc
+                sys.stderr.write(f"small smooth kept: sigma {sigma0:.1f}\n")
+            else:
+                sys.stderr.write(f"small smooth fallback: {why}\n")
+                for sigma, thin in _SU_PLATE_RUNGS[1:]:
+                    try:
+                        alt2, nc2 = _run_plate(sigma, thin, plate_am)
+                    except Exception as e:
+                        sys.stderr.write(f"small smooth skipped: {e}\n")
+                        break
+                    kept, why = _su_accept_plate(svg, alt2, rgb)
+                    if kept is not None:
+                        svg = kept
+                        smooth_curve = "aa"
+                        used_am = plate_am
+                        used_sigma = float(sigma)
+                        ncolors = nc2
+                        sys.stderr.write(f"small smooth kept: sigma {sigma:.1f}\n")
+                        break
+                    sys.stderr.write(f"small smooth fallback: {why}\n")
+    else:
+        svg, width_in, height_in, ncolors = _run_su(1.333, 0.8, 1.1)
+    # Gentle-curve flatten runs on the SVG we ship. Judge the smoothed plate
+    # after that flatten, and paint any paper speck it opened. The unsmoothed
+    # fit is left for the shared finish so it stays the live result.
+    gentle_flat = False
+    if smooth_curve == "aa" and base_hold and _curve_fair_enabled():
+        try:
+            flat = _flatten_gentle_svg(svg)
+            base_f = _flatten_gentle_svg(base_hold)
+            # Flatten can push a curve back under the speck cut. Lift those
+            # crumbs back over it before comparing with the unsmoothed fit.
+            flat = _su_trim_extra_specks(flat, _svg_speck_count(base_f))
+            flat, ncov = _su_cover_specks(flat, rgb)
+            if ncov:
+                flat, _ncov = _su_cover_specks(flat, rgb)
+            why = None
+            if _svg_speck_count(flat) > _svg_speck_count(base_f):
+                why = "specks"
+            elif _svg_bloat_count(flat) > _svg_bloat_count(base_f):
+                why = "bloat"
+            elif not (_svg_flip_rate(flat) < _svg_flip_rate(base_f) - 1e-12):
+                why = "flips"
+            else:
+                why = _su_plate_loss(base_f, flat, rgb)
+        except Exception as e:
+            why = str(e)
+            flat = None
+        if why or not flat:
+            sys.stderr.write(f"small smooth fallback: flat {why}\n")
+            svg = base_hold
+            ncolors = base_nc
+            smooth_curve = "base"
+            used_sigma = 0.0
+            used_am = 1.333
+        else:
+            gwhy = None
+            try:
+                gwhy = _guard_reason(base_f, flat, rgb)
+            except Exception as e:
+                sys.stderr.write(f"small guard skipped: {e}\n")
+            if gwhy:
+                # The plate already passed. A flatten that opens a raster
+                # speck or drops source coverage is skipped; the plate ships.
+                sys.stderr.write(f"small smooth flatten skipped: {gwhy}\n")
+                gentle_flat = True
+            else:
+                svg = flat
+                gentle_flat = True
+    if not svg:
         return None, None
-    px_scale = 900.0 / float(inches if inches else 10.0)
-    svg = _su_relax_bloat(svg, px_scale)
-    svg, nspeck = _su_cover_specks(svg, rgb)
-    if nspeck:
-        svg, _ns = _su_cover_specks(svg, rgb)
     n_paths = len(re.findall(r"<path\b", svg, re.I))
     meta = {
         "engine": "decoclub-vector",
@@ -12742,6 +14616,13 @@ def _vectorize_small_soft(path, inches, t0):
         "shared_edge": False,
         "small_soft": True,
         "polish": {},
+        "smooth_curve": smooth_curve,
+        "smooth_opttol": used_opt,
+        "smooth_alphamax": round(float(used_am), 3),
+        "smooth_plate_sigma": round(float(used_sigma), 2),
+        "gentle_flat": bool(gentle_flat),
+        "trace_sx": width_in / float(up.shape[1]),
+        "trace_sy": height_in / float(up.shape[0]),
     }
     return svg, meta
 
@@ -12910,9 +14791,488 @@ def _speed_write(sink):
         )
 
 
+# How far a cubic may leave its old samples, in render pixels (900px long
+# edge), when a gentle curvature reversal is flattened. Sharp corners
+# (interior angle under 120°) are not treated as reversals, so letters,
+# peaks, and stars stay put. Straight cubics have collinear handles and
+# stay straight when the handles get shorter.
+# Render-pixel cap for a gentle-flip edit. Near-white fills use the tighter
+# cap: the white-art hull moves when that outline pulls in, and the gate
+# fails a coverage drop above 1%.
+_GENTLE_FLAT_CAP_PX = 1.55
+_GENTLE_FLAT_WHITE_CAP_PX = 0.40
+
+
+def _svg_render_scale(svg_text):
+    """(px_per_user, vb_w, vb_h) using the gate's 900px long edge."""
+    m = re.search(
+        r'viewBox="\s*[-\d.]+\s+[-\d.]+\s+([-\d.]+)\s+([-\d.]+)\s*"',
+        svg_text or "",
+    )
+    if not m:
+        return None
+    vb_w = float(m.group(1))
+    vb_h = float(m.group(2))
+    if vb_w <= 0 or vb_h <= 0:
+        return None
+    aspect = vb_w / vb_h
+    rw = 900.0 if aspect >= 1.0 else max(1.0, float(int(round(900.0 * aspect))))
+    return rw / vb_w, vb_w, vb_h
+
+
+def _bez_samples(c, n=8):
+    p0, c1, c2, p3 = c
+    out = []
+    for j in range(n + 1):
+        t = j / float(n)
+        u = 1.0 - t
+        out.append((
+            u * u * u * p0[0] + 3 * u * u * t * c1[0] + 3 * u * t * t * c2[0] + t * t * t * p3[0],
+            u * u * u * p0[1] + 3 * u * u * t * c1[1] + 3 * u * t * t * c2[1] + t * t * t * p3[1],
+        ))
+    return out
+
+
+def _scale_cubic_handles(c, k):
+    p0, c1, c2, p3 = c
+    return (
+        p0,
+        (p0[0] + k * (c1[0] - p0[0]), p0[1] + k * (c1[1] - p0[1])),
+        (p3[0] + k * (c2[0] - p3[0]), p3[1] + k * (c2[1] - p3[1])),
+        p3,
+    )
+
+
+def _cubic_dev(a, b):
+    m = 0.0
+    for u, v in zip(_bez_samples(a), _bez_samples(b)):
+        d = math.hypot(u[0] - v[0], u[1] - v[1])
+        if d > m:
+            m = d
+    return m
+
+
+def _gentle_flips(pts):
+    """Counted gentle reversals. Same 120° corner skip and 1e-5 cross as the gate."""
+    flips = 0
+    prev = 0
+    for i in range(1, len(pts) - 1):
+        a, b, c = pts[i - 1], pts[i], pts[i + 1]
+        v1x, v1y = b[0] - a[0], b[1] - a[1]
+        v2x, v2y = c[0] - b[0], c[1] - b[1]
+        n1 = math.hypot(v1x, v1y)
+        n2 = math.hypot(v2x, v2y)
+        if n1 < 1e-9 or n2 < 1e-9:
+            continue
+        dot = (-v1x * v2x - v1y * v2y) / (n1 * n2)
+        if dot > 1.0:
+            dot = 1.0
+        elif dot < -1.0:
+            dot = -1.0
+        if dot > -0.5:
+            continue
+        cross = v1x * v2y - v1y * v2x
+        sign = 1 if cross > 1e-5 else (-1 if cross < -1e-5 else 0)
+        if sign and prev and sign != prev:
+            flips += 1
+        if sign:
+            prev = sign
+    return flips
+
+
+def _chain_pts(samples, lo, hi):
+    pts = []
+    for i in range(lo, hi + 1):
+        sm = samples[i]
+        if pts:
+            sm = sm[1:]
+        pts.extend(sm)
+    return pts
+
+
+def _gentle_bad_cubics(samples):
+    pts = []
+    own = []
+    for i, sm in enumerate(samples):
+        part = sm if not pts else sm[1:]
+        for p in part:
+            pts.append(p)
+            own.append(i)
+    bad = set()
+    prev = 0
+    prev_i = None
+    for i in range(1, len(pts) - 1):
+        a, b, c = pts[i - 1], pts[i], pts[i + 1]
+        v1x, v1y = b[0] - a[0], b[1] - a[1]
+        v2x, v2y = c[0] - b[0], c[1] - b[1]
+        n1 = math.hypot(v1x, v1y)
+        n2 = math.hypot(v2x, v2y)
+        if n1 < 1e-9 or n2 < 1e-9:
+            continue
+        dot = (-v1x * v2x - v1y * v2y) / (n1 * n2)
+        if dot > 1.0:
+            dot = 1.0
+        elif dot < -1.0:
+            dot = -1.0
+        if dot > -0.5:
+            continue
+        cross = v1x * v2y - v1y * v2x
+        sign = 1 if cross > 1e-5 else (-1 if cross < -1e-5 else 0)
+        if sign and prev and sign != prev:
+            bad.add(own[i])
+            if prev_i is not None:
+                bad.add(own[prev_i])
+        if sign:
+            prev = sign
+            prev_i = i
+    return bad
+
+
+def _ring_area(pts):
+    acc = 0.0
+    nxt = pts[1:] + pts[:1]
+    for a, b in zip(pts, nxt):
+        acc += a[0] * b[1] - b[0] * a[1]
+    return abs(acc) * 0.5
+
+
+def _flatten_cubic_ring(cubics, cap_user, speck_limit):
+    """Shorten handles on cubics that carry a gentle reversal. None = keep."""
+    samples = [_bez_samples(c) for c in cubics]
+    if not _gentle_bad_cubics(samples):
+        return None
+    orig = cubics
+    cur = list(cubics)
+    changed = False
+    for _pass in range(3):
+        samples = [_bez_samples(c) for c in cur]
+        bad = _gentle_bad_cubics(samples)
+        if not bad:
+            break
+        did = False
+        for i in sorted(bad):
+            lo = 0 if i == 0 else i - 1
+            hi = len(cur) - 1 if i + 1 >= len(cur) else i + 1
+            before = _gentle_flips(_chain_pts(samples, lo, hi))
+            if before < 1:
+                continue
+            best = None
+            for k in (0.72, 0.48, 0.28):
+                trial = _scale_cubic_handles(orig[i], k)
+                if _cubic_dev(orig[i], trial) > cap_user:
+                    continue
+                samples[i] = _bez_samples(trial)
+                after = _gentle_flips(_chain_pts(samples, lo, hi))
+                if after < before:
+                    best = trial
+                    break
+                samples[i] = _bez_samples(cur[i])
+            if best is not None:
+                cur[i] = best
+                samples[i] = _bez_samples(best)
+                did = True
+                changed = True
+        if not did:
+            break
+    if not changed:
+        return None
+    old_pts = []
+    new_pts = []
+    for i, c in enumerate(orig):
+        sm = _bez_samples(c)
+        old_pts.extend(sm if i == 0 else sm[1:])
+    for i, c in enumerate(cur):
+        sm = _bez_samples(c)
+        new_pts.extend(sm if i == 0 else sm[1:])
+    old_a = _ring_area(old_pts)
+    new_a = _ring_area(new_pts)
+    if old_a > 1e-12:
+        ratio = new_a / old_a
+        if ratio < 0.95 or ratio > 1.05:
+            return None
+        if old_a >= speck_limit and new_a < speck_limit:
+            return None
+    if _gentle_flips(new_pts) >= _gentle_flips(old_pts):
+        return None
+    return cur
+
+
+def _fmt_flat(n):
+    s = f"{float(n):.5f}".rstrip("0").rstrip(".")
+    if s in ("", "-0"):
+        return "0"
+    return s
+
+
+def _cubics_d(cubics):
+    p0 = cubics[0][0]
+    parts = [f"M {_fmt_flat(p0[0])} {_fmt_flat(p0[1])}"]
+    for c in cubics:
+        parts.append(
+            "C {0} {1} {2} {3} {4} {5}".format(
+                _fmt_flat(c[1][0]), _fmt_flat(c[1][1]),
+                _fmt_flat(c[2][0]), _fmt_flat(c[2][1]),
+                _fmt_flat(c[3][0]), _fmt_flat(c[3][1]),
+            )
+        )
+    parts.append("Z")
+    return " ".join(parts)
+
+
+def _subpath_cubics(d):
+    """Closed M/L/C/Z subpaths as cubic lists. None span = leave the text."""
+    toks = _PATH_TOK.findall(d or "")
+    i = 0
+    cx = cy = 0.0
+    sx0 = sy0 = 0.0
+    cmd = "M"
+    spans = []
+    cubics = None
+    closed = False
+
+    def num():
+        nonlocal i
+        v = float(toks[i])
+        i += 1
+        return v
+
+    def need(n):
+        return (len(toks) - i) >= n and toks[i] not in _CMD_SPEC
+
+    def start(x, y):
+        nonlocal cubics, closed, cx, cy, sx0, sy0
+        if cubics is not None:
+            spans.append((cubics, closed))
+        cubics = []
+        closed = False
+        cx, cy = x, y
+        sx0, sy0 = x, y
+
+    def add_line(x, y):
+        nonlocal cx, cy
+        if cubics is None:
+            return
+        p0 = (cx, cy)
+        p3 = (x, y)
+        cubics.append((
+            p0,
+            (p0[0] + (p3[0] - p0[0]) / 3.0, p0[1] + (p3[1] - p0[1]) / 3.0),
+            (p0[0] + 2.0 * (p3[0] - p0[0]) / 3.0, p0[1] + 2.0 * (p3[1] - p0[1]) / 3.0),
+            p3,
+        ))
+        cx, cy = x, y
+
+    def add_cubic(x1, y1, x2, y2, x, y):
+        nonlocal cx, cy
+        if cubics is None:
+            return
+        cubics.append(((cx, cy), (x1, y1), (x2, y2), (x, y)))
+        cx, cy = x, y
+
+    try:
+        while i < len(toks):
+            if toks[i] in _CMD_SPEC:
+                cmd = toks[i]
+                i += 1
+            rel = cmd.islower()
+            c = cmd.upper()
+            if c == "M":
+                if not need(2):
+                    break
+                x, y = num(), num()
+                if rel:
+                    x += cx
+                    y += cy
+                start(x, y)
+                cmd = "l" if rel else "L"
+                while need(2):
+                    x, y = num(), num()
+                    if rel:
+                        x += cx
+                        y += cy
+                    add_line(x, y)
+            elif c == "L":
+                while need(2):
+                    x, y = num(), num()
+                    if rel:
+                        x += cx
+                        y += cy
+                    add_line(x, y)
+            elif c == "C":
+                while need(6):
+                    x1, y1, x2, y2, x, y = num(), num(), num(), num(), num(), num()
+                    if rel:
+                        x1 += cx
+                        y1 += cy
+                        x2 += cx
+                        y2 += cy
+                        x += cx
+                        y += cy
+                    add_cubic(x1, y1, x2, y2, x, y)
+            elif c == "Z":
+                if cubics is not None and (abs(cx - sx0) > 1e-6 or abs(cy - sy0) > 1e-6):
+                    add_line(sx0, sy0)
+                closed = True
+                cx, cy = sx0, sy0
+            else:
+                # Quadratic / arc / smooth-shorthand: leave the whole path alone.
+                return None
+    except (ValueError, IndexError):
+        return None
+    if cubics is not None:
+        spans.append((cubics, closed))
+    return spans
+
+
+def _fill_luma(fill):
+    """sRGB luma of a #rgb / #rrggbb fill, or None."""
+    if not fill or not str(fill).startswith("#"):
+        return None
+    h = str(fill)[1:]
+    if len(h) == 3:
+        h = "".join(ch * 2 for ch in h)
+    if len(h) < 6:
+        return None
+    try:
+        r = int(h[0:2], 16)
+        g = int(h[2:4], 16)
+        b = int(h[4:6], 16)
+    except ValueError:
+        return None
+    return 0.2126 * r + 0.7152 * g + 0.0722 * b
+
+
+def _path_ds_with_fill(svg_text):
+    """Path `d` strings in document order, each with the fill it inherits."""
+    stack = [None]
+    out = []
+    for m in re.finditer(r"<(/?)(g|path)\b([^>]*)>", svg_text or ""):
+        slash, tag, attrs = m.group(1), m.group(2), m.group(3)
+        fm = re.search(r'\bfill="(#[0-9A-Fa-f]{3,8})"', attrs)
+        if tag == "g" and not slash:
+            stack.append(fm.group(1) if fm else stack[-1])
+        elif tag == "g" and slash:
+            if len(stack) > 1:
+                stack.pop()
+        elif tag == "path" and not slash:
+            dm = re.search(r'\bd="([^"]*)"', attrs)
+            if dm:
+                out.append((dm.group(1), fm.group(1) if fm else stack[-1]))
+    plain = re.findall(r'\bd="([^"]*)"', svg_text or "")
+    if len(out) != len(plain):
+        return [(d, None) for d in plain]
+    return out
+
+
+def _flatten_gentle_svg(svg_text, guard_src=None):
+    """Flatten gentle S-waves on closed fills. Open cracks are left alone.
+
+    Each kept edit shortens the handles of one cubic so a counted curvature
+    reversal goes away, without walking more than `_GENTLE_FLAT_CAP_PX`
+    render pixels off the old curve, without crossing the speck-area cut,
+    and without changing the area by more than 4%. The whole SVG is kept
+    only when speck count does not rise, a clean file does not gain a
+    bloated outline, and the flip rate actually falls.
+    """
+    if not svg_text or not _curve_fair_enabled():
+        return svg_text
+    scale = _svg_render_scale(svg_text)
+    if scale is None:
+        return svg_text
+    px, vb_w, vb_h = scale
+    speck_limit = _SVG_SPECK_AREA_FRAC * vb_w * vb_h
+    filled = _path_ds_with_fill(svg_text)
+    ds = [d for d, _fill in filled] if filled else re.findall(r'\bd="([^"]*)"', svg_text)
+    if not ds:
+        return svg_text
+    fills = [f for _d, f in filled] if filled and len(filled) == len(ds) else [None] * len(ds)
+    new_ds = []
+    any_change = False
+    for d, fill in zip(ds, fills):
+        lum = _fill_luma(fill)
+        cap_px = _GENTLE_FLAT_WHITE_CAP_PX if lum is not None and lum >= 200.0 else _GENTLE_FLAT_CAP_PX
+        cap_user = float(cap_px) / float(px)
+        parsed = _subpath_cubics(d)
+        if not parsed:
+            new_ds.append(d)
+            continue
+        spans = _SUBPATH_SPLIT.findall(d)
+        if len(spans) != len(parsed):
+            new_ds.append(d)
+            continue
+        out = []
+        changed = False
+        for span, (cubics, closed) in zip(spans, parsed):
+            if not closed or len(cubics) < 2:
+                out.append(span.strip())
+                continue
+            # Skip crumbs. Their flips barely move the rate and their area
+            # sits on the speck cut.
+            ring = []
+            for i, c in enumerate(cubics):
+                sm = _bez_samples(c, 4)
+                ring.extend(sm if i == 0 else sm[1:])
+            per = 0.0
+            for a, b in zip(ring, ring[1:]):
+                per += math.hypot(b[0] - a[0], b[1] - a[1])
+            if per * px < 8.0:
+                out.append(span.strip())
+                continue
+            got = _flatten_cubic_ring(cubics, cap_user, speck_limit)
+            if got is None:
+                out.append(span.strip())
+                continue
+            out.append(_cubics_d(got))
+            changed = True
+        if changed:
+            any_change = True
+            new_ds.append(" ".join(out))
+        else:
+            new_ds.append(d)
+    if not any_change:
+        return svg_text
+    it = iter(new_ds)
+
+    def repl(m):
+        return m.group(0)[: m.start(1) - m.start(0)] + next(it) + m.group(0)[m.end(1) - m.start(0) :]
+
+    updated = re.sub(r'\bd="([^"]*)"', repl, svg_text)
+    try:
+        if _svg_speck_count(updated) > _svg_speck_count(svg_text):
+            return svg_text
+        if _svg_bloat_count(svg_text) <= 0 and _svg_bloat_count(updated) > 0:
+            return svg_text
+        if not (_svg_flip_rate(updated) < _svg_flip_rate(svg_text) - 1e-12):
+            return svg_text
+    except Exception as e:
+        sys.stderr.write(f"gentle flatten guard failed: {e}\n")
+        return svg_text
+    if guard_src is not None:
+        try:
+            gwhy = _guard_reason(svg_text, updated, guard_src)
+        except Exception as e:
+            gwhy = None
+            sys.stderr.write(f"gentle flatten guard skipped: {e}\n")
+        if gwhy:
+            sys.stderr.write(f"gentle flatten fallback: {gwhy}\n")
+            return svg_text
+    return updated
+
+
 def _speed_finish(svg, meta, **note):
-    """Return the traced SVG unchanged. Optionally persist a colour-drop cache."""
+    """Persist a colour-drop cache. Smooth runs flatten gentle S-waves first."""
     global _LAST_PLATES
+    # The small-upload smoother flattens before its own guard. A second pass
+    # can open a paper speck the guard already cleared.
+    already = isinstance(meta, dict) and meta.get("gentle_flat")
+    if svg and _curve_fair_enabled() and not already:
+        try:
+            # Logo, small-upload fallback, art, poster, and vtracer all land
+            # here. The flatten is a different SVG from the one this route
+            # just traced, so the full guard decides whether it ships.
+            svg = _flatten_gentle_svg(svg, guard_src=_GUARD_SRC)
+        except Exception as e:
+            sys.stderr.write(f"gentle flatten skipped: {e}\n")
     _LAST_PLATES = dict(note)
     _LAST_PLATES["svg"] = svg
     _LAST_PLATES["meta"] = meta
@@ -13910,8 +16270,12 @@ def vectorize(path: str, inches: float = 10.0, colors=None, mode: str = "auto", 
     return svg, _with_inks(meta, plate_labels, plate_palette, plate_layers)
 
 def _vectorize_body(path: str, inches: float = 10.0, colors=None, mode: str = "auto"):
+    global _GUARD_SRC, _GUARD_ALPHA
     t0 = time.time()
     rgb0, alpha0 = load_rgba(path)
+    _guard_clear()
+    _GUARD_SRC = rgb0
+    _GUARD_ALPHA = alpha0
     h0, w0 = rgb0.shape[:2]
     src_score = junk_raster_score(rgb0)
     # Score the ORIGINAL upload only — cubic upsample invents colors and must not
@@ -14393,46 +16757,66 @@ def _vectorize_body(path: str, inches: float = 10.0, colors=None, mode: str = "a
         trace_assign = assign
         _sig_try = _logo_smooth_sigma(max(assign.shape) if assign.size else 1)
         _SMOOTH_APPLIED = False
-        # The vote map, after despeckle, when the vote actually moved the
-        # plates. None means this image stays on the base fit and is traced once.
+        # Heavy vote (native plates, tight fit) when it actually redrew the
+        # image. Otherwise a 2× anti-aliased partition, traced on that grid.
+        # None means smoothing is off (--smooth 0) and we trace once.
         smoothed_labels = None
+        smooth_scale = 1
+        smooth_kind = "base"
         if _sig_try > 0.05:
             try:
                 smoothed = _smooth_logo_assign(assign, palette, _sig_try)
                 moved = float(np.mean(np.asarray(smoothed) != np.asarray(assign)))
-                # A vote that only nudges edges is not worth the tighter fit:
-                # it is what packed nodes and specks on clean logos. The
-                # despeckle runs after that decision so it cannot pull a
-                # clean logo over the line, and the stored plates are what
-                # --from-cache retraces.
                 if moved >= _SMOOTH_KEEP_FRAC:
                     try:
                         smoothed = _despeckle_vote_plates(assign, smoothed, palette)
                     except Exception as e:
                         sys.stderr.write(f"logo despeckle skipped: {e}\n")
                     smoothed_labels = smoothed
+                    smooth_scale = 1
+                    smooth_kind = "heavy"
+                else:
+                    # The heavy vote barely moved a clean edge. Fit a 2×
+                    # anti-aliased iso of the same plates instead of skipping.
+                    sig_aa = min(_CURVE_AA_SIGMA_MAX, max(0.45, 0.32 * float(_sig_try)))
+                    aa = _aa_labels_scaled(assign, sig_aa, _CURVE_UPSCALE)
+                    if aa is not None and int(aa.shape[0]) == int(assign.shape[0]) * int(_CURVE_UPSCALE):
+                        smoothed_labels = aa
+                        smooth_scale = _CURVE_UPSCALE
+                        smooth_kind = "aa"
             except Exception as e:
                 sys.stderr.write(f"logo smooth skipped: {e}\n")
                 smoothed_labels = None
+                smooth_kind = "base"
+                smooth_scale = 1
         long_side = max(assign.shape) if assign.size else 1
         min_area_px = max(4 if keylined else 10, int(0.00003 * assign.size))
         paper_hex = to_hex(paper_rgb)
         try:
             built = None
             if smoothed_labels is not None:
-                # Second trace only when the vote is kept. Both fits are the
-                # SVGs this image just produced. Keep the tight one only when
-                # it does not add closed specks. A per-plate mix would open
-                # the shared seam (the two fits do not land on the same crack),
-                # so a miss replaces the whole image with the base fit.
-                fit_s = _logo_fit_knobs(long_side, applied=True)
+                # Both fits are SVGs this image just produced. Keep the smooth
+                # one only when it does not add closed specks. A per-plate mix
+                # would open the shared seam, so a miss replaces the whole image.
+                if smooth_kind == "heavy":
+                    fit_s = _logo_fit_knobs(long_side, applied=True)
+                    area_s = min_area_px
+                else:
+                    # opttolerance and the plate blur are in assign pixels.
+                    # Explicit --corners replaces the default alphamax.
+                    if _CORNERS_CTRL is None:
+                        am_s = float(_AA_ALPHAMAX)
+                    else:
+                        am_s = _logo_alphamax()
+                    fit_s = (am_s, float(_AA_OPTTOL), 0.0)
+                    area_s = min_area_px * smooth_scale * smooth_scale
                 fit_u = _logo_fit_knobs(long_side, applied=False)
 
-                def _one(labels, fit):
+                def _one(labels, fit, tscale, min_area):
                     try:
                         return _logo_mask_svg(
                             labels, palette, sx, sy, width_in, height_in,
-                            paper_hex, min_area_px, fit,
+                            paper_hex, min_area, fit, tscale,
                         )
                     except Exception as e:
                         sys.stderr.write(f"logo potrace mask failed: {e}\n")
@@ -14440,8 +16824,8 @@ def _vectorize_body(path: str, inches: float = 10.0, colors=None, mode: str = "a
 
                 from concurrent.futures import ThreadPoolExecutor
                 with ThreadPoolExecutor(max_workers=2) as pool:
-                    fut_s = pool.submit(_one, smoothed_labels, fit_s)
-                    fut_u = pool.submit(_one, assign, fit_u)
+                    fut_s = pool.submit(_one, smoothed_labels, fit_s, smooth_scale, area_s)
+                    fut_u = pool.submit(_one, assign, fit_u, 1, min_area_px)
                     res_s = fut_s.result()
                     res_u = fut_u.result()
                 def _count(res):
@@ -14455,22 +16839,145 @@ def _vectorize_body(path: str, inches: float = 10.0, colors=None, mode: str = "a
 
                 n_s = _count(res_s)
                 n_u = _count(res_u)
-                if res_s is not None and res_u is not None and n_s is not None and n_u is not None and n_s <= n_u:
-                    _SMOOTH_APPLIED = True
-                    trace_assign = smoothed_labels
+                # Plates cached for --from-cache stay on the native grid.
+                # The 2× map is only the curve fit; storing it would retrace
+                # at the wrong scale.
+                stored_labels = smoothed_labels if smooth_kind == "heavy" else assign
+                keep_s = (
+                    res_s is not None
+                    and res_u is not None
+                    and n_s is not None
+                    and n_u is not None
+                    and n_s <= n_u
+                )
+                # The heavy vote is the live tiger fit: speck count is the
+                # only gate, same as before. The anti-aliased fit can pack
+                # nodes or fail to get smoother, so it also has to beat the
+                # base on node-bloat and curvature flips.
+                reject = None
+                if keep_s and smooth_kind != "heavy":
+                    try:
+                        b_s = _svg_bloat_count(res_s[0])
+                        b_u = _svg_bloat_count(res_u[0])
+                        # A file that has no bloated outline must stay that way.
+                        # One that already fails node-bloat can keep a smoother
+                        # fit even when the count moves.
+                        if b_u <= 0 and b_s > 0:
+                            keep_s = False
+                            reject = f"bloat {b_s} > {b_u}"
+                    except Exception as e:
+                        keep_s = False
+                        reject = f"bloat count failed: {e}"
+                if keep_s and smooth_kind != "heavy":
+                    try:
+                        f_s = _svg_flip_rate(res_s[0])
+                        f_u = _svg_flip_rate(res_u[0])
+                        if not (f_s < f_u - 1e-12):
+                            keep_s = False
+                            reject = f"flips {f_s:.5f} >= {f_u:.5f}"
+                    except Exception as e:
+                        keep_s = False
+                        reject = f"flip count failed: {e}"
+                if keep_s and res_s is not None and res_u is not None:
+                    try:
+                        gwhy = _guard_reason(res_u[0], res_s[0], rgb0)
+                    except Exception as e:
+                        gwhy = None
+                        sys.stderr.write(f"logo guard skipped: {e}\n")
+                    if gwhy:
+                        sys.stderr.write(f"logo smooth guard: {gwhy}\n")
+                        # One milder fit before the whole image falls back.
+                        # A miss here is the same fallback the old checks used.
+                        try:
+                            if smooth_kind == "heavy":
+                                sig2 = max(0.8, float(_sig_try) * 0.5)
+                                sm2 = _smooth_logo_assign(assign, palette, sig2)
+                                try:
+                                    sm2 = _despeckle_vote_plates(assign, sm2, palette)
+                                except Exception:
+                                    pass
+                                moved2 = float(np.mean(np.asarray(sm2) != np.asarray(assign)))
+                                if moved2 >= _SMOOTH_KEEP_FRAC:
+                                    mild = (sm2, 1, "heavy")
+                                else:
+                                    mild = None
+                            else:
+                                mild = None
+                            if mild is None:
+                                sig_m = 0.45 if smooth_kind == "heavy" else max(0.35, float(sig_aa) * 0.55)
+                                aa_m = _aa_labels_scaled(assign, sig_m, _CURVE_UPSCALE)
+                                if (
+                                    aa_m is not None
+                                    and int(aa_m.shape[0]) == int(assign.shape[0]) * int(_CURVE_UPSCALE)
+                                ):
+                                    mild = (aa_m, _CURVE_UPSCALE, "aa")
+                            if mild is not None:
+                                lab_m, scale_m, kind_m = mild
+                                if kind_m == "heavy":
+                                    fit_m = _logo_fit_knobs(long_side, applied=True)
+                                    area_m = min_area_px
+                                else:
+                                    if _CORNERS_CTRL is None:
+                                        am_m = float(_AA_ALPHAMAX)
+                                    else:
+                                        am_m = _logo_alphamax()
+                                    fit_m = (am_m, float(_AA_OPTTOL), 0.0)
+                                    area_m = min_area_px * scale_m * scale_m
+                                res_m = _one(lab_m, fit_m, scale_m, area_m)
+                                n_m = _count(res_m)
+                                ok_m = (
+                                    res_m is not None
+                                    and n_m is not None
+                                    and n_u is not None
+                                    and n_m <= n_u
+                                )
+                                if ok_m and kind_m != "heavy":
+                                    try:
+                                        if _svg_bloat_count(res_u[0]) <= 0 and _svg_bloat_count(res_m[0]) > 0:
+                                            ok_m = False
+                                        elif not (
+                                            _svg_flip_rate(res_m[0]) < _svg_flip_rate(res_u[0]) - 1e-12
+                                        ):
+                                            ok_m = False
+                                    except Exception:
+                                        ok_m = False
+                                if ok_m:
+                                    gwhy2 = _guard_reason(res_u[0], res_m[0], rgb0)
+                                    if gwhy2:
+                                        ok_m = False
+                                        gwhy = gwhy2
+                                if ok_m:
+                                    res_s = res_m
+                                    smooth_kind = kind_m
+                                    smooth_scale = scale_m
+                                    stored_labels = lab_m if kind_m == "heavy" else assign
+                                    gwhy = None
+                                    sys.stderr.write(f"logo smooth kept: milder {kind_m}\n")
+                        except Exception as e:
+                            sys.stderr.write(f"logo milder skipped: {e}\n")
+                        if gwhy:
+                            keep_s = False
+                            reject = gwhy
+                if keep_s:
+                    _SMOOTH_APPLIED = smooth_kind == "heavy"
+                    trace_assign = stored_labels
                     built = res_s
                 elif res_u is not None:
                     _SMOOTH_APPLIED = False
                     trace_assign = assign
                     built = res_u
-                    if n_s is not None and n_u is not None and n_s > n_u:
-                        sys.stderr.write(f"logo smooth fallback: specks {n_s} > {n_u}\n")
+                    smooth_kind = "base"
+                    if reject is None and n_s is not None and n_u is not None and n_s > n_u:
+                        reject = f"specks {n_s} > {n_u}"
+                    if reject:
+                        sys.stderr.write(f"logo smooth fallback: {reject}\n")
                 elif res_s is not None:
-                    _SMOOTH_APPLIED = True
-                    trace_assign = smoothed_labels
+                    _SMOOTH_APPLIED = smooth_kind == "heavy"
+                    trace_assign = stored_labels
                     built = res_s
             else:
                 _SMOOTH_APPLIED = False
+                smooth_kind = "base"
                 built = _logo_mask_svg(
                     assign, palette, sx, sy, width_in, height_in, paper_hex,
                     min_area_px, _logo_fit_knobs(long_side, applied=False),
@@ -14507,6 +17014,7 @@ def _vectorize_body(path: str, inches: float = 10.0, colors=None, mode: str = "a
                     "smooth_sigma": round(float(_sig), 3),
                     "smooth_opttol": _opt,
                     "smooth_alphamax": round(float(_amax), 3),
+                    "smooth_curve": smooth_kind,
                 }
                 return _speed_finish(
                     svg,
