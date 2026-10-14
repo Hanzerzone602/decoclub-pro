@@ -20,6 +20,13 @@ function passwordProblem(pw) {
 }
 const { writeExports, intakePosterSvg, stripPaperUnderlaySvg } = require("./lib/exports");
 const { parsePreviewQuery, renderPreviewPng, loadSvgText } = require("./lib/previewRender");
+const {
+  servePreview,
+  takePreviewToken,
+  previewCacheKey,
+  clampHalftonePreviewBudget,
+  halftonePreviewRasterSpec,
+} = require("./lib/previewGate");
 const { writeMockups, BLANKS, searchBlanks, findBlank, blankPublicUrl } = require("./lib/mockup");
 const { loadCatalog, findSku, searchCatalog } = require("./lib/catalog");
 const { generateBadgePng } = require("./lib/demoart");
@@ -1459,6 +1466,41 @@ function previewArtEntitled(user, job) {
   const unlocks = job.unlocks || {};
   return !!(unlocks.vectorize || unlocks.halftones);
 }
+/** Clean halftone SVG (preview response or saved file). Admin is exempt.
+ * free_image jobs stay watermarked previews even when unlocks.halftones is set,
+ * same rule as vector preview. A vectorize unlock does not entitle halftones. */
+function previewHalftoneEntitled(user, job) {
+  if (user && user.role === "admin") return true;
+  if (!user || !job) return false;
+  if (job.free_image) return false;
+  if (halftoneIncluded(user)) return true;
+  const unlocks = job.unlocks || {};
+  return !!unlocks.halftones;
+}
+function previewActorKey(user, req) {
+  if (user && user.id) return "u:" + user.id;
+  return "ip:" + clientIp(req);
+}
+function sendPreviewLimited(res, retryAfter) {
+  const secs = Math.max(1, Math.ceil(Number(retryAfter) || 1));
+  return send(res, 429, JSON.stringify({ error: "Too many preview requests" }), {
+    "Content-Type": "application/json; charset=utf-8",
+    "Retry-After": String(secs),
+    "Cache-Control": "private, no-store",
+  });
+}
+function sendPreviewFailure(res, err) {
+  if (err && err.status === 429) return sendPreviewLimited(res, err.retryAfter);
+  if (err && err.status === 503) {
+    return send(res, 503, JSON.stringify({ error: "Preview busy" }), {
+      "Content-Type": "application/json; charset=utf-8",
+      "Retry-After": "2",
+      "Cache-Control": "private, no-store",
+    });
+  }
+  console.error("preview render", err && err.message);
+  return json(res, 500, { error: "Preview render failed" });
+}
 function clientVector(job, req) {
   const v = presentVector(job && job.vector);
   if (!v) return v;
@@ -1845,28 +1887,39 @@ async function handleApi(req, res, url) {
     if (!fs.existsSync(abs)) return json(res, 404, { error: "Vector art not found" });
     const q = parsePreviewQuery(url.searchParams);
     if (!q.ok) return json(res, 400, { error: q.error || "Bad preview query" });
-    let png;
+    const st = fs.statSync(abs);
+    const watermark = !previewArtEntitled(user, job);
+    const spec = {
+      x: q.x,
+      y: q.y,
+      w: q.w,
+      h: q.h,
+      pw: q.pw,
+      ph: q.ph,
+      mode: q.mode,
+      watermark: watermark,
+    };
     try {
-      const svgText = loadSvgText(abs);
-      png = renderPreviewPng(svgText, {
-        x: q.x,
-        y: q.y,
-        w: q.w,
-        h: q.h,
-        pw: q.pw,
-        ph: q.ph,
-        mode: q.mode,
-        watermark: !previewArtEntitled(user, job),
+      const out = await servePreview({
+        actor: previewActorKey(user, req),
+        key: previewCacheKey({
+          jobId: job.id,
+          mtime: st.mtimeMs + ":" + st.size,
+          mode: q.mode,
+          watermark: watermark,
+          params: { x: q.x, y: q.y, w: q.w, h: q.h, pw: q.pw, ph: q.ph, zoom: q.zoom },
+        }),
+        render: function () { return renderPreviewPng(loadSvgText(abs), spec); },
+      });
+      return send(res, 200, out.png, {
+        "Content-Type": "image/png",
+        "Cache-Control": "private, max-age=30",
+        "Vary": "Cookie",
+        "X-Preview-Cache": out.cache,
       });
     } catch (err) {
-      console.error("preview.png", err && err.message);
-      return json(res, 500, { error: "Preview render failed" });
+      return sendPreviewFailure(res, err);
     }
-    return send(res, 200, png, {
-      "Content-Type": "image/png",
-      "Cache-Control": "private, max-age=30",
-      "Vary": "Cookie",
-    });
   }
 
   const jobGet = pth.match(/^\/api\/jobs\/([^/]+)$/);
@@ -1998,28 +2051,66 @@ async function handleApi(req, res, url) {
         return json(res, 400, { error: "Could not convert art to PNG for halftone — export a PNG and drop that" });
       }
     }
+    const budget = clampHalftonePreviewBudget(body);
+    const htOpts = {
+      style: styleId,
+      lpi: body.lpi,
+      angle: body.angle,
+      contrast: body.contrast,
+      colorMode: body.colorMode || body.color_mode || "source",
+      color: body.color || "#000000",
+      knockout: body.knockout != null || body.knockoutWhite != null
+        ? !!(body.knockout || body.knockoutWhite)
+        : true,
+      paperUnderlay: !!(body.paperUnderlay || body.whitePlate),
+      widthIn: job.width_in || 10,
+      heightIn: job.height_in || job.width_in || 10,
+      preview: true,
+      // Transparent SVG + CSS checker — match Apply (no baked white plate).
+      previewPlate: false,
+      // Ignore client values above the preview cap. Apply keeps its own budget.
+      maxEdge: budget.maxEdge,
+      maxCells: budget.maxCells,
+    };
+    const actor = previewActorKey(user, req);
+    const ticket = takePreviewToken(actor);
+    if (!ticket.ok) return sendPreviewLimited(res, ticket.retryAfter);
     try {
-      const packed = vectorHalftone.halftoneToSvg(srcBuf, {
-        style: styleId,
-        lpi: body.lpi,
-        angle: body.angle,
-        contrast: body.contrast,
-        colorMode: body.colorMode || body.color_mode || "source",
-        color: body.color || "#000000",
-        knockout: body.knockout != null || body.knockoutWhite != null
-          ? !!(body.knockout || body.knockoutWhite)
-          : true,
-        paperUnderlay: !!(body.paperUnderlay || body.whitePlate),
-        widthIn: job.width_in || 10,
-        heightIn: job.height_in || job.width_in || 10,
-        preview: true,
-        // Transparent SVG + CSS checker — match Apply (no baked white plate).
-        previewPlate: false,
-        maxEdge: body.maxEdge,
-        maxCells: body.maxCells,
+      const packed = vectorHalftone.halftoneToSvg(srcBuf, htOpts);
+      const entitled = previewHalftoneEntitled(user, job);
+      if (entitled) return json(res, 200, { svg: packed.svg, meta: packed.meta });
+      const st = fs.statSync(abs);
+      const out = await servePreview({
+        actor: actor,
+        charged: true,
+        key: previewCacheKey({
+          jobId: job.id,
+          mtime: st.mtimeMs + ":" + st.size,
+          mode: "halftone",
+          watermark: true,
+          params: {
+            style: htOpts.style,
+            lpi: Number.isFinite(Number(htOpts.lpi)) ? Number(htOpts.lpi) : null,
+            angle: Number.isFinite(Number(htOpts.angle)) ? Number(htOpts.angle) : null,
+            contrast: Number.isFinite(Number(htOpts.contrast)) ? Number(htOpts.contrast) : null,
+            colorMode: htOpts.colorMode,
+            color: htOpts.color,
+            knockout: htOpts.knockout,
+            paperUnderlay: htOpts.paperUnderlay,
+            widthIn: htOpts.widthIn,
+            heightIn: htOpts.heightIn,
+            maxEdge: budget.maxEdge,
+            maxCells: budget.maxCells,
+          },
+        }),
+        render: function () { return renderPreviewPng(packed.svg, halftonePreviewRasterSpec(true)); },
       });
-      return json(res, 200, { svg: packed.svg, meta: packed.meta });
+      return json(res, 200, {
+        png: "data:image/png;base64," + out.png.toString("base64"),
+        meta: packed.meta,
+      });
     } catch (err) {
+      if (err && (err.status === 429 || err.status === 503)) return sendPreviewFailure(res, err);
       return json(res, 400, { error: clientFacingError(err, "Could not preview halftone") });
     }
   }

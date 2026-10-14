@@ -82,7 +82,11 @@ async function api(url, opts = {}) {
     const err = new Error(shopHttpError(res.status, data, "Request failed"));
     err.status = res.status;
     if (res.status === 413) err.code = "PAYLOAD_TOO_LARGE";
-    else if (res.status === 429) err.code = "RATE_LIMIT";
+    else if (res.status === 429) {
+      err.code = "RATE_LIMIT";
+      const ra = Number(res.headers.get("Retry-After") || res.headers.get("retry-after"));
+      if (Number.isFinite(ra) && ra > 0) err.retryAfter = ra;
+    }
     throw err;
   }
   return data;
@@ -115,6 +119,7 @@ function showArtWorking(label) {
 let htPanelWantOpen = false;
 let htPreviewTimer = null;
 let htPreviewSeq = 0;
+let htPreviewAbort = null;
 
 function hideArtWorking() {
   const ov = document.getElementById("artWorking");
@@ -1379,6 +1384,15 @@ async function fillArt(el, job, shopControls) {
   }
 
   function clearHtPreview() {
+    if (htPreviewTimer) {
+      clearTimeout(htPreviewTimer);
+      htPreviewTimer = null;
+    }
+    htPreviewSeq += 1;
+    if (htPreviewAbort) {
+      try { htPreviewAbort.abort(); } catch (e) { /* ignore */ }
+      htPreviewAbort = null;
+    }
     const frame = $("#htPreviewFrame");
     if (frame) {
       frame.hidden = true;
@@ -1405,6 +1419,24 @@ async function fillArt(el, job, shopControls) {
     }
     frame.hidden = false;
     frame.classList.remove("is-loading");
+    drop.classList.add("ht-previewing", "has-art");
+  }
+
+  /** Unpaid previews are a watermarked PNG. Checkerboard stays on the frame. */
+  function showHtPreviewPng(src) {
+    const frame = $("#htPreviewFrame");
+    const drop = $("#artDrop");
+    if (!frame || !drop || !src) return;
+    frame.innerHTML = "";
+    const img = document.createElement("img");
+    img.className = "ht-preview-png";
+    img.alt = "Halftone preview";
+    img.onload = () => { frame.classList.remove("is-loading"); };
+    img.onerror = () => { frame.classList.remove("is-loading"); };
+    img.src = src;
+    frame.appendChild(img);
+    frame.hidden = false;
+    if (img.complete) frame.classList.remove("is-loading");
     drop.classList.add("ht-previewing", "has-art");
   }
 
@@ -1440,6 +1472,11 @@ async function fillArt(el, job, shopControls) {
     const hint = $("#htHint");
     const frame = $("#htPreviewFrame");
     const seq = ++htPreviewSeq;
+    if (htPreviewAbort) {
+      try { htPreviewAbort.abort(); } catch (e) { /* ignore */ }
+    }
+    const ac = typeof AbortController === "function" ? new AbortController() : null;
+    htPreviewAbort = ac;
     try {
       if (frame) {
         frame.hidden = false;
@@ -1450,13 +1487,34 @@ async function fillArt(el, job, shopControls) {
       if (hint) hint.textContent = "Updating preview…";
       await ensurePngArtwork(job);
       if (seq !== htPreviewSeq) return;
-      const data = await api("/api/jobs/" + job.id + "/halftone/preview", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify(htPayload()),
-      });
+      const postPreview = async (attempt) => {
+        try {
+          return await api("/api/jobs/" + job.id + "/halftone/preview", {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify(htPayload()),
+            signal: ac ? ac.signal : undefined,
+          });
+        } catch (err) {
+          if (err && err.code === "ABORTED") throw err;
+          if (err && err.status === 429 && attempt < 1 && seq === htPreviewSeq) {
+            const waitMs = Math.min(3000, Math.max(400, (Number(err.retryAfter) || 1) * 1000));
+            await new Promise((r) => setTimeout(r, waitMs));
+            if (seq !== htPreviewSeq || (ac && ac.signal.aborted)) {
+              const aborted = new Error("aborted");
+              aborted.code = "ABORTED";
+              throw aborted;
+            }
+            return postPreview(attempt + 1);
+          }
+          throw err;
+        }
+      };
+      const data = await postPreview(0);
       if (seq !== htPreviewSeq) return;
-      if (data && data.svg) showHtPreviewSvg(data.svg);
+      if (data && data.png && !data.svg) showHtPreviewPng(data.png);
+      else if (data && data.svg) showHtPreviewSvg(data.svg);
+      else if (data && data.png) showHtPreviewPng(data.png);
       const meta = (data && data.meta) || {};
       if (hint) {
         hint.textContent = "Preview · " + (meta.styleName || htStyle) + " · " + (meta.elements || "?") +
@@ -1464,6 +1522,11 @@ async function fillArt(el, job, shopControls) {
       }
     } catch (err) {
       if (seq !== htPreviewSeq) return;
+      if (err && (err.code === "ABORTED" || err.name === "AbortError")) return;
+      if (err && err.status === 429) {
+        if (frame) frame.classList.remove("is-loading");
+        return;
+      }
       if (frame) frame.classList.remove("is-loading");
       if (hint) hint.textContent = (err && err.message) || "Preview failed — try Apply or re-drop art.";
     }
@@ -1831,9 +1894,14 @@ function bindArtZoom(stage, opts) {
   let reqSeq = 0;
   let sharpTimer = 0;
   let aspectKnown = false;
+  let previewAbort = null;
   if (stage._dcZoomAbort) stage._dcZoomAbort.abort();
   const zoomAbort = new AbortController();
   stage._dcZoomAbort = zoomAbort;
+  if (stage._dcPreviewAbort) {
+    try { stage._dcPreviewAbort.abort(); } catch (e) { /* ignore */ }
+    stage._dcPreviewAbort = null;
+  }
   const pointers = new Map();
   let pan = null;
   let pinch = null;
@@ -1975,10 +2043,13 @@ function bindArtZoom(stage, opts) {
       q.set("ph", String(Math.min(2048, Math.max(8, Math.round(screen.h * dpr)))));
     }
     const url = "/api/jobs/" + encodeURIComponent(opts.jobId) + "/preview.png?" + q.toString();
-    fetch(url, { credentials: "include" }).then((res) => {
-      if (!res.ok) throw new Error("preview " + res.status);
-      return res.blob();
-    }).then((blob) => {
+    if (previewAbort) {
+      try { previewAbort.abort(); } catch (e) { /* ignore */ }
+    }
+    const ac = new AbortController();
+    previewAbort = ac;
+    stage._dcPreviewAbort = ac;
+    const applyBlob = (blob) => {
       if (seq !== reqSeq || zoomGen !== artZoomGen) return;
       const obj = URL.createObjectURL(blob);
       const pre = new Image();
@@ -2006,7 +2077,27 @@ function bindArtZoom(stage, opts) {
       };
       pre.onerror = () => { URL.revokeObjectURL(obj); };
       pre.src = obj;
-    }).catch(() => {});
+    };
+    const fetchSharp = (attempt) => {
+      return fetch(url, { credentials: "include", signal: ac.signal }).then(async (res) => {
+        if (seq !== reqSeq || zoomGen !== artZoomGen) return;
+        if (res.status === 429 && attempt < 1) {
+          try { if (res.body && res.body.cancel) res.body.cancel(); } catch (e) { /* ignore */ }
+          const ra = Number(res.headers.get("retry-after"));
+          const waitMs = Math.min(3000, Math.max(400, (Number.isFinite(ra) && ra > 0 ? ra : 1) * 1000));
+          await new Promise((r) => setTimeout(r, waitMs));
+          if (seq !== reqSeq || zoomGen !== artZoomGen || ac.signal.aborted) return;
+          return fetchSharp(attempt + 1);
+        }
+        if (!res.ok) throw new Error("preview " + res.status);
+        const blob = await res.blob();
+        if (seq !== reqSeq || zoomGen !== artZoomGen) return;
+        applyBlob(blob);
+      });
+    };
+    fetchSharp(0).catch((err) => {
+      if (err && err.name === "AbortError") return;
+    });
   }
   function doFit() {
     const st = stageSize();

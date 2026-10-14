@@ -35,9 +35,20 @@ const SOLID = `<?xml version="1.0" encoding="UTF-8"?>
 </svg>
 `;
 
+let lastPreviewAt = 0;
 function req(port, method, urlPath, opts) {
   opts = opts || {};
-  return new Promise((resolve, reject) => {
+  const pace = String(urlPath).indexOf("/preview.png") === -1
+    ? Promise.resolve()
+    : new Promise((resolve) => {
+      // Stay under the preview token bucket (burst 4/sec) so these checks stay 200s.
+      const now = Date.now();
+      const wait = Math.max(0, lastPreviewAt + 270 - now);
+      lastPreviewAt = now + wait;
+      if (wait > 0) setTimeout(resolve, wait);
+      else resolve();
+    });
+  return pace.then(() => new Promise((resolve, reject) => {
     const headers = Object.assign({}, opts.headers || {});
     const body = opts.body == null ? null : Buffer.from(opts.body);
     if (body && !headers["Content-Type"] && !headers["content-type"]) headers["Content-Type"] = "application/json";
@@ -56,7 +67,7 @@ function req(port, method, urlPath, opts) {
     r.on("error", reject);
     if (body) r.write(body);
     r.end();
-  });
+  }));
 }
 
 function cookieFrom(res) {

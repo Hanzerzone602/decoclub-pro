@@ -673,11 +673,14 @@ th { color: var(--muted); font-weight: 600; font-size: 11px; letter-spacing: .06
   z-index: 1;
   pointer-events: none;
 }
-.ht-preview-frame svg {
+.ht-preview-frame svg,
+.ht-preview-frame img.ht-preview-png {
   width: 100%;
   height: auto;
   max-height: 420px;
   overflow: visible;
+  object-fit: contain;
+  background: transparent;
 }
 .art-drop.ht-previewing .art-zoom-inner {
   opacity: 0.12;
