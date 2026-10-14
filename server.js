@@ -2153,7 +2153,7 @@ async function handleApi(req, res, url) {
         paperUnderlay: !!(body.paperUnderlay || body.whitePlate),
         widthIn: job.width_in || 10,
         heightIn: job.height_in || job.width_in || 10,
-        maxEdge: body.maxEdge,
+        maxEdge: Math.min(Number(body.maxEdge) || 4000, 4000),
       });
       const svgName = Date.now() + "-" + uid() + "-halftone.svg";
       fs.writeFileSync(path.join(UPLOADS, svgName), packed.svg);
