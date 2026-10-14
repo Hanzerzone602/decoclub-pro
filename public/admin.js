@@ -41,6 +41,7 @@ async function render() {
   if (view === "shops") return renderShops();
   if (view === "settings") return renderSettings();
   if (view === "jobs") return renderJobs();
+  if (view === "messages") return renderMessages();
   if (view === "system") return renderSystem();
   if (view === "users") return renderUsers();
   return renderOverview();
@@ -349,6 +350,25 @@ async function renderJobs() {
       renderJobs();
     };
   });
+}
+
+async function renderMessages() {
+  const data = await api("/api/admin/contact-messages");
+  const rows = data.messages || [];
+  main.innerHTML = `
+    <h1 style="font-size:28px;margin-top:0">Messages</h1>
+    <p class="muted">${rows.length} contact message${rows.length === 1 ? "" : "s"}, newest first.</p>
+    <table>
+      <thead><tr><th>When</th><th>Name</th><th>Email</th><th>Subject</th><th>Message</th><th>Emailed</th></tr></thead>
+      <tbody>${rows.map((m) => `<tr>
+        <td class="mono">${fmtDate(m.created_at)}</td>
+        <td>${escapeHtml(m.name)}</td>
+        <td>${escapeHtml(m.email)}</td>
+        <td>${escapeHtml(m.subject)}</td>
+        <td style="white-space:pre-wrap;max-width:360px">${escapeHtml(m.message)}</td>
+        <td>${m.emailed ? "yes" : "no"}</td>
+      </tr>`).join("") || `<tr><td colspan="6" class="muted">No messages yet</td></tr>`}</tbody>
+    </table>`;
 }
 
 async function renderSettings() {

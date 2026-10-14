@@ -105,7 +105,7 @@ function checkPass(pw, stored) {
 }
 function emptyStore() {
   return {
-    shops: [], users: [], sessions: [], jobs: [], events: [],
+    shops: [], users: [], sessions: [], jobs: [], events: [], contact_messages: [],
     settings: { trial_days: 7, shop_price_cents: 7900, studio_price_cents: 14900, halftone_single_cents: 300, halftone_pack10_cents: 2000, vector_single_cents: 300, vector_pack10_cents: 2000 },
   };
 }
@@ -1138,6 +1138,7 @@ function load() {
   if (JSON.stringify(db.settings) !== before) dirty = true;
   if (ensureUserHalftoneCredits(db)) dirty = true;
   if (ensureAdmin(db)) dirty = true;
+  if (ensureContactMessages(db)) dirty = true;
   if (pruneExpiredSessions(db)) dirty = true;
   if (dirty) save(db);
   return db;
@@ -1262,6 +1263,29 @@ function loginFailRecord(ip) {
 }
 function loginFailClear(ip) {
   delete loginFailByIp[ip];
+}
+function ensureContactMessages(db) {
+  if (!db || Array.isArray(db.contact_messages)) return false;
+  db.contact_messages = [];
+  return true;
+}
+const contactHitByIp = Object.create(null);
+const CONTACT_WINDOW_MS = 60 * 60 * 1000;
+const CONTACT_MAX = 3;
+const CONTACT_THANKS = "Thanks — we got your message and will reply by email soon.";
+function contactRateLimited(ip) {
+  const now = Date.now();
+  let rec = contactHitByIp[ip];
+  if (!rec || now - rec.start > CONTACT_WINDOW_MS) {
+    rec = { start: now, count: 0 };
+    contactHitByIp[ip] = rec;
+  }
+  if (rec.count >= CONTACT_MAX) return true;
+  rec.count += 1;
+  return false;
+}
+function validContactEmail(email) {
+  return /^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email) && email.length <= 320;
 }
 function loginFailBlocked(ip) {
   const rec = loginFailByIp[ip];
@@ -1672,6 +1696,51 @@ async function handleApi(req, res, url) {
     const body = { demo: allowDemo(), billing: billingConfigured(), imagine: imagineConfigured(), imagineModel: "latest", vectorizerAi: vectorizerAi.configured(), vtracer: vtracer.available(), vaiTrace: vaiTrace.available(), inventVectorize: true, inventWinner: null, rasterCorel: true, inventWarp: inventWarp.available(), inventWarpReason: inventWarp.available() ? null : (inventWarp.unavailableReason && inventWarp.unavailableReason()), corelImport: true, name: "DecoClub Pro", statuses: STATUSES, methods: methodsFor(user), blanks: BLANKS, seed: allowDemo() ? { owner: "owner@anvil.local", client: "client@anvil.local", password: "anvil123" } : null, services: services, features: flagsFor(user), pricing: { vectorize: buyOptions("vectorize", st), halftones: buyOptions("halftones", st) }, halftonePricing: halftoneBuyOptions(st) };
     if (digitizeFor(user)) body.adminModules = ["/digitize-preview.js", "/digitize-admin.js"];
     return jsonPrivate(res, 200, body);
+  }
+  if (pth === "/api/contact" && method === "POST") {
+    let body = {};
+    try { body = parseJsonBody(await readBody(req)); }
+    catch (e) { return json(res, 400, { error: "Could not read that message." }); }
+    if (!body || typeof body !== "object" || Array.isArray(body)) body = {};
+    if (String(body.website || "").trim()) return json(res, 200, { ok: true, message: CONTACT_THANKS });
+    const name = String(body.name || "").trim();
+    const email = String(body.email || "").trim();
+    const subject = String(body.subject || "").trim();
+    const message = String(body.message || "").trim();
+    if (!name || !email || !subject || !message) return json(res, 400, { error: "Name, email, subject, and message are required." });
+    if (name.length > 200) return json(res, 400, { error: "Name must be 200 characters or fewer." });
+    if (subject.length > 200) return json(res, 400, { error: "Subject must be 200 characters or fewer." });
+    if (!validContactEmail(email)) return json(res, 400, { error: "Enter a valid email address." });
+    if (message.length > 5000) return json(res, 400, { error: "Message must be 5000 characters or fewer." });
+    const ip = clientIp(req);
+    if (contactRateLimited(ip)) return json(res, 429, { error: "Too many messages from this network. Please try again in about an hour." });
+    ensureContactMessages(db);
+    let emailed = false;
+    if (mailer.configured()) {
+      try {
+        await mailer.sendMail({
+          to: "decoclubpro.noreply@gmail.com",
+          replyTo: email,
+          subject: "[DecoClub contact] " + subject,
+          text: "Name: " + name + "\nEmail: " + email + "\n\n" + message,
+        });
+        emailed = true;
+      } catch (err) {
+        console.error("contact email failed:", err && err.message);
+      }
+    }
+    db.contact_messages.push({
+      id: uid(),
+      name: name,
+      email: email,
+      subject: subject,
+      message: message,
+      ip: ip,
+      created_at: new Date().toISOString(),
+      emailed: emailed,
+    });
+    save(db);
+    return json(res, 200, { ok: true, message: CONTACT_THANKS });
   }
   if (pth === "/api/services" && method === "GET") {
     const st = ensureSettings(db);
@@ -3280,6 +3349,14 @@ async function handleApi(req, res, url) {
     return json(res, 200, { settings: st, billing_configured: billingConfigured() });
   }
 
+  if (pth === "/api/admin/contact-messages" && method === "GET") {
+    if (!requireAdmin(user, res)) return;
+    ensureContactMessages(db);
+    const messages = db.contact_messages.slice().sort(function (a, b) {
+      return String(b.created_at || "").localeCompare(String(a.created_at || ""));
+    });
+    return json(res, 200, { messages: messages });
+  }
 
   return json(res, 404, { error: "Not found" });
 }
@@ -3311,7 +3388,7 @@ function serveStatic(req, res, url) {
   if (rel === "/" || rel === "") rel = "/index.html";
   const digitizeAsset = rel === "/digitize-demo.html" || rel === "/digitize-preview.js" || rel === "/digitize-admin.js";
   if (digitizeAsset && !digitizeFor(currentUser(req, load()))) return send(res, 404, "Not found");
-  const ALIAS = { "/login": "/login.html", "/app": "/app.html", "/admin": "/admin.html", "/signup": "/signup.html", "/start": "/start.html" };
+  const ALIAS = { "/login": "/login.html", "/app": "/app.html", "/admin": "/admin.html", "/signup": "/signup.html", "/start": "/start.html", "/contact": "/contact.html" };
   if (ALIAS[rel]) rel = ALIAS[rel];
   if (rel.indexOf("/uploads/") === 0) {
     const file = path.join(UPLOADS, path.basename(rel));

@@ -1,0 +1,93 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Contact · DecoClub Pro</title>
+  <meta name="description" content="Send a note to DecoClub Pro. We reply by email." />
+  <link rel="icon" href="/logo.png" />
+  <link href="https://fonts.googleapis.com/css?family=IBM+Plex+Sans:400,500,600,700|IBM+Plex+Serif:600" rel="stylesheet" />
+  <link rel="stylesheet" href="/styles.css?v=plp2" />
+  <link rel="stylesheet" href="/home.css?v=home2" />
+</head>
+<body class="home">
+  <header class="topbar">
+    <a class="brand" href="/"><img src="/logo.png" alt="" /> DECOCLUB PRO</a>
+    <nav class="nav" aria-label="Primary">
+      <a class="nav-link" href="/#method">How it works</a>
+      <a class="nav-link" href="/#pricing">Pricing</a>
+      <a class="nav-link" href="/#faq">FAQ</a>
+      <a class="nav-link" href="/contact">Contact</a>
+      <a class="nav-login" href="/login.html">Log in</a>
+      <a class="btn" href="/signup.html">Get started</a>
+    </nav>
+  </header>
+
+  <main class="section contact-wrap">
+    <div class="kicker">DecoClub Pro</div>
+    <h1>Contact</h1>
+    <p class="lede">Questions about a file, an account, or pricing? Send a note and we will reply by email.</p>
+    <form class="form contact-form" id="contactForm">
+      <label for="name">Name</label>
+      <input id="name" name="name" autocomplete="name" required />
+      <label for="email">Email</label>
+      <input id="email" name="email" type="email" autocomplete="email" required />
+      <label for="subject">Subject</label>
+      <input id="subject" name="subject" autocomplete="off" required />
+      <label for="message">Message</label>
+      <textarea id="message" name="message" rows="6" required></textarea>
+      <div class="hp" aria-hidden="true">
+        <label for="website">Website</label>
+        <input id="website" name="website" type="text" tabindex="-1" autocomplete="off" />
+      </div>
+      <button class="btn" type="submit">Send message</button>
+      <p id="contactNote" role="status"></p>
+    </form>
+  </main>
+
+  <footer class="footer-cols">
+    <div><a class="brand" href="/"><img src="/logo.png" alt="" /> DECOCLUB PRO</a><p>Vector and halftone files for print shops.</p></div>
+    <div><strong>Tools</strong><a href="/start.html?method=apparel&tool=vectorize">Vectorize</a><a href="/start.html?method=apparel&tool=halftones">Halftones</a></div>
+    <div><strong>Product</strong><a href="/#method">How it works</a><a href="/#pricing">Pricing</a><a href="/#faq">FAQ</a><a href="/contact">Contact</a></div>
+    <div><strong>Account</strong><a href="/signup.html">Get started</a><a href="/login.html">Log in</a></div>
+    <p class="footer-legal">DecoClub Pro. Vector and halftone files for print shops.</p>
+  </footer>
+  <script>
+    document.getElementById("contactForm").onsubmit = async function (e) {
+      e.preventDefault();
+      var note = document.getElementById("contactNote");
+      note.className = "muted";
+      note.textContent = "Sending…";
+      var fd = new FormData(e.target);
+      var payload = {
+        name: fd.get("name"),
+        email: fd.get("email"),
+        subject: fd.get("subject"),
+        message: fd.get("message"),
+        website: fd.get("website")
+      };
+      var res, data = {};
+      try {
+        res = await fetch("/api/contact", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify(payload)
+        });
+        data = await res.json();
+      } catch (err) {
+        note.className = "notice";
+        note.textContent = "Something went wrong. Please try again.";
+        return;
+      }
+      if (res.ok) {
+        note.className = "ok";
+        note.textContent = "Thanks — we got your message and will reply by email soon.";
+        e.target.reset();
+        return;
+      }
+      note.className = "notice";
+      note.textContent = (data && data.error) || "Something went wrong. Please try again.";
+    };
+  </script>
+</body>
+</html>
