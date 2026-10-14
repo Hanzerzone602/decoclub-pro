@@ -17,7 +17,8 @@
     <label>Your name</label><input name="name" required />
     <label>Studio name</label><input name="shopName" placeholder="Your studio" />
     <label>Email</label><input name="email" type="email" required />
-    <label>Password</label><input name="password" type="password" minlength="6" required />
+    <label>Password</label><input name="password" type="password" minlength="8" pattern="(?=.*[A-Za-z])(?=.*[0-9]).{8,}" title="8+ characters with at least one letter and one number" required />
+    <p class="muted" style="margin:4px 0 0;font-size:13px">8+ characters, at least one letter and one number. Your first image is free once you confirm your email.</p>
     <label>Account type</label>
     <select name="role">
       <option value="shop">Studio member</option>

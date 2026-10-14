@@ -212,6 +212,22 @@ function nav() {
   if (office) office.style.display = user && user.role === "admin" ? "block" : "none";
 }
 
+function showVerifyBanner(u) {
+  if (!u || u.role === "admin" || u.emailVerified || u.freeImageReason === "used") return;
+  const bar = document.createElement("div");
+  bar.className = "notice verify-banner";
+  bar.innerHTML = u.emailSending
+    ? 'Confirm your email to unlock your free first image. Check your inbox for our link. <button type="button" class="btn ghost small" id="resendVerify">Resend email</button>'
+    : "Your free first image unlocks once your email is verified. Email confirmation isn't switched on yet, so contact support and we'll verify you by hand.";
+  document.body.insertBefore(bar, document.body.firstChild.nextSibling);
+  const b = bar.querySelector("#resendVerify");
+  if (b) b.onclick = async () => {
+    b.disabled = true;
+    try { await api("/api/verify/resend", { method: "POST" }); b.textContent = "Sent, check your inbox"; }
+    catch (e) { b.textContent = (e && e.message) || "Try again later"; setTimeout(() => { b.disabled = false; b.textContent = "Resend email"; }, 60000); }
+  };
+}
+
 async function boot() {
   cfg = await api("/api/config");
   const me = await api("/api/me");
@@ -226,6 +242,7 @@ async function boot() {
     return;
   }
   user = me.user;
+  showVerifyBanner(user);
   const s = await api("/api/shop");
   shop = s.shop;
   cfg.billing = s.billing;
@@ -997,6 +1014,7 @@ async function fillArt(el, job, shopControls) {
           <div class="ruler ruler-y" aria-hidden="true"></div>
           <div class="preview art-drop${hasArt ? " has-art" : ""}" id="artDrop" tabindex="0">
             <div class="art-zoom-inner" id="artZoomInner">${preview}</div>
+            ${job.free_image ? `<div class="free-watermark" aria-hidden="true">DECOCLUB PRO · FREE PREVIEW · download is clean</div>` : ""}
             <div class="ht-preview-frame" id="htPreviewFrame" hidden aria-live="polite"></div>
           </div>
         </div>

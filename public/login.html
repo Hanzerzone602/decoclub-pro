@@ -20,6 +20,7 @@
     <input name="password" type="password" autocomplete="current-password" required />
     <label class="remember"><input name="remember_me" id="remember" type="checkbox" checked /> Remember me</label>
     <p class="notice" id="err"></p>
+    <script>if (/[?&]verify=expired/.test(location.search)) document.getElementById("err").textContent = "That confirmation link is invalid or expired. Log in and use Resend email for a new one.";</script>
     <p class="muted" id="hint"></p>
     <button class="btn" type="submit">Log in</button>
     <p class="muted" style="margin-top:18px">No account? <a href="/signup.html" id="altAuth">Create an account</a></p>

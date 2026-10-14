@@ -793,3 +793,8 @@ a.pcard:hover { border-color:var(--gold); box-shadow:var(--shadow); }
 @media (max-width: 600px) {
   .problem-grid, .footer-cols, .product-cards, .steps { grid-template-columns:1fr; }
 }
+
+/* free first image: on-screen watermark only (downloads are clean) */
+.preview.art-drop { position: relative; }
+.free-watermark { position: absolute; inset: 0; display: flex; align-items: center; justify-content: center; pointer-events: none; transform: rotate(-24deg); font: 700 22px/1.2 "IBM Plex Sans", sans-serif; letter-spacing: .12em; color: rgba(1, 126, 206, .28); text-align: center; text-shadow: 0 0 2px rgba(255,255,255,.6); z-index: 3; }
+.verify-banner { margin: 0; border-radius: 0; text-align: center; }

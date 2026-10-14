@@ -122,11 +122,11 @@ function stop(child) {
     assert.strictEqual(denied.status, 403);
     const signup = await req(port, "POST", "/api/signup", {
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ name: "Ada", email: "ada@shop.test", password: "secret1", shopName: "Ada Press", role: "shop" }),
+      body: JSON.stringify({ name: "Ada", email: "ada@shop.test", password: "secret12", shopName: "Ada Press", role: "shop" }),
     });
     assert.strictEqual(signup.status, 200);
     const setCookie = String(signup.headers["set-cookie"] || "");
-    assert.ok(setCookie.indexOf("decoclub=") === 0);
+    assert.ok(/(^|,)\s*decoclub=/.test(setCookie));
     assert.ok(setCookie.indexOf("HttpOnly") !== -1);
     assert.ok(setCookie.indexOf("SameSite=Lax") !== -1);
     const cookie = setCookie.split(";")[0];
@@ -159,14 +159,14 @@ function stop(child) {
     assert.ok(loginHtml.text.indexOf("remember_me") !== -1);
     const sessionLogin = await req(port, "POST", "/api/login", {
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ email: "ada@shop.test", password: "secret1" }),
+      body: JSON.stringify({ email: "ada@shop.test", password: "secret12" }),
     });
     assert.strictEqual(sessionLogin.status, 200);
     const sessionCookie = String(sessionLogin.headers["set-cookie"] || "");
     assert.ok(sessionCookie.indexOf("Max-Age") === -1, "session login has no Max-Age");
     const rememberLogin = await req(port, "POST", "/api/login", {
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ email: "ada@shop.test", password: "secret1", remember_me: true }),
+      body: JSON.stringify({ email: "ada@shop.test", password: "secret12", remember_me: true }),
     });
     const rememberCookie = String(rememberLogin.headers["set-cookie"] || "");
     assert.ok(rememberCookie.indexOf("Max-Age=15552000") !== -1);
@@ -284,7 +284,7 @@ function stop(child) {
     assert.strictEqual(shop.status, 200);
     const signup = await req(port3, "POST", "/api/signup", {
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ name: "Bea", email: "bea@shop.test", password: "secret1", shopName: "Bea Press" }),
+      body: JSON.stringify({ name: "Bea", email: "bea@shop.test", password: "secret12", shopName: "Bea Press" }),
     });
     assert.strictEqual(signup.status, 200);
     const exp = new Date(signup.json.user.planExpires).getTime() - Date.now();

@@ -157,9 +157,9 @@ function stop(child) {
     assert.ok(me0.json.user);
     assert.strictEqual(me0.json.user.halftoneIncluded, false);
     assert.strictEqual(me0.json.user.halftoneCredits, 0);
-    assert.strictEqual(me0.json.user.services.halftones.canApply, true, "first free image");
-    assert.strictEqual(me0.json.user.freeImageAvailable, true);
-    console.log("ok trial/shop signup: 0 credits, first image free");
+    assert.strictEqual(me0.json.user.services.halftones.canApply, false, "free image locked until verified");
+    assert.strictEqual(me0.json.user.freeImageReason, "unverified");
+    console.log("ok trial/shop signup: 0 credits, free image locked until email verified");
     // Spend the free image (simulate) so the paid gate below is exercised.
     {
       const fp = path.join(s.dir, "store.json");

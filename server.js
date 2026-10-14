@@ -5,6 +5,19 @@ const path = require("path");
 const crypto = require("crypto");
 const { URL } = require("url");
 const { priceJob, priceQuote } = require("./lib/price");
+const mailer = require("./lib/mailer");
+const DISPOSABLE = new Set(fs.readFileSync(path.join(__dirname, "lib", "disposable-domains.txt"), "utf8").split(/\r?\n/).map(function (l) { return l.trim().toLowerCase(); }).filter(function (l) { return l && l[0] !== "#"; }));
+function isDisposableEmail(email) {
+  const dom = String(email).split("@").pop().toLowerCase();
+  const parts = dom.split(".");
+  for (let i = 0; i < parts.length - 1; i++) if (DISPOSABLE.has(parts.slice(i).join("."))) return true;
+  return false;
+}
+function passwordProblem(pw) {
+  pw = String(pw || "");
+  if (pw.length < 8 || !/[A-Za-z]/.test(pw) || !/[0-9]/.test(pw)) return "Password must be 8+ characters with at least one letter and one number";
+  return null;
+}
 const { writeExports, intakePosterSvg, stripPaperUnderlaySvg } = require("./lib/exports");
 const { writeMockups, BLANKS, searchBlanks, findBlank, blankPublicUrl } = require("./lib/mockup");
 const { loadCatalog, findSku, searchCatalog } = require("./lib/catalog");
@@ -203,9 +216,33 @@ function vectorCreditBalance(user) {
   return Math.max(0, Math.floor(Number(user && user.vector_credits) || 0));
 }
 
-/** One free image per account (Vectorize OR Halftones, one total). Admin never uses it. */
-function freeImageAvailable(user) {
-  return !!(user && !isComped(user) && !user.free_image_used);
+/** One free image per account (Vectorize OR Halftones, one total). Admin never uses it.
+ * Needs a verified email, and is refused if this device or IP already claimed a free image. */
+const REQ_CTX = new WeakMap(); // user object -> { db, device, ipHash } for the current request
+function hashId(v) { return crypto.createHash("sha256").update("dcp-free1:" + String(v)).digest("hex"); }
+function freeImageStatus(user) {
+  if (!user || isComped(user)) return { available: false, reason: "admin" };
+  if (user.free_image_used) return { available: false, reason: "used" };
+  if (!user.email_verified) return { available: false, reason: "unverified" };
+  const ctx = REQ_CTX.get(user);
+  if (ctx && ctx.db) {
+    const hit = (ctx.db.free_claims || []).find(function (c) {
+      return c.user_id !== user.id && ((ctx.device && c.device === ctx.device) || (ctx.ipHash && c.ip === ctx.ipHash));
+    });
+    if (hit) return { available: false, reason: "device" };
+  }
+  return { available: true, reason: null };
+}
+function freeImageAvailable(user) { return freeImageStatus(user).available; }
+function recordFreeClaim(user, service) {
+  user.free_image_used = true;
+  user.free_image_service = service;
+  user.free_image_at = new Date().toISOString();
+  const ctx = REQ_CTX.get(user);
+  if (ctx && ctx.db) {
+    if (!ctx.db.free_claims) ctx.db.free_claims = [];
+    ctx.db.free_claims.push({ user_id: user.id, device: ctx.device || null, ip: ctx.ipHash || null, at: user.free_image_at, service: service });
+  }
 }
 
 function canApplyHalftone(user) {
@@ -279,11 +316,10 @@ function consumeServiceCredit(user, job, service) {
   if (job.unlocks[service]) return { ok: true, consumed: false, unlocked: true };
   const bal = service === "vectorize" ? vectorCreditBalance(user) : halftoneCreditBalance(user);
   if (bal < 1 && freeImageAvailable(user)) {
-    user.free_image_used = true;
-    user.free_image_service = service;
-    user.free_image_at = new Date().toISOString();
+    recordFreeClaim(user, service);
     user.images_processed = (Number(user.images_processed) || 0) + 1;
     job.unlocks[service] = true;
+    job.free_image = true;
     return { ok: true, consumed: false, free: true, remaining: bal };
   }
   if (bal < 1) return { ok: false };
@@ -301,6 +337,7 @@ function requireServiceCredit(user, job, service, res, settings) {
     error: vector ? VECTOR_CREDIT_MSG : HALFTONE_CREDIT_MSG,
     code: vector ? "vector_credits_required" : "halftone_credits_required",
     service: service,
+    freeImage: freeImageStatus(user),
     buy: buyOptions(service, settings),
     vectorCredits: vectorCreditBalance(user),
     halftoneCredits: halftoneCreditBalance(user),
@@ -327,7 +364,7 @@ function consumeHalftoneCredit(user) {
   if (halftoneIncluded(user)) return { ok: true, consumed: false, included: true, remaining: halftoneCreditBalance(user) };
   const bal = halftoneCreditBalance(user);
   if (bal < 1 && freeImageAvailable(user)) {
-    user.free_image_used = true; user.free_image_service = "halftones"; user.free_image_at = new Date().toISOString();
+    recordFreeClaim(user, "halftones");
     user.images_processed = (Number(user.images_processed) || 0) + 1;
     return { ok: true, consumed: false, free: true, included: false, remaining: 0 };
   }
@@ -1141,8 +1178,13 @@ const loginFailByIp = Object.create(null);
 const LOGIN_FAIL_WINDOW_MS = 15 * 60 * 1000;
 const LOGIN_FAIL_MAX = 8;
 function clientIp(req) {
-  const xff = String((req.headers && req.headers["x-forwarded-for"]) || "").split(",")[0].trim();
-  if (xff) return xff;
+  // Behind Railway's edge the proxy APPENDS the real client address, so the rightmost
+  // X-Forwarded-For entry is the one we can trust; leftmost entries are client-supplied.
+  // TRUST_PROXY=0 ignores the header (direct exposure). Default: trust one hop.
+  if (process.env.TRUST_PROXY !== "0") {
+    const list = String((req.headers && req.headers["x-forwarded-for"]) || "").split(",").map(function (x) { return x.trim(); }).filter(Boolean);
+    if (list.length) return list[list.length - 1];
+  }
   return (req.socket && req.socket.remoteAddress) || "unknown";
 }
 function loginFailRecord(ip) {
@@ -1196,6 +1238,9 @@ function publicUser(u) {
     vectorCredits: vectorCreditBalance(u),
     vectorIncluded: vectorIncluded(u),
     freeImageAvailable: freeImageAvailable(u),
+    freeImageReason: freeImageStatus(u).reason,
+    emailVerified: !!u.email_verified,
+    emailSending: mailer.configured(),
     services: serviceEntitlements(u),
   };
 }
@@ -1253,12 +1298,28 @@ function cookieFlags(req, remember) {
   if (isHttpsReq(req)) flags += "; Secure";
   return flags;
 }
-function setSession(res, token, req, remember) { res.setHeader("Set-Cookie", COOKIE + "=" + token + "; " + cookieFlags(req, remember)); }
+function appendCookie(res, c) {
+  const prev = res.getHeader("Set-Cookie");
+  const list = prev == null ? [] : (Array.isArray(prev) ? prev : [String(prev)]);
+  // Session cookie first, so simple clients that read the first Set-Cookie still get it.
+  if (c.indexOf(COOKIE + "=") === 0) list.unshift(c); else list.push(c);
+  res.setHeader("Set-Cookie", list);
+}
+function setSession(res, token, req, remember) { appendCookie(res, COOKIE + "=" + token + "; " + cookieFlags(req, remember)); }
+const DEVICE_COOKIE = "dcdev";
+function ensureDevice(req, res) {
+  let d = parseCookies(req)[DEVICE_COOKIE];
+  if (!d || !/^[a-f0-9]{32}$/.test(d)) {
+    d = uid();
+    appendCookie(res, DEVICE_COOKIE + "=" + d + "; Path=/; HttpOnly; SameSite=Lax; Max-Age=63072000" + (isHttpsReq(req) ? "; Secure" : ""));
+  }
+  return d;
+}
 function sessionRecord(userId, remember) {
   const now = Date.now();
   return { token: uid(), user_id: userId, created_at: new Date(now).toISOString(), remember: !!remember, expires: new Date(now + (remember ? 15552000 : 12 * 3600) * 1000).toISOString() };
 }
-function clearSession(res, req) { res.setHeader("Set-Cookie", COOKIE + "=; Path=/; HttpOnly; SameSite=Lax; Max-Age=0" + (isHttpsReq(req) ? "; Secure" : "")); }
+function clearSession(res, req) { appendCookie(res, COOKIE + "=; Path=/; HttpOnly; SameSite=Lax; Max-Age=0" + (isHttpsReq(req) ? "; Secure" : "")); }
 function originOf(req) {
   if (process.env.PUBLIC_URL) return process.env.PUBLIC_URL.replace(/\/$/, "");
   const proto = String(req.headers["x-forwarded-proto"] || "http").split(",")[0].trim();
@@ -1383,12 +1444,29 @@ function presentVector(vec) {
   }
   return copy;
 }
+/** Create a 24h verification token and email the link (fire-and-forget). Returns true if a send was attempted. */
+function issueVerification(u, req) {
+  if (!mailer.configured()) return false;
+  const token = crypto.randomBytes(32).toString("hex");
+  u.verify_token_hash = hashId("v:" + token);
+  u.verify_expires = new Date(Date.now() + 864e5).toISOString();
+  u.verify_sends = (u.verify_sends || []).filter(function (t) { return Date.now() - Date.parse(t) < 864e5; }).concat([new Date().toISOString()]);
+  const link = (process.env.PUBLIC_URL || originOf(req)) + "/api/verify?t=" + token;
+  mailer.sendMail({
+    to: u.email,
+    subject: "Confirm your DecoClub Pro email",
+    text: "Hi " + (u.name || "") + ",\n\nConfirm your email to unlock your free first image on DecoClub Pro:\n\n" + link + "\n\nThis link expires in 24 hours. If you didn't sign up, ignore this email.\n\nDecoClub Pro",
+  }).catch(function (err) { console.error("verify email failed:", err.message); });
+  return true;
+}
 function presentJob(job, req) {
   const copy = Object.assign({}, job);
   copy.proof_url = originOf(req) + "/proof.html?t=" + job.proof_token;
   copy.intake_url = originOf(req) + "/intake.html?t=" + job.proof_token;
   const unlocks = job.unlocks || {};
   copy.unlocks = { vectorize: !!unlocks.vectorize, halftones: !!unlocks.halftones };
+  // Free-image jobs get an on-screen watermark in the studio; downloads stay clean.
+  copy.free_image = !!job.free_image;
   // Keep settings + engine (QA); strip recipe/pipeline via presentVzMeta.
   if (copy.vector) copy.vector = presentVector(copy.vector);
   return copy;
@@ -1437,6 +1515,9 @@ async function handleApi(req, res, url) {
   const user = currentUser(req, db);
   const method = req.method;
   const pth = url.pathname;
+  // Device cookie is issued on GETs (app boot calls /api/me and /api/config) so it exists before any free claim.
+  const deviceId = method === "GET" ? ensureDevice(req, res) : (parseCookies(req)[DEVICE_COOKIE] || null);
+  if (user) REQ_CTX.set(user, { db: db, device: deviceId ? hashId("d:" + deviceId) : null, ipHash: hashId("ip:" + clientIp(req)) });
 
   if (pth === "/api/config" && method === "GET") {
     const st = ensureSettings(db);
@@ -1493,8 +1574,11 @@ async function handleApi(req, res, url) {
   if (pth === "/api/signup" && method === "POST") {
     const body = parseJsonBody(await readBody(req));
     if (!body.email || !body.password || !body.name) return json(res, 400, { error: "Name, email, password required" });
-    if (String(body.password).length < 6) return json(res, 400, { error: "Password must be 6+ characters" });
-    const email = String(body.email).toLowerCase();
+    const pwErr = passwordProblem(body.password);
+    if (pwErr) return json(res, 400, { error: pwErr });
+    const email = String(body.email).trim().toLowerCase();
+    if (!/^[^@\s]+@[^@\s]+\.[^@\s]+$/.test(email)) return json(res, 400, { error: "Enter a valid email" });
+    if (isDisposableEmail(email)) return json(res, 400, { error: "Please use a permanent email address (disposable inboxes aren't accepted)", code: "disposable_email" });
     if (db.users.some(function (u) { return u.email === email; })) return json(res, 409, { error: "Email already registered" });
     const now = new Date().toISOString();
     const role = body.role === "client" ? "client" : "shop";
@@ -1505,12 +1589,38 @@ async function handleApi(req, res, url) {
     }
     const trialDays = Number((db.settings && db.settings.trial_days) || 7);
     const u = { id: uid(), email: email, name: body.name, password_hash: hashPass(body.password), role: role, shop_id: shop_id, plan: role === "shop" ? "trial" : "client", plan_expires: role === "shop" ? new Date(Date.now() + trialDays * 864e5).toISOString() : null, halftone_credits: 0, vector_credits: 0, created_at: now };
+    u.email_verified = false;
     db.users.push(u);
+    const verifySent = issueVerification(u, req);
     const remember = body.remember_me == null ? true : truthy(body.remember_me);
     const sess = sessionRecord(u.id, remember);
     db.sessions.push(sess);
     save(db); setSession(res, sess.token, req, remember);
-    return json(res, 200, { user: publicUser(u) });
+    return json(res, 200, { user: publicUser(u), verification: { sent: verifySent, emailSending: mailer.configured() } });
+  }
+  if (pth === "/api/verify" && method === "GET") {
+    const t = String(url.searchParams.get("t") || "");
+    const th = t ? hashId("v:" + t) : "";
+    const u = th && db.users.find(function (x) { return x.verify_token_hash === th; });
+    if (!u || !u.verify_expires || Date.now() > Date.parse(u.verify_expires)) {
+      res.writeHead(302, { Location: "/login.html?verify=expired" }); return res.end();
+    }
+    u.email_verified = true; u.email_verified_at = new Date().toISOString();
+    u.verify_token_hash = null; u.verify_expires = null;
+    save(db);
+    res.writeHead(302, { Location: "/app.html?verified=1" }); return res.end();
+  }
+  if (pth === "/api/verify/resend" && method === "POST") {
+    if (!user) return json(res, 401, { error: "Log in first" });
+    if (user.email_verified) return json(res, 200, { ok: true, already: true });
+    if (!mailer.configured()) return json(res, 503, { error: "Email sending isn't set up yet. Contact support to verify your account.", code: "email_unconfigured" });
+    const now = Date.now();
+    const log = (user.verify_sends || []).filter(function (t) { return now - Date.parse(t) < 864e5; });
+    if (log.length && now - Date.parse(log[log.length - 1]) < 60000) return json(res, 429, { error: "Wait a minute before resending." });
+    if (log.length >= 5) return json(res, 429, { error: "Too many verification emails today. Try again tomorrow." });
+    const ok = issueVerification(user, req);
+    save(db);
+    return json(res, ok ? 200 : 502, ok ? { ok: true } : { error: "Could not send email" });
   }
   if (pth === "/api/login" && method === "POST") {
     const ip = clientIp(req);
@@ -2583,6 +2693,7 @@ async function handleApi(req, res, url) {
       disabled: !!u.disabled, created_at: u.created_at,
       free_image_used: !!u.free_image_used, free_image_service: u.free_image_service || null, free_image_at: u.free_image_at || null,
       images_processed: Number(u.images_processed) || 0,
+      email_verified: !!u.email_verified,
       jobs: (db.jobs || []).filter(function (j) { return j.owner_id === u.id || j.client_id === u.id; }).length,
     };
   }
@@ -2666,6 +2777,7 @@ async function handleApi(req, res, url) {
       vai_trace: vaiTrace.available(),
       vtracer: vtracer.available(),
       data_dir_env: !!process.env.DATA_DIR,
+      email_sending: mailer.configured(),
     });
   }
 
@@ -2774,6 +2886,10 @@ async function handleApi(req, res, url) {
       if (u.disabled) {
         db.sessions = (db.sessions || []).filter(function (s) { return s.user_id !== u.id; });
       }
+    }
+    if (body.email_verified !== undefined) {
+      u.email_verified = !!body.email_verified;
+      if (u.email_verified) { u.email_verified_at = new Date().toISOString(); u.verify_token_hash = null; u.verify_expires = null; }
     }
     if (body.name) u.name = String(body.name).trim();
     if (body.halftone_credits != null) {

@@ -240,7 +240,43 @@ async function uploadJob(port, cookie, title) {
     // Free-first-image rule: logged-out is refused; first image free; second needs credits.
     const anon = await req(port, "POST", "/api/jobs/x/vectorize", { body: JSON.stringify({ colors: 2 }) });
     assert.ok(anon.status === 401 || anon.status === 403, "anon vectorize must be refused, got " + anon.status);
-    assert.strictEqual(me.json.user.freeImageAvailable, true);
+    // Signup hardening: weak passwords and disposable domains are refused.
+    const weak = await req(port, "POST", "/api/signup", { body: JSON.stringify({ name: "W", email: "weak@test.local", password: "abcdefgh", role: "shop" }) });
+    assert.strictEqual(weak.status, 400, "letters-only password must fail");
+    const short = await req(port, "POST", "/api/signup", { body: JSON.stringify({ name: "W", email: "weak2@test.local", password: "abc123", role: "shop" }) });
+    assert.strictEqual(short.status, 400, "short password must fail");
+    const disp = await req(port, "POST", "/api/signup", { body: JSON.stringify({ name: "D", email: "x@mailinator.com", password: "test1234", role: "shop" }) });
+    assert.strictEqual(disp.status, 400);
+    assert.strictEqual(disp.json.code, "disposable_email");
+    console.log("ok signup refuses weak password and disposable email");
+
+    // Unverified: free image locked, honest reason, and no SMTP means resend says so.
+    assert.strictEqual(me.json.user.freeImageAvailable, false);
+    assert.strictEqual(me.json.user.freeImageReason, "unverified");
+    assert.strictEqual(me.json.user.emailSending, false);
+    const resend = await req(port, "POST", "/api/verify/resend", { headers: { Cookie: shopCk } });
+    assert.strictEqual(resend.status, 503);
+    assert.strictEqual(resend.json.code, "email_unconfigured");
+    const lockedJob = await uploadJob(port, shopCk, "PPI locked");
+    const locked = await req(port, "POST", "/api/jobs/" + lockedJob.id + "/vectorize", {
+      headers: { Cookie: shopCk }, body: JSON.stringify({ colors: 2, maxEdge: 96 }),
+    });
+    assert.strictEqual(locked.status, 402, "unverified free image must be locked");
+    assert.strictEqual(locked.json.freeImage.reason, "unverified");
+    const badTok = await req(port, "GET", "/api/verify?t=nope");
+    assert.strictEqual(badTok.status, 302);
+    assert.ok(/verify=expired/.test(badTok.headers.location));
+
+    // Admin verifies by hand (Admin > Users > Verify).
+    const adLog0 = await req(port, "POST", "/api/login", { body: JSON.stringify({ email: ADMIN_EMAIL, password: ADMIN_PASSWORD }) });
+    const adCk0 = cookieFrom(adLog0);
+    const ver = await req(port, "PATCH", "/api/admin/users/" + me.json.user.id, { headers: { Cookie: adCk0 }, body: JSON.stringify({ email_verified: true }) });
+    assert.strictEqual(ver.status, 200, JSON.stringify(ver.json));
+    assert.strictEqual(ver.json.user.email_verified, true);
+    const meV = await req(port, "GET", "/api/me", { headers: { Cookie: shopCk } });
+    assert.strictEqual(meV.json.user.freeImageAvailable, true);
+    console.log("ok unverified locked; admin manual verify unlocks free image");
+
     const freeJob = await uploadJob(port, shopCk, "PPI free");
     const freeRun = await req(port, "POST", "/api/jobs/" + freeJob.id + "/vectorize", {
       headers: { Cookie: shopCk },
@@ -264,6 +300,31 @@ async function uploadJob(port, cookie, title) {
     });
     assert.strictEqual(htDenied.status, 402, "halftone after free used " + htDenied.status);
     console.log("ok free first image: anon refused, 1 free, re-tweak free, then 402 on both services");
+    assert.strictEqual(freeRun.json.job.free_image, true, "free job flagged for on-screen watermark");
+
+    // Second verified account from the same device/IP: no free image (paid still allowed).
+    const su2 = await req(port, "POST", "/api/signup", { body: JSON.stringify({ name: "Dup", email: "dup@test.local", password: "test1234", role: "shop" }) });
+    assert.strictEqual(su2.status, 200, JSON.stringify(su2.json));
+    const dupCk = cookieFrom(su2);
+    await req(port, "PATCH", "/api/admin/users/" + su2.json.user.id, { headers: { Cookie: adCk0 }, body: JSON.stringify({ email_verified: true }) });
+    const meDup = await req(port, "GET", "/api/me", { headers: { Cookie: dupCk } });
+    assert.strictEqual(meDup.json.user.freeImageAvailable, false);
+    assert.strictEqual(meDup.json.user.freeImageReason, "device");
+    const dupJob = await uploadJob(port, dupCk, "dup");
+    const dupRun = await req(port, "POST", "/api/jobs/" + dupJob.id + "/vectorize", { headers: { Cookie: dupCk }, body: JSON.stringify({ colors: 2, maxEdge: 96 }) });
+    assert.strictEqual(dupRun.status, 402);
+    await req(port, "POST", "/api/admin/users/" + su2.json.user.id + "/vector-credits", { headers: { Cookie: adCk0 }, body: JSON.stringify({ add: 1 }) });
+    const dupPaid = await req(port, "POST", "/api/jobs/" + dupJob.id + "/vectorize", { headers: { Cookie: dupCk }, body: JSON.stringify({ colors: 2, maxEdge: 96 }) });
+    assert.strictEqual(dupPaid.status, 200, "paid still works on a used device");
+    assert.ok(!dupPaid.json.job.free_image, "paid job not watermarked");
+    // Admin list shows the new columns.
+    const ul = await req(port, "GET", "/api/admin/users", { headers: { Cookie: adCk0 } });
+    const row = ul.json.users.find((u) => u.email === "ppi-shop@test.local");
+    assert.strictEqual(row.email_verified, true);
+    assert.strictEqual(row.free_image_used, true);
+    assert.strictEqual(row.free_image_service, "vectorize");
+    assert.ok(row.images_processed >= 1);
+    console.log("ok same device/IP refused 2nd free image, paid allowed, admin columns present");
 
     const job = await uploadJob(port, shopCk, "PPI one");
     const denied = await req(port, "POST", "/api/jobs/" + job.id + "/vectorize", {
