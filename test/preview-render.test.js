@@ -18,6 +18,22 @@ const SVG = `<?xml version="1.0" encoding="UTF-8"?>
   <circle cx="50" cy="50" r="8" style="fill:#003399;stroke:none"/>
 </svg>
 `;
+// Group style + stylesheet class, same shape as a traced plate (fill on the
+// parent, fill-rule on the path). Outline has to beat both.
+const STYLED = `<?xml version="1.0" encoding="UTF-8"?>
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 100 100">
+  <style type="text/css">.ink { fill: #cc0000; stroke: none; stroke-width: 8; }</style>
+  <g style="fill:#003399;stroke:#003399;stroke-width:6" fill="#003399" stroke="#003399" stroke-width="6">
+    <rect class="ink" x="20" y="20" width="60" height="60" fill-rule="evenodd"/>
+    <path class="ink" d="M 0 50 L 100 50" fill-rule="evenodd"/>
+  </g>
+</svg>
+`;
+const SOLID = `<?xml version="1.0" encoding="UTF-8"?>
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 10 10">
+  <rect width="10" height="10" fill="#cc0000"/>
+</svg>
+`;
 
 function req(port, method, urlPath, opts) {
   opts = opts || {};
@@ -116,10 +132,28 @@ function diffCount(a, b) {
   return n;
 }
 
-const isRed = (r, g, b, a) => a > 30 && r > 150 && r > b + 40;
-// Outline stroke is #00a0ff. The fixture's navy fill (#003399) must not count.
-const isBlue = (r, g, b, a) => a > 40 && r < 90 && g > 80 && b > 160;
+const isRed = (r, g, b, a) => a > 30 && r > 150 && g < 90 && b < 90;
+// Outline stroke is #ff00aa. Navy (#003399) and the red fill must not count.
+const isMagenta = (r, g, b, a) => a > 40 && r > 170 && b > 90 && g < 130 && b > g + 30 && r > g + 50;
+const isNavy = (r, g, b, a) => a > 40 && r < 60 && g < 90 && b > 110 && b > r + 40;
 const isOpaque = (r, g, b, a) => a > 20;
+
+// Longest run of rows that contain a magenta pixel. A 1px stroke is a short run.
+function magentaRowRun(buf) {
+  const d = decodePng(buf);
+  let maxRun = 0;
+  let run = 0;
+  for (let y = 0; y < d.height; y++) {
+    let hit = false;
+    for (let x = 0; x < d.width; x++) {
+      const i = (y * d.width + x) * 4;
+      if (isMagenta(d.rgba[i], d.rgba[i + 1], d.rgba[i + 2], d.rgba[i + 3])) { hit = true; break; }
+    }
+    if (hit) { run++; if (run > maxRun) maxRun = run; }
+    else run = 0;
+  }
+  return maxRun;
+}
 
 (async () => {
   const port = 41321;
@@ -217,19 +251,21 @@ const isOpaque = (r, g, b, a) => a > 20;
     assert.strictEqual(fill.buf[0], 0x89);
     assert.strictEqual(fill.buf[1], 0x50);
     const fillRed = countWhere(fill.buf, isRed);
-    const fillBlue = countWhere(fill.buf, isBlue);
+    const fillMag = countWhere(fill.buf, isMagenta);
     assert.ok(fillRed.n > 500, "fill paints the red square, got " + fillRed.n);
-    assert.ok(fillBlue.n < 30, "fill is not an outline, blue " + fillBlue.n);
+    assert.ok(fillMag.n < 30, "fill is not an outline, magenta " + fillMag.n);
 
     const outline = await req(port, "GET", "/api/jobs/" + paidId + "/preview.png?" + q + "&mode=outline", { headers: { Cookie: shopCk } });
     assert.strictEqual(outline.status, 200);
     assert.ok(String(outline.headers["content-type"] || "").indexOf("image/png") !== -1);
     const outRed = countWhere(outline.buf, isRed);
-    const outBlue = countWhere(outline.buf, isBlue);
+    const outMag = countWhere(outline.buf, isMagenta);
+    const outNavy = countWhere(outline.buf, isNavy);
     assert.ok(Buffer.compare(fill.buf, outline.buf) !== 0, "outline bytes differ from fill");
-    assert.ok(outBlue.n > 40, "outline strokes are blue, got " + outBlue.n);
+    assert.ok(outMag.n > 40, "outline strokes are magenta, got " + outMag.n);
     assert.ok(outRed.n < fillRed.n / 5, "outline drops the red fill");
-    assert.ok(outBlue.n < outBlue.pixels * 0.25, "outline stroke stays thin, blue " + outBlue.n);
+    assert.ok(outNavy.n < 15, "circle style stroke:none does not keep the navy fill, got " + outNavy.n);
+    assert.ok(outMag.n < outMag.pixels * 0.25, "outline stroke stays thin, magenta " + outMag.n);
 
     const corner = await req(port, "GET", "/api/jobs/" + paidId + "/preview.png?x=0&y=0&w=0.15&h=0.15&pw=40&ph=40&mode=fill", { headers: { Cookie: shopCk } });
     assert.strictEqual(corner.status, 200);
@@ -240,6 +276,83 @@ const isOpaque = (r, g, b, a) => a > 20;
     assert.strictEqual(unpaid.status, 200);
     const wmDiff = diffCount(fill.buf, unpaid.buf);
     assert.ok(wmDiff > 80, "unpaid watermark differs from entitled preview, diff " + wmDiff);
+
+    const styledName = "1700000000004-styled-vector.svg";
+    const solidName = "1700000000005-solid-vector.svg";
+    fs.writeFileSync(path.join(uploads, styledName), STYLED);
+    fs.writeFileSync(path.join(uploads, solidName), SOLID);
+    const styledId = crypto.randomBytes(16).toString("hex");
+    const wmFreeId = crypto.randomBytes(16).toString("hex");
+    const wmPaidId = crypto.randomBytes(16).toString("hex");
+    const db2 = JSON.parse(fs.readFileSync(storePath, "utf8"));
+    const styledJob = Object.assign({}, job, {
+      id: styledId,
+      title: "Styled plate",
+      proof_token: crypto.randomBytes(32).toString("hex"),
+      vector_svg: "/uploads/" + styledName,
+      free_image: false,
+      unlocks: { vectorize: true, halftones: false },
+      vector: Object.assign({}, job.vector),
+      halftone: { style: "classic-round", svg: "/uploads/" + styledName },
+    });
+    const wmFree = Object.assign({}, job, {
+      id: wmFreeId,
+      title: "Watermark plate",
+      proof_token: crypto.randomBytes(32).toString("hex"),
+      vector_svg: "/uploads/" + solidName,
+      free_image: true,
+      unlocks: { vectorize: true, halftones: false },
+      vector: Object.assign({}, job.vector),
+      halftone: { style: "classic-round", svg: "/uploads/" + solidName },
+    });
+    const wmPaid = Object.assign({}, wmFree, {
+      id: wmPaidId,
+      title: "Watermark paid",
+      proof_token: crypto.randomBytes(32).toString("hex"),
+      free_image: false,
+    });
+    db2.jobs.push(styledJob, wmFree, wmPaid);
+    fs.writeFileSync(storePath, JSON.stringify(db2));
+
+    const styledFill = await req(port, "GET", "/api/jobs/" + styledId + "/preview.png?x=0&y=0&w=1&h=1&pw=100&ph=100&mode=fill", { headers: { Cookie: shopCk } });
+    assert.strictEqual(styledFill.status, 200, styledFill.text.slice(0, 180));
+    const styledFillRed = countWhere(styledFill.buf, isRed);
+    assert.ok(styledFillRed.n > 2000, "class rule fills the rect red, got " + styledFillRed.n);
+    const styledOut = await req(port, "GET", "/api/jobs/" + styledId + "/preview.png?x=0&y=0&w=1&h=1&pw=100&ph=100&mode=outline", { headers: { Cookie: shopCk } });
+    assert.strictEqual(styledOut.status, 200);
+    const styledMag = countWhere(styledOut.buf, isMagenta);
+    const styledRed = countWhere(styledOut.buf, isRed);
+    const styledNavy = countWhere(styledOut.buf, isNavy);
+    assert.ok(styledMag.n > 80, "outline beats group style and class fill, magenta " + styledMag.n);
+    assert.ok(styledRed.n < 80, "class fill is not painted in outline, red " + styledRed.n);
+    assert.ok(styledNavy.n < 40, "group navy is not painted in outline, navy " + styledNavy.n);
+    assert.ok(styledMag.n < styledMag.pixels * 0.2, "styled outline stays a thin stroke");
+
+    // Interior of the rect at ~12x, where a user-unit stroke is << 1. The line
+    // must stay about one pixel thick. vector-effect would drop it.
+    const zq = "x=0.45&y=0.47&w=0.08&h=0.08&pw=160&ph=160";
+    const zFill = await req(port, "GET", "/api/jobs/" + styledId + "/preview.png?" + zq + "&mode=fill", { headers: { Cookie: shopCk } });
+    const zOut = await req(port, "GET", "/api/jobs/" + styledId + "/preview.png?" + zq + "&mode=outline", { headers: { Cookie: shopCk } });
+    assert.strictEqual(zOut.status, 200);
+    const zFillRed = countWhere(zFill.buf, isRed);
+    const zMag = countWhere(zOut.buf, isMagenta);
+    const zRed = countWhere(zOut.buf, isRed);
+    assert.ok(zFillRed.n > 8000, "zoomed fill still shows the class fill, red " + zFillRed.n);
+    assert.ok(zMag.n > 40, "zoomed outline stroke is visible, magenta " + zMag.n);
+    assert.ok(zRed.n < 60, "zoomed outline is not the red fill, red " + zRed.n);
+    const thick = magentaRowRun(zOut.buf);
+    assert.ok(thick >= 1 && thick <= 6, "zoomed outline is about 1 device px, row run " + thick);
+
+    const wmQ = "pw=240&ph=240&mode=fill";
+    const wmFull = await req(port, "GET", "/api/jobs/" + wmFreeId + "/preview.png?x=0&y=0&w=1&h=1&" + wmQ, { headers: { Cookie: shopCk } });
+    const wmZoom = await req(port, "GET", "/api/jobs/" + wmFreeId + "/preview.png?x=0.4&y=0.4&w=0.07&h=0.07&" + wmQ, { headers: { Cookie: shopCk } });
+    const wmClean = await req(port, "GET", "/api/jobs/" + wmPaidId + "/preview.png?x=0&y=0&w=1&h=1&" + wmQ, { headers: { Cookie: shopCk } });
+    assert.strictEqual(wmFull.status, 200, wmFull.text.slice(0, 160));
+    assert.strictEqual(wmZoom.status, 200);
+    const wmInk = diffCount(wmClean.buf, wmFull.buf);
+    const wmStable = diffCount(wmFull.buf, wmZoom.buf);
+    assert.ok(wmInk > 80, "watermark is burned in, diff " + wmInk);
+    assert.ok(wmStable < 80, "watermark stays in output pixels when the crop zooms, diff " + wmStable);
 
     const capped = await req(port, "GET", "/api/jobs/" + paidId + "/preview.png?x=0&y=0&w=1&h=1&pw=4000&ph=4000&mode=fill", { headers: { Cookie: shopCk } });
     assert.strictEqual(capped.status, 200);
