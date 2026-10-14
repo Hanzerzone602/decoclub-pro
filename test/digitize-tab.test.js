@@ -6,7 +6,7 @@ const { digitizeLayers, summarize, ensureStitchFiles } = require("../lib/digitiz
 const { sampleArt } = require("../lib/stitch/art");
 
 {
-  const app = fs.readFileSync(path.join(__dirname, "..", "public", "app.js"), "utf8");
+  const app = fs.readFileSync(path.join(__dirname, "..", "public", "digitize-admin.js"), "utf8");
   assert.ok(app.indexOf("design.pes") !== -1, "Digitize tab offers PES");
   assert.ok(app.indexOf("paintDigitizeStats") !== -1, "tab paints stitch/thread stats");
   assert.ok(app.indexOf("textWarnings") !== -1, "tab shows prep textWarnings");
@@ -46,7 +46,7 @@ const { sampleArt } = require("../lib/stitch/art");
 }
 
 {
-  const app = fs.readFileSync(path.join(__dirname, "..", "public", "app.js"), "utf8");
+  const app = fs.readFileSync(path.join(__dirname, "..", "public", "digitize-admin.js"), "utf8");
   assert.ok(app.indexOf("previewOnly: true") !== -1);
   const exp = fs.readFileSync(path.join(__dirname, "..", "lib", "exports.js"), "utf8");
   assert.ok(exp.indexOf("engine: \"legacy\"") !== -1, "Vectorize packet DST path stays legacy");

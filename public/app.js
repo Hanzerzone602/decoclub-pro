@@ -3,17 +3,17 @@ let user = null, shop = null, view = "make", currentJob = null, station = "art",
 let cfg = { statuses: [], methods: [], blanks: [], billing: false, demo: false };
 const $ = (s, r = document) => r.querySelector(s);
 const STAT_LABEL = { new: "New", art_in: "Art in", mockup: "Mockup", priced: "Priced", proof_sent: "Proof sent", approved: "Approved", in_production: "In production", done: "Done" };
-const METHODS = ["dtf","uvdtf","uv","vinyl","laser","sticker","screen","hat","apparel","patch","embroidery","sublimation","rhinestone","sign"];
+const METHODS = ["dtf","uvdtf","uv","vinyl","laser","sticker","screen","hat","apparel","patch","sublimation","rhinestone","sign"];
 const METHOD_LABELS = {
   dtf: "DTF", uvdtf: "UV DTF", uv: "UV print", vinyl: "Vinyl", laser: "Laser",
   sticker: "Stickers", screen: "Screen", hat: "Hats", apparel: "Apparel", patch: "Patches",
-  embroidery: "Digitize", sublimation: "Sublimation", rhinestone: "Rhinestone", sign: "Signs",
+  sublimation: "Sublimation", rhinestone: "Rhinestone", sign: "Signs",
 };
 const METHOD_OUTCOMES = {
   dtf: "22in gang + SVG/EPS", uvdtf: "22in UV gang + SVG/EPS", uv: "SVG + EPS print",
   vinyl: "SVG + EPS cut", laser: "SVG + PLT", sticker: "Kiss-cut SVG + EPS",
-  hat: "Cap mockup + SVG/EPS", apparel: "Garment mockup + SVG/EPS", patch: "Badge + DST/EXP",
-  embroidery: "DST + EXP stitches", sublimation: "Wrap + SVG/EPS", rhinestone: "SS map + CSV", sign: "Board SVG + EPS",
+  hat: "Cap mockup + SVG/EPS", apparel: "Garment mockup + SVG/EPS", patch: "Badge + SVG/EPS",
+  sublimation: "Wrap + SVG/EPS", rhinestone: "SS map + CSV", sign: "Board SVG + EPS",
 };
 const METHOD_ICONS = {
   dtf: '<rect x="3" y="5" width="18" height="14" rx="1.5"/><path d="M6 9h5v6H6zM13 9h5M13 13h4"/>',
@@ -26,12 +26,35 @@ const METHOD_ICONS = {
   hat: '<path d="M4 14c2-6 4.5-8 8-8s6 2 8 8"/><path d="M3 15h18v2H3z"/><path d="M8 14v-2"/>',
   apparel: '<path d="M8 6l4-2 4 2 4 2-2.5 3H16v9H8V11H6.5L4 8z"/>',
   patch: '<path d="M12 3l7 3v6c0 4.2-2.8 7.5-7 9-4.2-1.5-7-4.8-7-9V6z"/>',
-  embroidery: '<circle cx="12" cy="12" r="7"/><circle cx="12" cy="12" r="3"/><path d="M12 2v3M12 19v3M2 12h3M19 12h3"/>',
   sublimation: '<rect x="8" y="4" width="8" height="16" rx="3.5"/><path d="M8 9h8"/>',
   rhinestone: '<path d="M12 3l4 6-4 12L8 9z"/><path d="M8 9h8"/>',
   sign: '<rect x="4" y="5" width="16" height="10" rx="1"/><path d="M12 15v5M8 20h8"/>',
 };
 const BLANKS = ["tee","hoodie","hat","tumbler","plaque","sticker","sign","hoop"];
+function studioExtras() {
+  return (window.DecoStudio && window.DecoStudio.extras) || [];
+}
+function methodChoices() {
+  if (cfg && Array.isArray(cfg.methods) && cfg.methods.length) return cfg.methods;
+  return METHODS;
+}
+function methodMeta(id) {
+  const extra = studioExtras().find((m) => m && m.method && m.method.id === id);
+  return {
+    label: (extra && extra.method.label) || METHOD_LABELS[id] || id,
+    outcome: (extra && extra.method.outcome) || METHOD_OUTCOMES[id] || "",
+    icon: (extra && extra.method.icon) || METHOD_ICONS[id] || "",
+  };
+}
+function loadAdminScripts(list) {
+  return (list || []).reduce((chain, src) => chain.then(() => new Promise((resolve, reject) => {
+    const el = document.createElement("script");
+    el.src = src;
+    el.onload = () => resolve();
+    el.onerror = () => reject(new Error("Could not load studio module"));
+    document.body.appendChild(el);
+  })), Promise.resolve());
+}
 const PLACES = [
   { id: "chest", label: "Center chest" },
   { id: "left_chest", label: "Left chest" },
@@ -245,7 +268,7 @@ async function boot() {
   const me = await api("/api/me");
   if (!me.user) {
     const m = new URLSearchParams(location.search).get("method") || sessionStorage.getItem("decoclub_start_method") || "";
-    if (METHODS.indexOf(m) !== -1) {
+    if (methodChoices().indexOf(m) !== -1) {
       sessionStorage.setItem("decoclub_start_method", m);
       location.href = "/login.html?method=" + encodeURIComponent(m);
     } else {
@@ -282,6 +305,7 @@ async function boot() {
     $("#sideName").textContent = shop.name;
     if (shop.logo_path) $("#sideLogo").src = shop.logo_path;
   }
+  if (user && cfg && Array.isArray(cfg.adminModules)) await loadAdminScripts(cfg.adminModules);
   const startMethod = consumeStartMethod();
   if (startMethod) makeMethod = startMethod;
   consumeStartTool();
@@ -294,7 +318,8 @@ function consumeStartMethod() {
   const params = new URLSearchParams(location.search);
   const fromUrl = params.get("method") || "";
   const fromStore = sessionStorage.getItem("decoclub_start_method") || "";
-  const method = METHODS.indexOf(fromUrl) !== -1 ? fromUrl : (METHODS.indexOf(fromStore) !== -1 ? fromStore : "");
+  const choices = methodChoices();
+  const method = choices.indexOf(fromUrl) !== -1 ? fromUrl : (choices.indexOf(fromStore) !== -1 ? fromStore : "");
   sessionStorage.removeItem("decoclub_start_method");
   if (method && (params.get("method") || params.get("station"))) {
     // keep tool= in URL until consumeStartTool runs; strip below if no tool
@@ -489,7 +514,7 @@ async function startJobFromFile(file, method) {
     file = await fileToPng(file);
     const fd = new FormData();
     fd.append("title", titleFromFile(file));
-    fd.append("method", METHODS.indexOf(method) !== -1 ? method : "apparel");
+    fd.append("method", methodChoices().indexOf(method) !== -1 ? method : "apparel");
     fd.append("width_in", "10");
     fd.append("height_in", "10");
     fd.append("qty", "1");
@@ -515,11 +540,11 @@ async function startJobFromFile(file, method) {
 }
 
 function processTileInner(m) {
-  const ico = METHOD_ICONS[m] || "";
-  return `<svg class="process-ico" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" aria-hidden="true">${ico}</svg><span class="process-name">${METHOD_LABELS[m]}</span><span class="process-out">${METHOD_OUTCOMES[m] || ""}</span><span class="process-go">Start job</span>`;
+  const meta = methodMeta(m);
+  return `<svg class="process-ico" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" aria-hidden="true">${meta.icon}</svg><span class="process-name">${meta.label}</span><span class="process-out">${meta.outcome}</span><span class="process-go">Start job</span>`;
 }
 function processGridHtml(asButtons) {
-  return `<div class="process-grid">${METHODS.map((m) => (
+  return `<div class="process-grid">${methodChoices().map((m) => (
     asButtons
       ? `<button type="button" class="process-tile" data-start-method="${m}">${processTileInner(m)}</button>`
       : `<a class="process-tile" href="/start.html?method=${m}">${processTileInner(m)}</a>`
@@ -542,7 +567,7 @@ async function renderMake() {
     return renderBoard();
   }
   // Quiet default method — no process-chip picker on Make
-  if (METHODS.indexOf(makeMethod) === -1) makeMethod = "apparel";
+  if (methodChoices().indexOf(makeMethod) === -1) makeMethod = "apparel";
   main.innerHTML = `
     <div class="make-home">
       <h1 class="make-title">Drop art. Vectorize. Recolor. Export.</h1>
@@ -663,7 +688,7 @@ async function renderIntake() {
     <form class="form" id="jobForm">
       <label>Title</label><input name="title" required placeholder="Club hats — Saturday market" />
       <label>Method</label>
-      <select name="method">${METHODS.map((m) => `<option value="${m}">${m}</option>`).join("")}</select>
+      <select name="method">${methodChoices().map((m) => `<option value="${m}">${methodMeta(m).label}</option>`).join("")}</select>
       <label>Client</label>
       <select name="client_id"><option value="">Unassigned</option>${clients.map((c) => `<option value="${c.id}">${escapeHtml(c.name)}</option>`).join("")}</select>
       <label>Due date</label><input name="due_at" type="date" />
@@ -690,20 +715,20 @@ async function renderIntake() {
   };
 }
 
-// Digitize shows only when this user's /api/me entitlements include it (admin + flag).
-function canDigitize() { return !!(user && user.services && user.services.digitize); }
-
 async function renderJob(id) {
   const { job, events } = await api("/api/jobs/" + id);
   const shopControls = canFloor();
   const PRICE_STATION_ENABLED = false; // apparel quote UI off until David turns it back on
+  const extras = studioExtras();
+  const extraTabs = extras.filter((m) => m && m.tab).map((m) => m.tab);
   const tabs = [
-    ["art","Art"],...(canDigitize() ? [["digitize","Digitize"]] : []),["export","Export"],["mockup","Mockup"],
+    ["art","Art"], ...extraTabs, ["export","Export"],["mockup","Mockup"],
     ...(PRICE_STATION_ENABLED ? [["price","Price"]] : []),
     ["proof","Proof"],["overview","Overview"],["comments","Comments"]
   ];
+  const known = tabs.map((t) => t[0]).concat(["produce"]);
   if (!PRICE_STATION_ENABLED && station === "price") station = "art";
-  if (station === "digitize" && !canDigitize()) station = "art";
+  if (known.indexOf(station) === -1) station = "art";
   main.innerHTML = `
     <div class="studio-top">
       <button class="btn ghost small" id="back">← Board</button>
@@ -719,8 +744,9 @@ async function renderJob(id) {
   $("#back").onclick = () => { currentJob = null; view = "board"; nav(); render(); };
   main.querySelectorAll("[data-tab]").forEach((b) => { b.onclick = () => { station = b.dataset.tab; renderJob(id); }; });
   const el = $("#station");
+  const extra = extras.find((m) => m && m.id === station && typeof m.open === "function");
+  if (extra) return extra.open(el, job, shopControls);
   if (station === "art") return fillArt(el, job, shopControls);
-  if (station === "digitize") return fillDigitize(el, job, shopControls);
   if (station === "mockup") return fillMockup(el, job, shopControls);
   if (station === "price" && PRICE_STATION_ENABLED) return fillPrice(el, job, shopControls);
   if (station === "proof") return fillProof(el, job, shopControls);
@@ -888,15 +914,16 @@ async function fillArt(el, job, shopControls) {
     ? `<p class="muted vz-used" id="vzUsed">Last run · Detail ${escapeHtml(detailReadout(toPct(lastSet.detail, DETAIL_LEGACY, 50)))} · Smoothing ${escapeHtml(smoothReadout(toPct(lastSet.smoothing, SMOOTH_LEGACY, 50)))} · Corners ${escapeHtml(cornerReadout(toPct(lastSet.cornerSmooth, CORNER_LEGACY, 50)))}</p>`
     : `<p class="muted vz-used" id="vzUsed" hidden></p>`;
 
+  const extras = studioExtras();
   const RAIL_ICO = {
     upload: '<path d="M12 16V4M7 9l5-5 5 5"/><path d="M4 16v4h16v-4"/>',
     vectorize: '<path d="M4 17l4-10 4 6 3-4 5 8"/><path d="M4 19h16"/>',
     halftones: '<circle cx="6" cy="8" r="1.4"/><circle cx="12" cy="6" r="2"/><circle cx="18" cy="9" r="1.2"/><circle cx="8" cy="14" r="1.8"/><circle cx="14" cy="15" r="1.3"/><circle cx="19" cy="16" r="1.6"/>',
     colors: '<circle cx="12" cy="12" r="8"/><circle cx="9" cy="10" r="1.3"/><circle cx="14" cy="9" r="1.3"/><circle cx="15" cy="14" r="1.3"/>',
     clean: '<path d="M4 20l7-7"/><path d="M14 4l6 6-8 8-6-6z"/>',
-    digitize: '<path d="M4 12c3-6 5 6 8 0s5 6 8 0"/><path d="M4 18h16"/>',
     export: '<path d="M12 4v12M7 11l5 5 5-5"/><path d="M4 20h16"/>',
   };
+  extras.forEach((m) => { if (m && m.id && m.railIcon) RAIL_ICO[m.id] = m.railIcon; });
   const railBtn = (key, label) => `<button type="button" class="rail-btn" data-rail="${key}" title="${escapeHtml(label)}"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" aria-hidden="true">${RAIL_ICO[key]}</svg><span>${escapeHtml(label)}</span></button>`;
   const exportPanel = `
         ${shopControls && (layers.length || jobHasVector(job)) ? `<div class="export-grid export-hero art-dl">
@@ -916,12 +943,11 @@ async function fillArt(el, job, shopControls) {
           <a href="/api/export/${job.id}/art.png" id="dlArtPng">Download PNG</a>
         </div>
         <p class="muted">Raster art · PNG</p>` : ""}
-        ${shopControls && canDigitize() && (layers.length || jobHasVector(job)) ? `<div class="export-grid art-dl art-dl-stitch">
-          <a href="/api/export/${job.id}/design.dst">DST</a>
-          <a href="/api/export/${job.id}/design.exp">EXP</a>
-          <a href="/api/export/${job.id}/design.pes">PES</a>
-        </div>
-        <p class="muted">Stitch files (admin) · tune on the Digitize tab</p>` : ""}
+        ${extras.map((m) => {
+          if (!shopControls || !m || typeof m.exportHtml !== "function") return "";
+          if (m.needsArt && !(layers.length || jobHasVector(job))) return "";
+          return m.exportHtml(job, { layers: layers });
+        }).join("")}
         ${shopControls ? `<button type="button" class="btn ghost small studio-more-files" id="moreFilesBtn">All production files →</button>` : ""}`;
 
   el.innerHTML = `
@@ -932,7 +958,7 @@ async function fillArt(el, job, shopControls) {
         ${railBtn("halftones", "Halftones")}
         ${layers.length ? railBtn("colors", "Colors") : ""}
         ${railBtn("clean", "Clean up")}
-        ${canDigitize() ? railBtn("digitize", "Digitize") : ""}
+        ${extras.filter((m) => m && m.railLabel).map((m) => railBtn(m.id, m.railLabel)).join("")}
         ${railBtn("export", "Export")}
       </nav>` : ""}
       <aside class="studio-panel art-tools">
@@ -1060,10 +1086,15 @@ async function fillArt(el, job, shopControls) {
       halftones: () => { const p = $("#htPanel"); if (p && p.hidden) $("#halftoneBtn").click(); if (p) p.scrollIntoView({ block: "nearest", behavior: "smooth" }); },
       colors: () => { const p = $("#htPanel"); if (p && !p.hidden) $("#htCancel").click(); const l = $("#layerList"); if (l) l.scrollIntoView({ block: "start", behavior: "smooth" }); },
       clean: () => { const m = $("#artMore"); if (m) { m.open = true; m.scrollIntoView({ block: "nearest", behavior: "smooth" }); } },
-      digitize: () => { station = "digitize"; renderJob(job.id); },
       export: () => { const c = $("#exportCard"); if (c) { c.classList.add("flash"); c.scrollIntoView({ block: "nearest", behavior: "smooth" }); setTimeout(() => c.classList.remove("flash"), 900); } },
     };
-    el.querySelectorAll("[data-rail]").forEach((b) => { b.onclick = () => { el.querySelectorAll("[data-rail]").forEach((x) => x.classList.toggle("on", x === b)); (railGo[b.dataset.rail] || (() => {}))(); }; });
+    el.querySelectorAll("[data-rail]").forEach((b) => { b.onclick = () => {
+      el.querySelectorAll("[data-rail]").forEach((x) => x.classList.toggle("on", x === b));
+      const go = railGo[b.dataset.rail];
+      if (go) { go(); return; }
+      const ex = extras.find((m) => m && m.id === b.dataset.rail);
+      if (ex) { station = ex.id; renderJob(job.id); }
+    }; });
     const ctx = $("#ctExport"); if (ctx) ctx.onclick = railGo.export;
     const mf = $("#moreFilesBtn"); if (mf) mf.onclick = () => { station = "export"; renderJob(job.id); };
   }
@@ -2331,7 +2362,7 @@ function fillPrice(el, job, shopControls) {
     <p class="muted">Area rate by method, volume breaks at 10 and 25. Margin is shop markup on subtotal — not a fake invoice from a processor.</p>
     ${shopControls ? `<form id="pf" class="form">
       <label>Primary method</label>
-      <select name="method">${METHODS.map((m) => `<option value="${m}" ${m===job.method?"selected":""}>${m}</option>`).join("")}</select>
+      <select name="method">${methodChoices().map((m) => `<option value="${m}" ${m===job.method?"selected":""}>${methodMeta(m).label}</option>`).join("")}</select>
       <div class="row">
         <div style="flex:1"><label>W</label><input name="width_in" type="number" step="0.1" value="${job.width_in}" /></div>
         <div style="flex:1"><label>H</label><input name="height_in" type="number" step="0.1" value="${job.height_in}" /></div>
@@ -2365,7 +2396,7 @@ function fillPrice(el, job, shopControls) {
 function lineRow(it, i) {
   return `<div class="line" data-line>
     <input name="l${i}desc" placeholder="Desc" value="${escapeHtml(it.desc||"")}" />
-    <select name="l${i}method">${METHODS.map((m) => `<option value="${m}" ${m===it.method?"selected":""}>${m}</option>`).join("")}</select>
+    <select name="l${i}method">${methodChoices().map((m) => `<option value="${m}" ${m===it.method?"selected":""}>${methodMeta(m).label}</option>`).join("")}</select>
     <input name="l${i}width_in" type="number" step="0.1" value="${it.width_in||10}" />
     <input name="l${i}height_in" type="number" step="0.1" value="${it.height_in||10}" />
     <input name="l${i}qty" type="number" value="${it.qty||1}" />
@@ -2394,210 +2425,14 @@ function fillProof(el, job, shopControls) {
   };
 }
 
-let digitizeView = null;
-async function fillDigitize(el, job, shopControls) {
-  if (!shopControls) { el.innerHTML = "<p class='muted'>Digitize is shop-only.</p>"; return; }
-  if (!entitled()) {
-    el.innerHTML = paywallNote() + "<p class='muted'>DST / EXP packets need Shop or Studio. Vectorize stays on trial.</p>";
-    return;
-  }
-  const pals = await loadPalettes();
-  const madeira = pals.madeiraRayon || pals.thread || [];
-  const w0 = Number(job.width_in) || 1;
-  const h0 = Number(job.height_in) || 1;
-  el.innerHTML = `
-    <div class="split digitize-station">
-      <div class="dig-stage">
-        <canvas id="digView" class="dig-canvas"></canvas>
-        <p class="muted">Drag to orbit · scroll to zoom · fabric + thread tubes (not Wilcom TrueView)</p>
-      </div>
-      <div class="dig-tools">
-        <p class="stat" id="digCount">${job.stitchCount != null ? Number(job.stitchCount).toLocaleString() + " stitches" : "— stitches"}</p>
-        <ul class="dig-stats" id="digStats"></ul>
-        <ul class="dig-threads" id="digThreads"></ul>
-        <div class="dig-warns" id="digWarns"></div>
-        <p class="muted" id="digMeta">${escapeHtml((job.digitizeExporter || "") + (job.colorStops && job.colorStops[0] ? " · " + job.colorStops[0].madeiraCode + " " + job.colorStops[0].name : ""))}</p>
-        <label>Width (in) <span id="digWread">${w0}</span></label>
-        <input id="digW" type="range" min="0.4" max="6" step="0.05" value="${w0}" />
-        <label>Height (in) <span id="digHread">${h0}</span></label>
-        <input id="digH" type="range" min="0.4" max="6" step="0.05" value="${h0}" />
-        <label class="remember"><input id="digLock" type="checkbox" checked /> Lock aspect</label>
-        <label>Density (mm) <span id="digDread">0.40</span></label>
-        <input id="digD" type="range" min="0.22" max="0.70" step="0.02" value="0.40" />
-        <label>Satin spacing (mm) <span id="digSread">0.40</span></label>
-        <input id="digS" type="range" min="0.25" max="0.80" step="0.05" value="0.40" />
-        <label>Fabric</label>
-        <select id="digFabric">
-          <option value="tee" selected>T-shirt / jersey</option>
-          <option value="polo">Polo / pique</option>
-          <option value="woven">Woven / poplin</option>
-          <option value="twill">Twill / chino</option>
-          <option value="fleece">Fleece / sweat</option>
-          <option value="cap">Cap front</option>
-        </select>
-        <label class="remember" id="digBusyWrap" hidden><input id="digSimplify" type="checkbox" /> Simplify busy art</label>
-        <label>Stitch player <span id="digPread">100%</span></label>
-        <input id="digPlayer" type="range" min="0" max="100" step="1" value="100" />
-        <div class="cta-row">
-          <button type="button" class="btn ghost small" id="digPlay">Play</button>
-          <button type="button" class="btn ghost small" id="digPause">Pause</button>
-        </div>
-        <label>Madeira Rayon</label>
-        <input id="digFilter" class="field" placeholder="Search code or name" />
-        <select id="digThread" size="8" class="dig-thread"></select>
-        <p class="muted">On-screen match, not a certified spool. Size/density restitches. Thread swap recolors only.</p>
-        <div class="export-grid export-hero art-dl" id="digDl">
-          <a href="/api/export/${job.id}/design.dst">Download DST</a>
-          <a href="/api/export/${job.id}/design.exp">Download EXP</a>
-          <a href="/api/export/${job.id}/design.pes">Download PES</a>
-          <a href="/api/export/${job.id}/stitch-preview.svg">2D preview SVG</a>
-        </div>
-        <p class="notice" id="digErr"></p>
-      </div>
-    </div>`;
-  const threadSel = $("#digThread");
-  function fillThreadOpts(q) {
-    const qq = String(q || "").toLowerCase();
-    const list = madeira.filter((c) => !qq || String(c.code).indexOf(qq) !== -1 || String(c.name).toLowerCase().indexOf(qq) !== -1);
-    threadSel.innerHTML = list.slice(0, 80).map((c) =>
-      `<option value="${escapeHtml(c.hex)}" data-code="${escapeHtml(c.code || "")}" data-name="${escapeHtml(c.name || "")}">${escapeHtml((c.code ? c.code + " · " : "") + c.name)}</option>`
-    ).join("");
-  }
-  fillThreadOpts("");
-  $("#digFilter").oninput = () => fillThreadOpts($("#digFilter").value);
-  const aspect = w0 / (h0 || 1);
-  let payload = null;
-  let timer = 0;
-  function readSize() {
-    return {
-      widthIn: Number($("#digW").value),
-      heightIn: Number($("#digH").value),
-      density: Number($("#digD").value),
-      satinSpacingMm: Number($("#digS").value),
-      fabric: $("#digFabric") ? $("#digFabric").value : "tee",
-      simplify: !!( $("#digSimplify") && $("#digSimplify").checked ),
-    };
-  }
-  function paintDigitizeStats(data) {
-    const sum = data.summary || {};
-    const stitches = Number(data.stitchCount || sum.stitchCount || 0);
-    const colours = (data.colorStops || []).length || sum.colours || 0;
-    const changes = sum.colorChanges != null ? sum.colorChanges : Math.max(0, colours - 1);
-    const trims = sum.trims != null ? sum.trims : 0;
-    $("#digCount").textContent = stitches.toLocaleString() + " stitches";
-    const stats = $("#digStats");
-    if (stats) {
-      stats.innerHTML =
-        "<li>" + colours + " thread colour" + (colours === 1 ? "" : "s") + "</li>" +
-        "<li>" + changes + " colour change" + (changes === 1 ? "" : "s") + "</li>" +
-        "<li>" + trims + " trim" + (trims === 1 ? "" : "s") + "</li>";
-    }
-    const list = $("#digThreads");
-    if (list) {
-      list.innerHTML = (data.colorStops || []).map((s) => {
-        const hex = escapeHtml(s.hex || "#888");
-        const code = s.madeiraCode ? escapeHtml(String(s.madeiraCode)) + " " : "";
-        const name = escapeHtml(s.name || "Thread");
-        return "<li><span class='dig-swatch' style='background:" + hex + "'></span>" + code + name + "</li>";
-      }).join("");
-    }
-    const warns = [];
-    if (data.minRecommendedWidthIn) warns.push("Recommended width ≥ " + Number(data.minRecommendedWidthIn).toFixed(1) + " in");
-    (data.textWarnings || []).forEach((w) => {
-      const msg = w && (w.message || w.warning || w.text);
-      if (msg) warns.push(msg);
-      else if (w && w.type) warns.push(String(w.type).replace(/_/g, " "));
-    });
-    const busy = data.busyArt;
-    const busyWrap = $("#digBusyWrap");
-    if (busy && (busy.warning || busy.simplifyAvailable || busy.score != null)) {
-      if (busy.warning) warns.push(busy.warning);
-      else if (busy.score != null) warns.push("Busy art score " + busy.score);
-      else warns.push("Busy artwork: may need manual digitizing.");
-      if (busy.verdict && !(busy.warning && String(busy.warning).toLowerCase().indexOf(String(busy.verdict).toLowerCase()) >= 0)) warns.push("Verdict: " + String(busy.verdict).replace(/_/g, " "));
-      if (busyWrap) busyWrap.hidden = !busy.simplifyAvailable;
-    } else if (busyWrap) busyWrap.hidden = true;
-    const box = $("#digWarns");
-    if (box) box.innerHTML = warns.map((t) => "<p class='dig-warn'>" + escapeHtml(t) + "</p>").join("");
-    const stop = (data.colorStops && data.colorStops[0]) || {};
-    $("#digMeta").textContent = (data.engine || "wq") + (data.exporter ? " · " + data.exporter : "") + (stop.madeiraCode ? " · " + stop.madeiraCode + " " + stop.name : "");
-  }
-  async function restitch() {
-    const s = readSize();
-    $("#digWread").textContent = s.widthIn.toFixed(2);
-    $("#digHread").textContent = s.heightIn.toFixed(2);
-    $("#digDread").textContent = s.density.toFixed(2);
-    $("#digSread").textContent = s.satinSpacingMm.toFixed(2);
-    $("#digErr").textContent = "Digitizing…";
-    const dl = $("#digDl");
-    if (dl) dl.querySelectorAll("a").forEach((a) => { a.style.pointerEvents = "none"; a.style.opacity = "0.5"; });
-    try {
-      const data = await api("/api/jobs/" + job.id + "/digitize", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ widthIn: s.widthIn, heightIn: s.heightIn, density: s.density, satinSpacingMm: s.satinSpacingMm, fabric: s.fabric, simplify: s.simplify, previewOnly: true }),
-      });
-      payload = data.preview;
-      paintDigitizeStats(data);
-      $("#digErr").textContent = data.usedFallback ? "Art was too thin — used a fill block. Vectorize first for a real logo." : "";
-      if (payload && window.DigitizePreview) {
-        const canvas = $("#digView");
-        if (digitizeView && digitizeView.canvas === canvas) digitizeView.setPayload(payload);
-        else {
-          if (digitizeView && digitizeView.stop) digitizeView.stop();
-          digitizeView = window.DigitizePreview.mount(canvas, payload);
-        }
-      }
-      if (dl) dl.querySelectorAll("a").forEach((a) => { a.style.pointerEvents = ""; a.style.opacity = ""; });
-    } catch (err) {
-      $("#digErr").textContent = err.message;
-    }
-  }
-  function debounce() { clearTimeout(timer); timer = setTimeout(restitch, 250); }
-  $("#digW").oninput = () => {
-    if ($("#digLock").checked) $("#digH").value = (Number($("#digW").value) / aspect).toFixed(2);
-    debounce();
-  };
-  $("#digH").oninput = () => {
-    if ($("#digLock").checked) $("#digW").value = (Number($("#digH").value) * aspect).toFixed(2);
-    debounce();
-  };
-  $("#digD").oninput = debounce;
-  $("#digS").oninput = debounce;
-  if ($("#digFabric")) $("#digFabric").onchange = restitch;
-  if ($("#digSimplify")) $("#digSimplify").onchange = restitch;
-  if ($("#digPlayer")) $("#digPlayer").oninput = () => {
-    const t = Number($("#digPlayer").value) / 100;
-    $("#digPread").textContent = Math.round(t * 100) + "%";
-    if (digitizeView && digitizeView.setPlayhead) digitizeView.setPlayhead(t);
-  };
-  if ($("#digPlay")) $("#digPlay").onclick = () => { if (digitizeView && digitizeView.play) digitizeView.play(0.16); };
-  if ($("#digPause")) $("#digPause").onclick = () => { if (digitizeView && digitizeView.pause) digitizeView.pause(); };
-  threadSel.onchange = async () => {
-    const opt = threadSel.selectedOptions[0];
-    if (!opt || !payload) return;
-    const hex = opt.value, code = opt.dataset.code, name = opt.dataset.name;
-    payload.threads = (payload.threads || []).map((t, i) => i === 0 ? Object.assign({}, t, { hex: hex, code: code, name: name }) : t);
-    if (digitizeView) digitizeView.recolor(payload.threads);
-    try {
-      await api("/api/jobs/" + job.id + "/digitize", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ recolorOnly: true, threads: [{ layerIndex: 0, hex: hex, code: code, name: name }] }),
-      });
-    } catch (err) { $("#digErr").textContent = err.message; }
-  };
-  await restitch();
-}
-
 function fillProduce(el, job, shopControls) {
   if (!shopControls) { el.innerHTML = "<p class='muted'>Export files are shop-only.</p>"; return; }
   if (!entitled()) { el.innerHTML = paywallNote() + "<p class='muted'>Some art exports stay locked until a member account is active. Admin stays open.</p>"; return; }
-  const stitch = job.stitchCount != null ? job.stitchCount : (job.vector ? "run Export" : "—");
   const stones = job.stones && job.stones.count != null ? job.stones.count : "—";
+  const extraFiles = studioExtras().map((m) => (m && typeof m.produceHtml === "function") ? m.produceHtml(job) : "").join("");
   el.innerHTML = `
-    <p class="muted">Process files from this art. SVG + EPS for Corel. DST + EXP stitches. Rhinestone SS map + CSV. 3D stitch preview lives on the Digitize tab.</p>
-    <p class="mono">Stitches ${escapeHtml(String(stitch))} · Stones ${escapeHtml(String(stones))}${job.digitizeExporter ? " · " + escapeHtml(job.digitizeExporter) : ""}</p>
+    <p class="muted">Process files from this art. SVG + EPS for Corel. Rhinestone SS map + CSV.</p>
+    <p class="mono">Stones ${escapeHtml(String(stones))}</p>
     <div class="export-grid export-hero">
       <a href="/api/export/${job.id}/art.svg">SVG</a>
       <a href="/api/export/${job.id}/art.eps">EPS</a>
@@ -2605,13 +2440,10 @@ function fillProduce(el, job, shopControls) {
       <a href="/api/export/${job.id}/art.dxf">DXF</a>
       <a href="/api/export/${job.id}/art.tiff">TIFF 300</a>
       <a href="/api/export/${job.id}/art-dtf.tiff">DTF TIFF + white</a>
-      ${canDigitize() ? `<a href="/api/export/${job.id}/design.dst">DST</a>
-      <a href="/api/export/${job.id}/design.exp">EXP</a>
-      <a href="/api/export/${job.id}/design.pes">PES</a>` : ""}
+      ${extraFiles}
       <a href="/api/export/${job.id}/stones.svg">Stones SVG</a>
       <a href="/api/export/${job.id}/stones.csv">Stones CSV</a>
       <a href="/api/export/${job.id}/stones.plt">Stones PLT</a>
-      <a href="/api/export/${job.id}/stitch-preview.svg">Stitch preview</a>
     </div>
     <div class="export-grid">
       <a href="/api/export/${job.id}/cut-contour.svg">Cut contour SVG</a>
@@ -2730,5 +2562,19 @@ async function renderSettings() {
   };
   main.querySelectorAll("[data-plan]").forEach((b) => { b.onclick = () => checkout(b.dataset.plan); });
 }
+
+window.DecoStudio = {
+  qs: $,
+  api: api,
+  renderJob: renderJob,
+  escapeHtml: escapeHtml,
+  loadPalettes: loadPalettes,
+  entitled: entitled,
+  paywallNote: paywallNote,
+  getStation: () => station,
+  setStation: (next) => { station = next; },
+  extras: [],
+  register: function (mod) { if (mod && mod.id) this.extras.push(mod); },
+};
 
 boot().catch((err) => { main.innerHTML = `<p class="notice">${escapeHtml(err.message)}</p>`; });

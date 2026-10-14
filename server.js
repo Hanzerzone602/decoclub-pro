@@ -418,7 +418,62 @@ async function stitchFileForJob(job, name) {
   return null;
 }
 function flagsFor(u) {
-  return Object.assign({}, features.flags(), { digitize: digitizeFor(u) });
+  const f = Object.assign({}, features.flags());
+  if (digitizeFor(u)) { f.digitize = true; return f; }
+  delete f.digitize;
+  return f;
+}
+
+function methodsFor(user) {
+  if (digitizeFor(user)) return METHODS;
+  return METHODS.filter(function (m) { return m !== "embroidery"; });
+}
+
+function forbidDigitize(user, res) {
+  if (digitizeFor(user)) return false;
+  if (!user) { json(res, 401, { error: "Sign in required" }); return true; }
+  json(res, 403, { error: "Forbidden" });
+  return true;
+}
+
+function isStitchExportName(name) {
+  const n = String(name || "").toLowerCase();
+  if (n === "stitch-preview.svg") return true;
+  return n.indexOf("dst") !== -1 || n.indexOf("exp") !== -1 || n.indexOf("pes") !== -1;
+}
+
+function rewriteEmbroideryMethod(value) {
+  if (typeof value === "string") return value === "embroidery" ? "apparel" : value;
+  if (Buffer.isBuffer(value)) return value;
+  if (Array.isArray(value)) return value.map(rewriteEmbroideryMethod);
+  if (value && typeof value === "object") {
+    const out = {};
+    Object.keys(value).forEach(function (k) { out[k] = rewriteEmbroideryMethod(value[k]); });
+    return out;
+  }
+  return value;
+}
+
+function scrubHidden(value) {
+  if (typeof value === "string") {
+    if (!/digitiz|embroider/i.test(value)) return value;
+    return value.replace(/digitiz\w*/ig, "").replace(/embroider\w*/ig, "").replace(/\s{2,}/g, " ").trim();
+  }
+  if (Buffer.isBuffer(value)) return value;
+  if (Array.isArray(value)) return value.map(scrubHidden).filter(function (v) { return v !== ""; });
+  if (value && typeof value === "object") {
+    const out = {};
+    Object.keys(value).forEach(function (k) {
+      if (/digitiz|embroider/i.test(k)) return;
+      out[k] = scrubHidden(value[k]);
+    });
+    return out;
+  }
+  return value;
+}
+
+function scrubCustomer(value) {
+  return scrubHidden(rewriteEmbroideryMethod(value));
 }
 
 function serviceEntitlements(u) {
@@ -1426,9 +1481,11 @@ function sanitizePublicEventMessage(message) {
   return s;
 }
 
-function presentEvents(events) {
+function presentEvents(events, user) {
   return (events || []).map(function (e) {
-    return Object.assign({}, e, { message: sanitizePublicEventMessage(e.message) });
+    let message = sanitizePublicEventMessage(e.message);
+    if (!digitizeFor(user)) message = scrubHidden(message);
+    return Object.assign({}, e, { message: message });
   });
 }
 
@@ -1552,6 +1609,7 @@ function presentJob(job, req) {
       delete copy.halftone.svg;
     }
   }
+  if (!digitizeFor(currentUser(req, load()))) return scrubCustomer(copy);
   return copy;
 }
 function event(db, job, message) {
@@ -1603,9 +1661,17 @@ async function handleApi(req, res, url) {
   const deviceId = method === "GET" ? ensureDevice(req, res) : (parseCookies(req)[DEVICE_COOKIE] || null);
   if (user) REQ_CTX.set(user, { db: db, device: deviceId ? hashId("d:" + deviceId) : null, ipHash: hashId("ip:" + clientIp(req)) });
 
+  if (/digitiz|embroider/i.test(pth)) {
+    if (forbidDigitize(user, res)) return;
+  }
+
   if (pth === "/api/config" && method === "GET") {
     const st = ensureSettings(db);
-    return jsonPrivate(res, 200, { demo: allowDemo(), billing: billingConfigured(), imagine: imagineConfigured(), imagineModel: "latest", vectorizerAi: vectorizerAi.configured(), vtracer: vtracer.available(), vaiTrace: vaiTrace.available(), inventVectorize: true, inventWinner: null, rasterCorel: true, inventWarp: inventWarp.available(), inventWarpReason: inventWarp.available() ? null : (inventWarp.unavailableReason && inventWarp.unavailableReason()), corelImport: true, name: "DecoClub Pro", statuses: STATUSES, methods: METHODS, blanks: BLANKS, seed: allowDemo() ? { owner: "owner@anvil.local", client: "client@anvil.local", password: "anvil123" } : null, services: { vectorize: true, halftones: true, digitize: digitizeFor(user) }, features: flagsFor(user), pricing: { vectorize: buyOptions("vectorize", st), halftones: buyOptions("halftones", st) }, halftonePricing: halftoneBuyOptions(st) });
+    const services = { vectorize: true, halftones: true };
+    if (digitizeFor(user)) services.digitize = true;
+    const body = { demo: allowDemo(), billing: billingConfigured(), imagine: imagineConfigured(), imagineModel: "latest", vectorizerAi: vectorizerAi.configured(), vtracer: vtracer.available(), vaiTrace: vaiTrace.available(), inventVectorize: true, inventWinner: null, rasterCorel: true, inventWarp: inventWarp.available(), inventWarpReason: inventWarp.available() ? null : (inventWarp.unavailableReason && inventWarp.unavailableReason()), corelImport: true, name: "DecoClub Pro", statuses: STATUSES, methods: methodsFor(user), blanks: BLANKS, seed: allowDemo() ? { owner: "owner@anvil.local", client: "client@anvil.local", password: "anvil123" } : null, services: services, features: flagsFor(user), pricing: { vectorize: buyOptions("vectorize", st), halftones: buyOptions("halftones", st) }, halftonePricing: halftoneBuyOptions(st) };
+    if (digitizeFor(user)) body.adminModules = ["/digitize-preview.js", "/digitize-admin.js"];
+    return jsonPrivate(res, 200, body);
   }
   if (pth === "/api/services" && method === "GET") {
     const st = ensureSettings(db);
@@ -1616,7 +1682,8 @@ async function handleApi(req, res, url) {
   }
   if (pth === "/api/quote" && (method === "POST" || method === "GET")) {
     const body = method === "GET" ? { method: url.searchParams.get("method"), width_in: url.searchParams.get("width_in"), height_in: url.searchParams.get("height_in"), qty: url.searchParams.get("qty"), margin_pct: url.searchParams.get("margin_pct") } : parseJsonBody(await readBody(req));
-    return json(res, 200, { quote: priceQuote(body) });
+    const quote = priceQuote(body);
+    return json(res, 200, { quote: digitizeFor(user) ? quote : scrubCustomer(quote) });
   }
   if (pth === "/api/me" && method === "GET") {
     if (user) {
@@ -1632,7 +1699,8 @@ async function handleApi(req, res, url) {
   }
   if (pth === "/api/catalog" && method === "GET") {
     const q = url.searchParams.get("q");
-    const skus = searchCatalog(q);
+    let skus = searchCatalog(q);
+    if (!digitizeFor(user)) skus = skus.map(scrubCustomer);
     return json(res, 200, { skus: skus, total: loadCatalog().length });
   }
   if (pth === "/api/blanks" && method === "GET") {
@@ -1927,7 +1995,7 @@ async function handleApi(req, res, url) {
     if (!user) return json(res, 401, { error: "Sign in required" });
     const job = db.jobs.find(function (j) { return j.id === jobGet[1]; });
     if (!job || !canSeeJob(user, job)) return json(res, 404, { error: "Job not found" });
-    return json(res, 200, { job: presentJob(job, req), events: presentEvents(db.events.filter(function (e) { return e.job_id === job.id; })) });
+    return json(res, 200, { job: presentJob(job, req), events: presentEvents(db.events.filter(function (e) { return e.job_id === job.id; }), user) });
   }
   if (jobGet && method === "POST") {
     if (!canRunFloor(user)) return json(res, 403, { error: "Shop login required" });
@@ -2705,7 +2773,7 @@ async function handleApi(req, res, url) {
   }
   const digPath = pth.match(/^\/api\/jobs\/([^/]+)\/digitize$/);
   if (digPath && method === "POST") {
-    if (!digitizeFor(user)) return json(res, 404, { error: "Not found" });
+    if (forbidDigitize(user, res)) return;
     if (!canRunFloor(user)) return json(res, 403, { error: "Shop login required" });
     if (!requirePaidProduce(user, res)) return;
     const job = db.jobs.find(function (j) { return j.id === digPath[1] && j.shop_id === user.shop_id; });
@@ -2782,10 +2850,10 @@ async function handleApi(req, res, url) {
   }
   const expFile = pth.match(/^\/api\/export\/([^/]+)\/([^/]+)$/);
   if (expFile && method === "GET") {
-    if (!canRunFloor(user)) return json(res, 403, { error: "Shop login required" });
     const exportName = String(expFile[2] || "").toLowerCase();
-    const stitchPacket = exportName.indexOf("dst") !== -1 || exportName.indexOf("exp") !== -1 || exportName.indexOf("pes") !== -1;
-    if (stitchPacket && !digitizeFor(user)) return json(res, 404, { error: "Not found" });
+    if (isStitchExportName(exportName) && forbidDigitize(user, res)) return;
+    if (!canRunFloor(user)) return json(res, 403, { error: "Shop login required" });
+    const stitchPacket = isStitchExportName(exportName);
     const packetExport = /\.(dst|exp|pes)$/.test(exportName) || stitchPacket || exportName.indexOf("stones") !== -1 || exportName.indexOf("packet") !== -1;
     if (packetExport) {
       if (!requirePaidProduce(user, res)) return;
@@ -2835,7 +2903,8 @@ async function handleApi(req, res, url) {
         return json(res, 500, { error: String(err && err.message || err) });
       }
     }
-    const pack = writeExports(job, UPLOADS, path.join(EXPORTS, job.id));
+    const exportJob = digitizeFor(user) ? job : Object.assign({}, job, { _hideMachineFiles: true });
+    const pack = writeExports(exportJob, UPLOADS, path.join(EXPORTS, job.id));
     if (name === "packet.json") return download(res, "decoclub-" + short + "-packet.json", JSON.stringify(pack.packet, null, 2), "application/json");
     if (pack.contents[name]) return download(res, "decoclub-" + short + "-" + name, pack.contents[name], MIME[path.extname(name)] || "application/octet-stream");
     return json(res, 404, { error: "Unknown export" });
@@ -2847,7 +2916,8 @@ async function handleApi(req, res, url) {
     const job = db.jobs.find(function (j) { return j.id === exp[1] && j.shop_id === user.shop_id; });
     if (!job) return json(res, 404, { error: "Job not found" });
     job._shop = db.shops.find(function (s) { return s.id === user.shop_id; });
-    const pack = writeExports(job, UPLOADS, path.join(EXPORTS, job.id));
+    const exportJob = digitizeFor(user) ? job : Object.assign({}, job, { _hideMachineFiles: true });
+    const pack = writeExports(exportJob, UPLOADS, path.join(EXPORTS, job.id));
     res.setHeader("Content-Disposition", 'attachment; filename="decoclub-' + job.id.slice(0, 8) + '-packet.json"');
     return json(res, 200, pack.packet);
   }
@@ -3236,11 +3306,11 @@ function guardVectorUpload(req, base) {
 
 function serveStatic(req, res, url) {
   let rel = decodeURIComponent(url.pathname);
-  if (rel === "/") rel = "/index.html";
-  const digitizeDemo = rel === "/digitize-demo.html";
-  if (digitizeDemo && !digitizeFor(currentUser(req, load()))) return send(res, 404, "Not found");
   // Trailing slash → bare path so /admin/ and /login/ match aliases like /admin and /login.
   if (rel.length > 1 && rel.charAt(rel.length - 1) === "/") rel = rel.slice(0, -1);
+  if (rel === "/" || rel === "") rel = "/index.html";
+  const digitizeAsset = rel === "/digitize-demo.html" || rel === "/digitize-preview.js" || rel === "/digitize-admin.js";
+  if (digitizeAsset && !digitizeFor(currentUser(req, load()))) return send(res, 404, "Not found");
   const ALIAS = { "/login": "/login.html", "/app": "/app.html", "/admin": "/admin.html", "/signup": "/signup.html", "/start": "/start.html" };
   if (ALIAS[rel]) rel = ALIAS[rel];
   if (rel.indexOf("/uploads/") === 0) {
@@ -3261,7 +3331,7 @@ function serveStatic(req, res, url) {
   if (!fs.existsSync(file) || fs.statSync(file).isDirectory()) return send(res, 404, "Not found");
   const ext = path.extname(file).toLowerCase();
   const headers = { "Content-Type": MIME[ext] || "application/octet-stream" };
-  if (digitizeDemo) {
+  if (digitizeAsset) {
     headers["Cache-Control"] = "private, no-store";
     headers["Vary"] = "Cookie";
   } else if (ext === ".html" || ext === ".js" || ext === ".css") {
@@ -3300,7 +3370,8 @@ const server = http.createServer(async function (req, res) {
   try {
     const url = new URL(req.url, "http://localhost");
     if (url.pathname === "/health" || url.pathname === "/api/health") {
-      return json(res, 200, {
+      const healthUser = currentUser(req, load());
+      const health = {
         ok: true,
         name: BUILD.name,
         version: BUILD.version,
@@ -3309,10 +3380,11 @@ const server = http.createServer(async function (req, res) {
         imagine: false,
         vectorizerAi: false,
         vaiTrace: vaiTrace.available(),
-        services: enabledServiceNames(null),
+        services: enabledServiceNames(healthUser),
         pricing: "ppi",
-        digitizeDeps: DIGITIZE_DEPS,
-      });
+      };
+      if (digitizeFor(healthUser)) health.digitizeDeps = DIGITIZE_DEPS;
+      return json(res, 200, health);
     }
     if (url.pathname.indexOf("/api/") === 0) return await handleApi(req, res, url);
     return serveStatic(req, res, url);

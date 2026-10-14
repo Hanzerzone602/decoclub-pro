@@ -210,8 +210,8 @@ async function uploadJob(port, cookie, title) {
     const cfg = await req(port, "GET", "/api/config");
     assert.strictEqual(cfg.status, 200);
     assert.strictEqual(cfg.json.features.membership, false);
-    assert.strictEqual(cfg.json.features.digitize, false);
-    assert.strictEqual(cfg.json.services.digitize, false);
+    assert.ok(!("digitize" in cfg.json.features));
+    assert.ok(!("digitize" in cfg.json.services));
     assert.strictEqual(cfg.json.services.vectorize, true);
     assert.strictEqual(cfg.json.services.halftones, true);
     assert.strictEqual(cfg.json.pricing.vectorize.single.cents, 300);
@@ -432,12 +432,12 @@ async function uploadJob(port, cookie, title) {
       headers: { Cookie: shopCk },
       body: JSON.stringify({ density: 0.4 }),
     });
-    assert.strictEqual(dig.status, 404);
+    assert.strictEqual(dig.status, 403);
     const demo = await req(port, "GET", "/digitize-demo.html");
     assert.strictEqual(demo.status, 404);
     const previewJs = await req(port, "GET", "/digitize-preview.js");
-    assert.strictEqual(previewJs.status, 200);
-    console.log("ok digitize hidden, preview script still served");
+    assert.strictEqual(previewJs.status, 404);
+    console.log("ok digitize hidden, preview script admin-only");
   } catch (err) {
     console.error(s.child.log ? s.child.log() : "");
     throw err;
@@ -452,8 +452,8 @@ async function uploadJob(port, cookie, title) {
     // FEATURE_DIGITIZE=1 is admin-only: anonymous + normal users see the flag-off site
     const cfg2 = await req(port2, "GET", "/api/config");
     assert.strictEqual(cfg2.json.features.membership, true);
-    assert.strictEqual(cfg2.json.features.digitize, false);
-    assert.strictEqual(cfg2.json.services.digitize, false);
+    assert.ok(!("digitize" in cfg2.json.features));
+    assert.ok(!("digitize" in cfg2.json.services));
     assert.ok(/no-store/.test(cfg2.headers["cache-control"] || ""), "config not cacheable");
     const h2 = await req(port2, "GET", "/health");
     assert.ok((h2.json.services || []).indexOf("digitize") === -1);
@@ -462,15 +462,15 @@ async function uploadJob(port, cookie, title) {
     const su = await req(port2, "POST", "/api/signup", { body: JSON.stringify({ name: "Bo", email: "bo@shop.test", password: "secret12" }) });
     const boCk = cookieFrom(su);
     const boCfg = await req(port2, "GET", "/api/config", { headers: { Cookie: boCk } });
-    assert.strictEqual(boCfg.json.features.digitize, false);
-    assert.strictEqual(boCfg.json.services.digitize, false);
+    assert.ok(!("digitize" in boCfg.json.features));
+    assert.ok(!("digitize" in boCfg.json.services));
     assert.ok(!(await req(port2, "GET", "/api/services", { headers: { Cookie: boCk } })).json.services.digitize);
     assert.ok(!((await req(port2, "GET", "/api/me", { headers: { Cookie: boCk } })).json.user.services || {}).digitize);
     assert.strictEqual((await req(port2, "GET", "/digitize-demo.html", { headers: { Cookie: boCk } })).status, 404);
     const boJob = await req(port2, "POST", "/api/jobs", { headers: { Cookie: boCk }, body: JSON.stringify({ title: "B", method: "embroidery", width_in: 2, height_in: 2 }) });
     assert.strictEqual(boJob.status, 200);
-    assert.strictEqual((await req(port2, "POST", "/api/jobs/" + boJob.json.job.id + "/digitize", { headers: { Cookie: boCk }, body: "{}" })).status, 404);
-    assert.strictEqual((await req(port2, "GET", "/api/export/" + boJob.json.job.id + "/design.dst", { headers: { Cookie: boCk } })).status, 404);
+    assert.strictEqual((await req(port2, "POST", "/api/jobs/" + boJob.json.job.id + "/digitize", { headers: { Cookie: boCk }, body: "{}" })).status, 403);
+    assert.strictEqual((await req(port2, "GET", "/api/export/" + boJob.json.job.id + "/design.dst", { headers: { Cookie: boCk } })).status, 403);
     // admin sees Digitize
     const ad = await req(port2, "POST", "/api/login", { body: JSON.stringify({ email: ADMIN_EMAIL, password: ADMIN_PASSWORD }) });
     assert.strictEqual(ad.status, 200, JSON.stringify(ad.json));
@@ -484,6 +484,12 @@ async function uploadJob(port, cookie, title) {
     const adDemo = await req(port2, "GET", "/digitize-demo.html", { headers: { Cookie: adCk } });
     assert.strictEqual(adDemo.status, 200);
     assert.ok(/no-store/.test(adDemo.headers["cache-control"] || ""));
+    const adPreview = await req(port2, "GET", "/digitize-preview.js", { headers: { Cookie: adCk } });
+    assert.strictEqual(adPreview.status, 200);
+    assert.ok(adPreview.text.indexOf("DigitizePreview") !== -1);
+    const adUi = await req(port2, "GET", "/digitize-admin.js", { headers: { Cookie: adCk } });
+    assert.strictEqual(adUi.status, 200);
+    assert.ok(/digitiz/i.test(adUi.text));
     console.log("ok FEATURE_DIGITIZE=1 is admin-only (anon/shop see flag-off site)");
   } finally {
     await stop(s2.child);

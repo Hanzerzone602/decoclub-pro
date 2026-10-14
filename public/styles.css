@@ -437,7 +437,6 @@ th { color: var(--muted); font-weight: 600; font-size: 11px; letter-spacing: .06
 .layer-color-edit input[type=number] { width: 46px; padding: 3px 4px; font-size: 12px; border: 1px solid var(--line); background: #fff; color: var(--ink); border-radius: 4px; }
 .layer-row select.layer-pal { font-size: 11px; padding: 4px 6px; max-width: 150px; }
 
-.digitize-station { align-items: start; }
 .dig-stage { min-width: 0; }
 .dig-canvas { width: 100%; height: min(72vh, 640px); display: block; background: #12161e; border: 1px solid var(--line); }
 .dig-tools label { display: block; font-size: 11px; letter-spacing: .06em; text-transform: uppercase; color: var(--muted); margin: 12px 0 4px; }

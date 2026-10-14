@@ -89,13 +89,11 @@ function stop(child) {
     assert.ok(appJs.text.indexOf("Grok Imagine") === -1);
     assert.ok(appJs.text.indexOf("crossOrigin") === -1);
     assert.ok(appJs.text.indexOf("Vectorize") !== -1);
-    assert.ok(appJs.text.indexOf("DST") !== -1);
-    assert.ok(appJs.text.indexOf("No DST") === -1);
-    assert.ok(appJs.text.indexOf("fillDigitize") !== -1);
-    assert.ok(appJs.text.indexOf("Digitize") !== -1);
+    assert.ok(!/digitiz|embroider/i.test(appJs.text), "customer app.js hides machine tools");
     const previewJs = await req(port, "GET", "/digitize-preview.js");
-    assert.strictEqual(previewJs.status, 200);
-    assert.ok(previewJs.text.indexOf("DigitizePreview") !== -1);
+    assert.strictEqual(previewJs.status, 404);
+    const adminBundleAnon = await req(port, "GET", "/digitize-admin.js");
+    assert.strictEqual(adminBundleAnon.status, 404);
     assert.ok(appJs.text.indexOf('credentials: "include"') !== -1);
     const cfg = await req(port, "GET", "/api/config");
     assert.strictEqual(cfg.json.demo, false);
@@ -105,6 +103,16 @@ function stop(child) {
       body: JSON.stringify({ email: "Davidhanes2@yahoo.com", password: adminPwSeed }),
     });
     assert.strictEqual(adminSeedLogin.status, 200);
+    const adminSeedCookie = String(adminSeedLogin.headers["set-cookie"] || "").split(";")[0];
+    const adminPreview = await req(port, "GET", "/digitize-preview.js", { headers: { Cookie: adminSeedCookie } });
+    assert.strictEqual(adminPreview.status, 200);
+    assert.ok(adminPreview.text.indexOf("DigitizePreview") !== -1);
+    const adminUi = await req(port, "GET", "/digitize-admin.js", { headers: { Cookie: adminSeedCookie } });
+    assert.strictEqual(adminUi.status, 200);
+    assert.ok(adminUi.text.indexOf("DST") !== -1);
+    assert.ok(adminUi.text.indexOf("No DST") === -1);
+    assert.ok(adminUi.text.indexOf("fillDigitize") !== -1);
+    assert.ok(adminUi.text.indexOf("Digitize") !== -1);
     const store = JSON.parse(fs.readFileSync(path.join(s.dir, "store.json"), "utf8"));
     assert.strictEqual(store.users.length, 1);
     assert.strictEqual(store.users[0].role, "admin");
@@ -148,12 +156,12 @@ function stop(child) {
     const pack = await req(port, "GET", "/api/export/" + job.json.job.id + "/cut-contour.svg", { headers: { Cookie: cookie } });
     assert.strictEqual(pack.status, 200, "trial keeps SVG/EPS/cut files");
     const dstTrial = await req(port, "GET", "/api/export/" + job.json.job.id + "/design.dst", { headers: { Cookie: cookie } });
-    assert.strictEqual(dstTrial.status, 404, "trial DST hidden (Digitize is admin-only)");
+    assert.strictEqual(dstTrial.status, 403, "trial DST hidden (Digitize is admin-only)");
     const digTrial = await req(port, "POST", "/api/jobs/" + job.json.job.id + "/digitize", {
       headers: { "Content-Type": "application/json", Cookie: cookie },
       body: JSON.stringify({ density: 0.4 }),
     });
-    assert.strictEqual(digTrial.status, 404, "trial digitize hidden (Digitize is admin-only)");
+    assert.strictEqual(digTrial.status, 403, "trial digitize hidden (Digitize is admin-only)");
     const loginHtml = await req(port, "GET", "/login.html");
     assert.ok(loginHtml.text.indexOf("Remember me") !== -1);
     assert.ok(loginHtml.text.indexOf("remember_me") !== -1);
