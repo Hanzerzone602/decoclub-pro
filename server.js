@@ -19,6 +19,7 @@ function passwordProblem(pw) {
   return null;
 }
 const { writeExports, intakePosterSvg, stripPaperUnderlaySvg } = require("./lib/exports");
+const { parsePreviewQuery, renderPreviewPng, loadSvgText } = require("./lib/previewRender");
 const { writeMockups, BLANKS, searchBlanks, findBlank, blankPublicUrl } = require("./lib/mockup");
 const { loadCatalog, findSku, searchCatalog } = require("./lib/catalog");
 const { generateBadgePng } = require("./lib/demoart");
@@ -1444,6 +1445,30 @@ function presentVector(vec) {
   }
   return copy;
 }
+function jobHasVectorArt(job) {
+  return !!(job && (job.vector_svg || (job.vector && job.vector.layers && job.vector.layers.length)));
+}
+/** Clean vector file (no preview watermark, raw SVG URL allowed).
+ * Admin is always entitled. free_image jobs are previews even if unlocks.vectorize is set.
+ * Paid credit unlocks and included memberships count as entitled. */
+function previewArtEntitled(user, job) {
+  if (user && user.role === "admin") return true;
+  if (!user || !job) return false;
+  if (job.free_image) return false;
+  if (vectorIncluded(user) || halftoneIncluded(user)) return true;
+  const unlocks = job.unlocks || {};
+  return !!(unlocks.vectorize || unlocks.halftones);
+}
+function clientVector(job, req) {
+  const v = presentVector(job && job.vector);
+  if (!v) return v;
+  if (!previewArtEntitled(req && req._dcUser, job)) {
+    const c = Object.assign({}, v);
+    delete c.svg;
+    return c;
+  }
+  return v;
+}
 /** Create a 24h verification token and email the link (fire-and-forget). Returns true if a send was attempted. */
 function issueVerification(u, req) {
   if (!mailer.configured()) return false;
@@ -1469,6 +1494,22 @@ function presentJob(job, req) {
   copy.free_image = !!job.free_image;
   // Keep settings + engine (QA); strip recipe/pipeline via presentVzMeta.
   if (copy.vector) copy.vector = presentVector(copy.vector);
+  const showSvg = previewArtEntitled(req && req._dcUser, job);
+  copy.has_vector = jobHasVectorArt(job);
+  if (job.vector_svg) copy.vector_preview = "/api/jobs/" + job.id + "/preview.png";
+  // Unpaid / free-image jobs must not carry a fetchable SVG (or the inline markup).
+  if (!showSvg) {
+    delete copy.vector_svg;
+    delete copy.vector_eps;
+    if (copy.vector && typeof copy.vector === "object") {
+      copy.vector = Object.assign({}, copy.vector);
+      delete copy.vector.svg;
+    }
+    if (copy.halftone && typeof copy.halftone === "object") {
+      copy.halftone = Object.assign({}, copy.halftone);
+      delete copy.halftone.svg;
+    }
+  }
   return copy;
 }
 function event(db, job, message) {
@@ -1513,6 +1554,7 @@ function download(res, filename, body, type) {
 async function handleApi(req, res, url) {
   const db = load();
   const user = currentUser(req, db);
+  req._dcUser = user || null;
   const method = req.method;
   const pth = url.pathname;
   // Device cookie is issued on GETs (app boot calls /api/me and /api/config) so it exists before any free claim.
@@ -1790,6 +1832,43 @@ async function handleApi(req, res, url) {
     return json(res, 200, { job: presentJob(job, req) });
   }
 
+  // Sharp vector preview. x,y,w,h are normalized fractions of the SVG viewBox
+  // (0..1, top-left origin), not raw user units. See lib/previewRender.js.
+  const previewPng = pth.match(/^\/api\/jobs\/([^/]+)\/preview\.png$/);
+  if (previewPng && method === "GET") {
+    if (!user) return json(res, 401, { error: "Sign in required" });
+    const job = db.jobs.find(function (j) { return j.id === previewPng[1]; });
+    if (!job) return json(res, 404, { error: "Job not found" });
+    if (!canSeeJob(user, job)) return json(res, 403, { error: "Forbidden" });
+    if (!job.vector_svg) return json(res, 404, { error: "Vector art not found" });
+    const abs = path.join(UPLOADS, path.basename(String(job.vector_svg)));
+    if (!fs.existsSync(abs)) return json(res, 404, { error: "Vector art not found" });
+    const q = parsePreviewQuery(url.searchParams);
+    if (!q.ok) return json(res, 400, { error: q.error || "Bad preview query" });
+    let png;
+    try {
+      const svgText = loadSvgText(abs);
+      png = renderPreviewPng(svgText, {
+        x: q.x,
+        y: q.y,
+        w: q.w,
+        h: q.h,
+        pw: q.pw,
+        ph: q.ph,
+        mode: q.mode,
+        watermark: !previewArtEntitled(user, job),
+      });
+    } catch (err) {
+      console.error("preview.png", err && err.message);
+      return json(res, 500, { error: "Preview render failed" });
+    }
+    return send(res, 200, png, {
+      "Content-Type": "image/png",
+      "Cache-Control": "private, max-age=30",
+      "Vary": "Cookie",
+    });
+  }
+
   const jobGet = pth.match(/^\/api\/jobs\/([^/]+)$/);
   if (jobGet && method === "GET") {
     if (!user) return json(res, 401, { error: "Sign in required" });
@@ -2030,9 +2109,10 @@ async function handleApi(req, res, url) {
       else if (creditUse.included) htNote = " · admin";
       event(db, job, "Halftone · " + packed.meta.styleName + " · " + packed.meta.elements + " marks" + htNote);
       save(db);
+      const presented = presentJob(job, req);
       return json(res, 200, {
-        job: presentJob(job, req),
-        halftone: job.halftone,
+        job: presented,
+        halftone: presented.halftone || null,
         meta: packed.meta,
         user: publicUser(user),
         halftoneCredits: halftoneCreditBalance(user),
@@ -2222,7 +2302,7 @@ async function handleApi(req, res, url) {
       if (body.apply_mockup !== false) applyMockup(job);
       event(db, job, "Art imported · " + (result.meta.paths || 0) + " paths");
       save(db);
-      return json(res, 200, { job: presentJob(job, req), vector: presentVector(job.vector), meta: presentVzMeta(result.meta) });
+      return json(res, 200, { job: presentJob(job, req), vector: clientVector(job, req), meta: presentVzMeta(result.meta) });
     } catch (err) {
       return json(res, 400, { error: IS_PROD ? "Could not import Corel SVG" : err.message });
     }
@@ -2249,7 +2329,7 @@ async function handleApi(req, res, url) {
       save(db);
       const payload = {
         job: presentJob(job, req),
-        vector: presentVector(job.vector),
+        vector: clientVector(job, req),
         vectorCredits: vectorCreditBalance(user),
         creditConsumed: !!creditUse.consumed,
         user: publicUser(user),
@@ -2276,7 +2356,7 @@ async function handleApi(req, res, url) {
         if (body.apply_mockup) applyMockup(job);
         event(db, job, "Art imported · " + (job.vector.layers || []).length + " layers");
         save(db);
-        return json(res, 200, { job: presentJob(job, req), vector: presentVector(job.vector), meta: presentVzMeta(result.meta) });
+        return json(res, 200, { job: presentJob(job, req), vector: clientVector(job, req), meta: presentVzMeta(result.meta) });
       } catch (err) {
         return json(res, 400, { error: IS_PROD ? "Could not import Corel SVG" : err.message });
       }
@@ -2517,7 +2597,7 @@ async function handleApi(req, res, url) {
       rewriteVectorSvg(job);
     }
     event(db, job, "Recolor layer " + idx); save(db);
-    return json(res, 200, { job: presentJob(job, req), vector: presentVector(job.vector) });
+    return json(res, 200, { job: presentJob(job, req), vector: clientVector(job, req) });
   }
   const stnPath = pth.match(/^\/api\/jobs\/([^/]+)\/stones$/);
   if (stnPath && method === "POST") {
@@ -3043,6 +3123,26 @@ async function handleApi(req, res, url) {
   return json(res, 404, { error: "Not found" });
 }
 
+/** Block raw production SVGs for viewers who have not paid. Admins are exempt.
+ * Returns 0 to allow, otherwise an HTTP status. */
+function guardVectorUpload(req, base) {
+  if (path.extname(base).toLowerCase() !== ".svg") return 0;
+  const generated = /-(?:vector|halftone|corel|vtracer)\.svg$/i.test(base);
+  const db = load();
+  const viewer = currentUser(req, db);
+  let job = null;
+  const jobs = db.jobs || [];
+  for (let i = 0; i < jobs.length; i++) {
+    const j = jobs[i];
+    if (j && j.vector_svg && path.basename(String(j.vector_svg)) === base) { job = j; break; }
+  }
+  if (!job && !generated) return 0;
+  if (viewer && viewer.role === "admin") return 0;
+  if (!viewer) return 401;
+  if (!job || !canSeeJob(viewer, job) || !previewArtEntitled(viewer, job)) return 403;
+  return 0;
+}
+
 function serveStatic(req, res, url) {
   let rel = decodeURIComponent(url.pathname);
   if (rel === "/") rel = "/index.html";
@@ -3055,6 +3155,13 @@ function serveStatic(req, res, url) {
   if (rel.indexOf("/uploads/") === 0) {
     const file = path.join(UPLOADS, path.basename(rel));
     if (!fs.existsSync(file)) return send(res, 404, "Not found");
+    const blocked = guardVectorUpload(req, path.basename(file));
+    if (blocked) {
+      return send(res, blocked, blocked === 401 ? "Sign in required" : "Forbidden", {
+        "Content-Type": "text/plain; charset=utf-8",
+        "Cache-Control": "private, no-store",
+      });
+    }
     const ext = path.extname(file).toLowerCase();
     return send(res, 200, fs.readFileSync(file), { "Content-Type": MIME[ext] || "application/octet-stream", "Cache-Control": "private, no-store" });
   }

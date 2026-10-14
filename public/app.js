@@ -196,6 +196,13 @@ function canFloor() {
   return !!(user && (user.role === "shop" || (user.role === "admin" && user.shopId)));
 }
 function entitled() { return !!(user && user.entitled); }
+function jobHasVector(job) {
+  if (!job) return false;
+  if (job.vector_svg || job.vector_preview || job.has_vector) return true;
+  return !!(job.vector && job.vector.layers && job.vector.layers.length);
+}
+let artPreviewObjectUrl = null;
+let artZoomGen = 0;
 function paywallNote() {
   if (entitled()) return "";
   return '<p class="notice" id="paywall">Some exports need a member account. Trial and member logins unlock the full art studio.</p>';
@@ -793,10 +800,13 @@ async function fillArt(el, job, shopControls) {
   const initSmooth = toPct(lastSet.smoothing != null ? lastSet.smoothing : loadVzPref("smoothing", "50"), SMOOTH_LEGACY, 50);
   const initCorner = toPct(lastSet.cornerSmooth != null ? lastSet.cornerSmooth : loadVzPref("corner", "50"), CORNER_LEGACY, 50);
   const initColorMode = loadVzPref("colorMode", "rgb");
-  const hasArt = !!(job.vector_svg || job.file_path);
-  const preview = job.vector_svg
-    ? `<div id="artZoomSvg" class="art-svg-host" data-src="${escapeHtml(job.vector_svg)}"></div>`
-    : (job.file_path ? `<img id="artZoomImg" src="${job.file_path}" alt="Art" draggable="false" />` : `<div class="drop-hint"><strong>Drop art here</strong><span>PNG, JPG, or WebP</span></div>`);
+  const vectorSrc = job.vector_preview || (job.vector_svg ? ("/api/jobs/" + job.id + "/preview.png") : "");
+  const hasArt = !!(vectorSrc || job.file_path);
+  let previewOutline = false;
+  try { previewOutline = localStorage.getItem("dcPreviewMode") === "outline"; } catch (e) { /* ignore */ }
+  const preview = vectorSrc
+    ? `<img id="artZoomImg" class="art-svg-host" alt="Vector preview" draggable="false" />`
+    : (job.file_path ? `<img id="artZoomImg" class="art-svg-host" src="${escapeHtml(job.file_path)}" alt="Art" draggable="false" />` : `<div class="drop-hint"><strong>Drop art here</strong><span>PNG, JPG, or WebP</span></div>`);
   function layerRgb(L) {
     if (L.rgb) return L.rgb;
     const h = String(L.hex || "#111111").replace("#", "");
@@ -884,7 +894,7 @@ async function fillArt(el, job, shopControls) {
   };
   const railBtn = (key, label) => `<button type="button" class="rail-btn" data-rail="${key}" title="${escapeHtml(label)}"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" aria-hidden="true">${RAIL_ICO[key]}</svg><span>${escapeHtml(label)}</span></button>`;
   const exportPanel = `
-        ${shopControls && (layers.length || job.vector_svg) ? `<div class="export-grid export-hero art-dl">
+        ${shopControls && (layers.length || jobHasVector(job)) ? `<div class="export-grid export-hero art-dl">
           <a href="/api/export/${job.id}/art.svg">Download SVG</a>
           <a href="/api/export/${job.id}/art.eps">Download EPS</a>
           <a href="/api/export/${job.id}/art.pdf">Download PDF</a>
@@ -897,11 +907,11 @@ async function fillArt(el, job, shopControls) {
           <a href="/api/export/${job.id}/art-underbase.png" title="White underbase only, choked 0.35 px">White underbase</a>
         </div>
         <p class="muted">Vector: SVG / EPS / PDF / DXF (laser + cutter) · Raster: 300 DPI at true print size, transparent · DTF white choked in, none under soft edges</p>` : ""}
-        ${shopControls && job.file_path && !job.vector_svg ? `<div class="export-grid export-hero art-dl">
+        ${shopControls && job.file_path && !vectorSrc ? `<div class="export-grid export-hero art-dl">
           <a href="/api/export/${job.id}/art.png" id="dlArtPng">Download PNG</a>
         </div>
         <p class="muted">Raster art · PNG</p>` : ""}
-        ${shopControls && canDigitize() && (layers.length || job.vector_svg) ? `<div class="export-grid art-dl art-dl-stitch">
+        ${shopControls && canDigitize() && (layers.length || jobHasVector(job)) ? `<div class="export-grid art-dl art-dl-stitch">
           <a href="/api/export/${job.id}/design.dst">DST</a>
           <a href="/api/export/${job.id}/design.exp">EXP</a>
           <a href="/api/export/${job.id}/design.pes">PES</a>
@@ -1006,6 +1016,7 @@ async function fillArt(el, job, shopControls) {
             <button type="button" class="zoom-btn" id="zoomIn" title="Zoom in">+</button>
             <span class="zoom-readout" id="zoomRead">100%</span>
             <button type="button" class="zoom-btn" id="bgToggle" title="Switch preview background (light / dark) so every ink stands out">Light bg</button>
+            ${vectorSrc ? `<button type="button" class="zoom-btn" id="outlineToggle" aria-pressed="${previewOutline ? "true" : "false"}" title="Outline preview — strokes only">Outline</button>` : ""}
           </div>` : ""}
           ${shopControls ? `<button type="button" class="btn small ct-export" id="ctExport">Export</button>` : ""}
         </div>
@@ -1018,7 +1029,7 @@ async function fillArt(el, job, shopControls) {
             <div class="ht-preview-frame" id="htPreviewFrame" hidden aria-live="polite"></div>
           </div>
         </div>
-        ${hasArt ? `<p class="muted canvas-hint">Scroll to zoom · drag to pan · drop new art to replace</p>` : ""}
+        ${hasArt ? `<p class="muted canvas-hint">Scroll to zoom · drag to pan · pinch to zoom · drop new art to replace</p>` : ""}
         <input id="artFile" type="file" accept="image/*,.svg,.pdf" hidden />
       </section>
       <aside class="studio-right">
@@ -1178,42 +1189,7 @@ async function fillArt(el, job, shopControls) {
     const f = e.dataTransfer && e.dataTransfer.files && e.dataTransfer.files[0];
     if (f) uploadArtwork(f);
   };
-  if (hasArt) {
-    const host = $("#artZoomSvg");
-    if (host && host.dataset.src) {
-      fetch(host.dataset.src, { credentials: "include" }).then((r) => r.text()).then((svg) => {
-        host.innerHTML = svg;
-        // Show exactly what downloads: no paper plate, so white ink vs. empty reads on the checkerboard.
-        host.querySelectorAll('[data-name="paper-underlay"]').forEach((n) => n.remove());
-        const elSvg = host.querySelector("svg");
-        if (elSvg) {
-          elSvg.removeAttribute("width");
-          elSvg.removeAttribute("height");
-          elSvg.setAttribute("preserveAspectRatio", "xMidYMid meet");
-          elSvg.style.width = "100%";
-          elSvg.style.height = "auto";
-        }
-        bindArtZoom(drop);
-        const bgBtn = $("#bgToggle");
-        if (bgBtn) {
-          const applyBg = (dark) => {
-            host.classList.toggle("bg-dark", dark);
-            bgBtn.textContent = dark ? "Light bg" : "Dark bg";
-            try { localStorage.setItem("dcPreviewBg", dark ? "dark" : "light"); } catch (e) { /* ignore */ }
-          };
-          let dark = true;
-          try { dark = localStorage.getItem("dcPreviewBg") !== "light"; } catch (e) { /* ignore */ }
-          applyBg(dark);
-          bgBtn.onclick = () => applyBg(!host.classList.contains("bg-dark"));
-        }
-      }).catch(() => {
-        host.outerHTML = '<img id="artZoomImg" src="' + host.dataset.src + '" alt="Vector" draggable="false" />';
-        bindArtZoom(drop);
-      });
-    } else {
-      bindArtZoom(drop);
-    }
-  }
+  if (hasArt) bindArtZoom(drop, { jobId: job.id, vector: !!vectorSrc });
   $("#rmbgBtn").onclick = async () => {
     const btn = $("#rmbgBtn");
     const errEl = $("#err");
@@ -1257,7 +1233,7 @@ async function fillArt(el, job, shopControls) {
     try {
       invertBtn.disabled = true;
       invertBtn.textContent = "Inverting…";
-      const hasVec = !!(job.vector_svg || (job.vector && job.vector.layers && job.vector.layers.length));
+      const hasVec = jobHasVector(job);
       if (!hasVec) await ensurePngArtwork(job);
       const data = await api("/api/jobs/" + job.id + "/artops", {
         method: "POST",
@@ -1437,7 +1413,7 @@ async function fillArt(el, job, shopControls) {
     const frame = $("#htPreviewFrame");
     const drop = $("#artDrop");
     const hint = $("#htHint");
-    if (!job.file_path && !job.vector_svg) {
+    if (!job.file_path && !jobHasVector(job)) {
       if (hint) hint.textContent = "Drop art first, then preview styles.";
       return;
     }
@@ -1451,7 +1427,7 @@ async function fillArt(el, job, shopControls) {
   function scheduleHtPreview() {
     if (!htPanelWantOpen) return;
     if (!$("#htPanel") || $("#htPanel").hidden) return;
-    if (!job.file_path && !job.vector_svg) {
+    if (!job.file_path && !jobHasVector(job)) {
       const hint = $("#htHint");
       if (hint) hint.textContent = "Drop art first, then preview styles.";
       return;
@@ -1838,47 +1814,330 @@ async function fillArt(el, job, shopControls) {
   });
 }
 
-function bindArtZoom(stage) {
+function bindArtZoom(stage, opts) {
+  opts = opts || {};
   const inner = $("#artZoomInner", stage) || $("#artZoomInner");
-  if (!inner) return;
-  let scale = 1, x = 0, y = 0, drag = null;
-  function apply() {
-    inner.style.transform = "translate(" + x + "px, " + y + "px) scale(" + scale + ")";
-    const r = $("#zoomRead");
-    if (r) r.textContent = Math.round(scale * 100) + "%";
+  const img = $("#artZoomImg", stage) || $("#artZoomImg");
+  if (!inner || !stage) return;
+  const vectorMode = !!(opts.vector && opts.jobId);
+  const zoomGen = ++artZoomGen;
+  // tile = normalized viewBox fraction currently in the bitmap. disp = its CSS box before transform.
+  let svgAspect = 1;
+  let tile = { x: 0, y: 0, w: 1, h: 1 };
+  let disp = { x: 0, y: 0, w: 10, h: 10 };
+  let s = 1, tx = 0, ty = 0;
+  let mode = "fill";
+  try { mode = localStorage.getItem("dcPreviewMode") === "outline" ? "outline" : "fill"; } catch (e) { /* ignore */ }
+  let reqSeq = 0;
+  let sharpTimer = 0;
+  let aspectKnown = false;
+  if (stage._dcZoomAbort) stage._dcZoomAbort.abort();
+  const zoomAbort = new AbortController();
+  stage._dcZoomAbort = zoomAbort;
+  const pointers = new Map();
+  let pan = null;
+  let pinch = null;
+  const read = $("#zoomRead");
+
+  function stageSize() {
+    const r = stage.getBoundingClientRect();
+    return {
+      w: Math.max(32, r.width || stage.clientWidth || 320),
+      h: Math.max(32, r.height || stage.clientHeight || 320),
+    };
   }
-  function zoomTo(next, cx, cy) {
-    const old = scale;
-    scale = Math.max(0.25, Math.min(8, next));
+  function fitBox(stW, stH, aspect) {
+    const a = aspect > 0 ? aspect : 1;
+    let w = stW;
+    let h = stW / a;
+    if (h > stH) { h = stH; w = stH * a; }
+    return { x: (stW - w) / 2, y: (stH - h) / 2, w: w, h: h };
+  }
+  function trueZoom() {
+    const st = stageSize();
+    const box = fitBox(st.w, st.h, svgAspect || 1);
+    if (!box.w || !tile.w) return 1;
+    return ((disp.w / tile.w) * s) / box.w;
+  }
+  function apply() {
+    inner.style.transform = "translate(" + tx + "px, " + ty + "px) scale(" + s + ")";
+    if (img) {
+      img.style.left = disp.x + "px";
+      img.style.top = disp.y + "px";
+      img.style.width = Math.max(1, disp.w) + "px";
+      img.style.height = Math.max(1, disp.h) + "px";
+    }
+    if (read) {
+      const pct = Math.round(trueZoom() * 100);
+      read.textContent = (pct < 10 ? 10 : pct > 1600 ? 1600 : pct) + "%";
+    }
+  }
+  function setPreviewSrc(url) {
+    if (!img) return;
+    const prev = artPreviewObjectUrl;
+    artPreviewObjectUrl = url;
+    img.src = url;
+    if (prev && prev !== url) URL.revokeObjectURL(prev);
+  }
+  function scheduleSharp() {
+    if (!vectorMode) return;
+    clearTimeout(sharpTimer);
+    sharpTimer = setTimeout(requestSharp, 150);
+  }
+  function zoomAt(next, cx, cy) {
+    const cur = trueZoom() || 1;
+    const target = Math.max(0.1, Math.min(16, next));
+    const factor = target / cur;
+    if (Math.abs(factor - 1) < 1e-4) {
+      apply();
+      scheduleSharp();
+      return;
+    }
+    const old = s || 1;
+    s = s * factor;
     if (cx != null) {
-      x = cx - ((cx - x) * (scale / old));
-      y = cy - ((cy - y) * (scale / old));
+      tx = cx - (cx - tx) * (s / old);
+      ty = cy - (cy - ty) * (s / old);
     }
     apply();
+    scheduleSharp();
   }
+  function stageToSvg(sx, sy) {
+    const u = ((sx - tx) / (s || 1) - disp.x) / (disp.w || 1);
+    const v = ((sy - ty) / (s || 1) - disp.y) / (disp.h || 1);
+    return { x: tile.x + u * tile.w, y: tile.y + v * tile.h };
+  }
+  function visibleSvgRect() {
+    const st = stageSize();
+    const corners = [stageToSvg(0, 0), stageToSvg(st.w, 0), stageToSvg(0, st.h), stageToSvg(st.w, st.h)];
+    let x0 = corners[0].x, y0 = corners[0].y, x1 = corners[0].x, y1 = corners[0].y;
+    corners.forEach((c) => {
+      if (c.x < x0) x0 = c.x;
+      if (c.y < y0) y0 = c.y;
+      if (c.x > x1) x1 = c.x;
+      if (c.y > y1) y1 = c.y;
+    });
+    const ix0 = Math.max(0, Math.min(1, x0));
+    const iy0 = Math.max(0, Math.min(1, y0));
+    const ix1 = Math.max(0, Math.min(1, x1));
+    const iy1 = Math.max(0, Math.min(1, y1));
+    if (ix1 - ix0 < 1e-4 || iy1 - iy0 < 1e-4) return null;
+    return { x: ix0, y: iy0, w: ix1 - ix0, h: iy1 - iy0 };
+  }
+  function screenRectOfSvg(rx, ry, rw, rh) {
+    const u0 = (rx - tile.x) / (tile.w || 1);
+    const v0 = (ry - tile.y) / (tile.h || 1);
+    const u1 = (rx + rw - tile.x) / (tile.w || 1);
+    const v1 = (ry + rh - tile.y) / (tile.h || 1);
+    return {
+      x: tx + s * (disp.x + u0 * disp.w),
+      y: ty + s * (disp.y + v0 * disp.h),
+      w: s * (u1 - u0) * disp.w,
+      h: s * (v1 - v0) * disp.h,
+    };
+  }
+  // Match server clampWindow so the bitmap we swap in is the region rsvg cropped.
+  function clampWin(rect) {
+    const MIN_WIN = 1 / 16;
+    let x = rect.x, y = rect.y, w = rect.w, h = rect.h;
+    w = Math.min(1, Math.max(MIN_WIN, w));
+    h = Math.min(1, Math.max(MIN_WIN, h));
+    if (x < 0) x = 0;
+    if (y < 0) y = 0;
+    if (x + w > 1) x = Math.max(0, 1 - w);
+    if (y + h > 1) y = Math.max(0, 1 - h);
+    return { x: x, y: y, w: w, h: h };
+  }
+  function requestSharp() {
+    if (!vectorMode || zoomGen !== artZoomGen) return;
+    // First tile omits pw/ph so the PNG keeps the SVG aspect (rsvg stretches to pw×ph).
+    const learn = !aspectKnown;
+    let win;
+    if (learn) win = { x: 0, y: 0, w: 1, h: 1 };
+    else {
+      const vis = visibleSvgRect();
+      if (!vis) return;
+      win = clampWin(vis);
+    }
+    const screen = screenRectOfSvg(win.x, win.y, win.w, win.h);
+    if (!learn && (!(screen.w >= 2) || !(screen.h >= 2))) return;
+    const seq = ++reqSeq;
+    const dpr = Math.max(1, Math.min(3, window.devicePixelRatio || 1));
+    const q = new URLSearchParams();
+    q.set("x", win.x.toFixed(5));
+    q.set("y", win.y.toFixed(5));
+    q.set("w", win.w.toFixed(5));
+    q.set("h", win.h.toFixed(5));
+    q.set("zoom", String(Math.round((trueZoom() || 1) * 1000) / 1000));
+    q.set("mode", mode === "outline" ? "outline" : "fill");
+    if (!learn) {
+      q.set("pw", String(Math.min(2048, Math.max(8, Math.round(screen.w * dpr)))));
+      q.set("ph", String(Math.min(2048, Math.max(8, Math.round(screen.h * dpr)))));
+    }
+    const url = "/api/jobs/" + encodeURIComponent(opts.jobId) + "/preview.png?" + q.toString();
+    fetch(url, { credentials: "include" }).then((res) => {
+      if (!res.ok) throw new Error("preview " + res.status);
+      return res.blob();
+    }).then((blob) => {
+      if (seq !== reqSeq || zoomGen !== artZoomGen) return;
+      const obj = URL.createObjectURL(blob);
+      const pre = new Image();
+      pre.onload = () => {
+        if (seq !== reqSeq || zoomGen !== artZoomGen) { URL.revokeObjectURL(obj); return; }
+        if (learn && pre.naturalWidth && pre.naturalHeight) {
+          svgAspect = pre.naturalWidth / pre.naturalHeight;
+          aspectKnown = true;
+          const st = stageSize();
+          const box = fitBox(st.w, st.h, svgAspect);
+          tile = { x: 0, y: 0, w: 1, h: 1 };
+          disp = box;
+          s = 1; tx = 0; ty = 0;
+          setPreviewSrc(obj);
+          apply();
+          scheduleSharp();
+          return;
+        }
+        const place = screenRectOfSvg(win.x, win.y, win.w, win.h);
+        tile = { x: win.x, y: win.y, w: win.w, h: win.h };
+        disp = { x: place.x, y: place.y, w: Math.max(1, place.w), h: Math.max(1, place.h) };
+        s = 1; tx = 0; ty = 0;
+        setPreviewSrc(obj);
+        apply();
+      };
+      pre.onerror = () => { URL.revokeObjectURL(obj); };
+      pre.src = obj;
+    }).catch(() => {});
+  }
+  function doFit() {
+    const st = stageSize();
+    const box = fitBox(st.w, st.h, svgAspect || 1);
+    disp = {
+      x: box.x + tile.x * box.w,
+      y: box.y + tile.y * box.h,
+      w: Math.max(1, tile.w * box.w),
+      h: Math.max(1, tile.h * box.h),
+    };
+    s = 1; tx = 0; ty = 0;
+    apply();
+    if (vectorMode) requestSharp();
+  }
+  function layoutRaster() {
+    if (!img || !img.naturalWidth) return;
+    svgAspect = img.naturalWidth / img.naturalHeight;
+    const st = stageSize();
+    tile = { x: 0, y: 0, w: 1, h: 1 };
+    disp = fitBox(st.w, st.h, svgAspect);
+    s = 1; tx = 0; ty = 0;
+    apply();
+  }
+
   const zin = $("#zoomIn"), zout = $("#zoomOut"), zfit = $("#zoomFit");
-  if (zin) zin.onclick = (e) => { e.stopPropagation(); zoomTo(scale * 1.25); };
-  if (zout) zout.onclick = (e) => { e.stopPropagation(); zoomTo(scale / 1.25); };
-  if (zfit) zfit.onclick = (e) => { e.stopPropagation(); scale = 1; x = 0; y = 0; apply(); };
+  if (zin) zin.onclick = (e) => { e.stopPropagation(); const st = stageSize(); zoomAt(trueZoom() * 1.25, st.w / 2, st.h / 2); };
+  if (zout) zout.onclick = (e) => { e.stopPropagation(); const st = stageSize(); zoomAt(trueZoom() / 1.25, st.w / 2, st.h / 2); };
+  if (zfit) zfit.onclick = (e) => { e.stopPropagation(); doFit(); };
+  const outlineBtn = $("#outlineToggle");
+  if (outlineBtn) {
+    outlineBtn.setAttribute("aria-pressed", mode === "outline" ? "true" : "false");
+    outlineBtn.onclick = (e) => {
+      e.stopPropagation();
+      mode = mode === "outline" ? "fill" : "outline";
+      try { localStorage.setItem("dcPreviewMode", mode); } catch (err) { /* ignore */ }
+      outlineBtn.setAttribute("aria-pressed", mode === "outline" ? "true" : "false");
+      if (vectorMode) requestSharp();
+    };
+  }
+  const bgBtn = $("#bgToggle");
+  if (bgBtn) {
+    const applyBg = (dark) => {
+      stage.classList.toggle("bg-dark", !!dark);
+      if (img) img.classList.toggle("bg-dark", !!dark);
+      bgBtn.textContent = dark ? "Light bg" : "Dark bg";
+      try { localStorage.setItem("dcPreviewBg", dark ? "dark" : "light"); } catch (e) { /* ignore */ }
+    };
+    let dark = true;
+    try { dark = localStorage.getItem("dcPreviewBg") !== "light"; } catch (e) { /* ignore */ }
+    applyBg(dark);
+    bgBtn.onclick = (e) => { e.stopPropagation(); applyBg(!stage.classList.contains("bg-dark")); };
+  }
+
   stage.addEventListener("wheel", (e) => {
+    if (e.target && e.target.closest && e.target.closest("a, button, input, textarea, select")) return;
     e.preventDefault();
     const rect = stage.getBoundingClientRect();
-    zoomTo(scale * (e.deltaY < 0 ? 1.12 : 1 / 1.12), e.clientX - rect.left, e.clientY - rect.top);
-  }, { passive: false });
+    zoomAt(trueZoom() * (e.deltaY < 0 ? 1.12 : 1 / 1.12), e.clientX - rect.left, e.clientY - rect.top);
+  }, { passive: false, signal: zoomAbort.signal });
   stage.addEventListener("pointerdown", (e) => {
-    if (e.button !== 0) return;
-    drag = { x: e.clientX - x, y: e.clientY - y };
-    stage.classList.add("panning");
-    stage.setPointerCapture(e.pointerId);
-  });
+    if (e.pointerType === "mouse" && e.button !== 0) return;
+    if (e.target && e.target.closest && e.target.closest("a, button, input, textarea, select, label")) return;
+    if (e.pointerType !== "mouse") e.preventDefault();
+    try { stage.setPointerCapture(e.pointerId); } catch (err) { /* ignore */ }
+    pointers.set(e.pointerId, { x: e.clientX, y: e.clientY });
+    if (pointers.size === 1) {
+      pan = { id: e.pointerId, ox: e.clientX, oy: e.clientY, tx: tx, ty: ty };
+      pinch = null;
+      stage.classList.add("panning");
+    } else {
+      pan = null;
+      stage.classList.remove("panning");
+      const pts = Array.from(pointers.values());
+      const rect = stage.getBoundingClientRect();
+      pinch = {
+        dist: Math.hypot(pts[0].x - pts[1].x, pts[0].y - pts[1].y) || 1,
+        zoom: trueZoom() || 1,
+        cx: (pts[0].x + pts[1].x) / 2 - rect.left,
+        cy: (pts[0].y + pts[1].y) / 2 - rect.top,
+      };
+    }
+  }, { signal: zoomAbort.signal });
   stage.addEventListener("pointermove", (e) => {
-    if (!drag) return;
-    x = e.clientX - drag.x;
-    y = e.clientY - drag.y;
+    if (!pointers.has(e.pointerId)) return;
+    pointers.set(e.pointerId, { x: e.clientX, y: e.clientY });
+    if (pointers.size >= 2) {
+      const pts = Array.from(pointers.values());
+      const rect = stage.getBoundingClientRect();
+      const cx = (pts[0].x + pts[1].x) / 2 - rect.left;
+      const cy = (pts[0].y + pts[1].y) / 2 - rect.top;
+      const dist = Math.hypot(pts[0].x - pts[1].x, pts[0].y - pts[1].y) || 1;
+      if (!pinch) {
+        pinch = { dist: dist, zoom: trueZoom() || 1, cx: cx, cy: cy };
+        pan = null;
+        return;
+      }
+      tx += cx - pinch.cx;
+      ty += cy - pinch.cy;
+      pinch.cx = cx;
+      pinch.cy = cy;
+      zoomAt(pinch.zoom * (dist / pinch.dist), cx, cy);
+      return;
+    }
+    if (!pan || e.pointerId !== pan.id) return;
+    tx = pan.tx + (e.clientX - pan.ox);
+    ty = pan.ty + (e.clientY - pan.oy);
     apply();
-  });
-  stage.addEventListener("pointerup", () => { drag = null; stage.classList.remove("panning"); });
+    scheduleSharp();
+  }, { signal: zoomAbort.signal });
+  function endPointer(e) {
+    pointers.delete(e.pointerId);
+    if (pointers.size < 2) pinch = null;
+    if (pan && e.pointerId === pan.id) {
+      pan = null;
+      stage.classList.remove("panning");
+    }
+    if (pointers.size === 1) {
+      const entry = Array.from(pointers.entries())[0];
+      pan = { id: entry[0], ox: entry[1].x, oy: entry[1].y, tx: tx, ty: ty };
+    }
+    scheduleSharp();
+  }
+  stage.addEventListener("pointerup", endPointer, { signal: zoomAbort.signal });
+  stage.addEventListener("pointercancel", endPointer, { signal: zoomAbort.signal });
+
+  const st0 = stageSize();
+  disp = fitBox(st0.w, st0.h, svgAspect);
   apply();
+  if (vectorMode) requestSharp();
+  else if (img && img.complete && img.naturalWidth) layoutRaster();
+  else if (img) img.addEventListener("load", layoutRaster, { once: true, signal: zoomAbort.signal });
 }
 
 function fillMockup(el, job, shopControls) {
