@@ -166,13 +166,17 @@ async function renderUsers() {
     </div>
     <p class="muted">Grant / revoke plans, set Halftone credits, set role, assign shop, reset temp password, disable, or delete non-admins. Password hashes are never shown.</p>
     <table>
-      <thead><tr><th>Name</th><th>Email</th><th>Role</th><th>Shop</th><th>Plan</th><th>HT credits</th><th>Expires</th><th>Status</th><th>Actions</th></tr></thead>
+      <thead><tr><th>Name</th><th>Email</th><th>Role</th><th>Shop</th><th>Plan</th><th>Signed up</th><th>Free image</th><th>Images</th><th>Vec credits</th><th>HT credits</th><th>Expires</th><th>Status</th><th>Actions</th></tr></thead>
       <tbody>${users.map((u) => `<tr>
         <td>${escapeHtml(u.name)}</td>
         <td>${escapeHtml(u.email)}</td>
         <td>${escapeHtml(u.role)}</td>
         <td>${escapeHtml(u.shop_name || "—")}</td>
         <td>${escapeHtml(u.plan || "—")}${u.halftone_included ? ' <span class="pill ok">HT∞</span>' : ""}</td>
+        <td class="mono">${u.created_at ? fmtDay(u.created_at) : "—"}</td>
+        <td>${u.role === "admin" ? "—" : (u.free_image_used ? '<span class="pill">used' + (u.free_image_service ? " · " + escapeHtml(u.free_image_service) : "") + '</span>' : '<span class="pill ok">available</span>')}</td>
+        <td class="mono">${u.images_processed || 0}</td>
+        <td class="mono">${u.vector_included ? "∞" : (u.vector_credits || 0)}</td>
         <td class="mono">${u.halftone_included ? "∞" : (u.halftone_credits != null ? u.halftone_credits : 0)}</td>
         <td class="mono">${u.plan_expires ? fmtDay(u.plan_expires) : "—"}</td>
         <td>${u.disabled ? '<span class="pill warn">disabled</span>' : '<span class="pill ok">active</span>'}</td>

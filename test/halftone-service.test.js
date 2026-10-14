@@ -157,8 +157,16 @@ function stop(child) {
     assert.ok(me0.json.user);
     assert.strictEqual(me0.json.user.halftoneIncluded, false);
     assert.strictEqual(me0.json.user.halftoneCredits, 0);
-    assert.strictEqual(me0.json.user.services.halftones.canApply, false);
-    console.log("ok trial/shop signup: 0 credits, not included");
+    assert.strictEqual(me0.json.user.services.halftones.canApply, true, "first free image");
+    assert.strictEqual(me0.json.user.freeImageAvailable, true);
+    console.log("ok trial/shop signup: 0 credits, first image free");
+    // Spend the free image (simulate) so the paid gate below is exercised.
+    {
+      const fp = path.join(s.dir, "store.json");
+      const d0 = JSON.parse(fs.readFileSync(fp, "utf8"));
+      d0.users.find((x) => x.email === email).free_image_used = true;
+      fs.writeFileSync(fp, JSON.stringify(d0));
+    }
 
     // Credit gate runs after job lookup. A real job with 0 credits is 402; a missing id is 404.
     const jobRes = await req(port, "POST", "/api/jobs", {

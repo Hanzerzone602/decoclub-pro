@@ -237,6 +237,34 @@ async function uploadJob(port, cookie, title) {
     const shopId = me.json.user.id;
     console.log("ok signup credits 0 plan null");
 
+    // Free-first-image rule: logged-out is refused; first image free; second needs credits.
+    const anon = await req(port, "POST", "/api/jobs/x/vectorize", { body: JSON.stringify({ colors: 2 }) });
+    assert.ok(anon.status === 401 || anon.status === 403, "anon vectorize must be refused, got " + anon.status);
+    assert.strictEqual(me.json.user.freeImageAvailable, true);
+    const freeJob = await uploadJob(port, shopCk, "PPI free");
+    const freeRun = await req(port, "POST", "/api/jobs/" + freeJob.id + "/vectorize", {
+      headers: { Cookie: shopCk },
+      body: JSON.stringify({ colors: 2, maxEdge: 96 }),
+    });
+    assert.strictEqual(freeRun.status, 200, "free first image " + JSON.stringify(freeRun.json));
+    assert.strictEqual(freeRun.json.job.unlocks.vectorize, true);
+    const freeAgain = await req(port, "POST", "/api/jobs/" + freeJob.id + "/vectorize", {
+      headers: { Cookie: shopCk },
+      body: JSON.stringify({ colors: 3, maxEdge: 96 }),
+    });
+    assert.strictEqual(freeAgain.status, 200, "re-tweak of free image stays free");
+    const me2 = await req(port, "GET", "/api/me", { headers: { Cookie: shopCk } });
+    assert.strictEqual(me2.json.user.freeImageAvailable, false);
+    assert.strictEqual(me2.json.user.vectorCredits, 0);
+    // free image is one total: halftones on a new job is now gated too
+    const htJob = await uploadJob(port, shopCk, "PPI ht after free");
+    const htDenied = await req(port, "POST", "/api/jobs/" + htJob.id + "/halftone", {
+      headers: { Cookie: shopCk },
+      body: JSON.stringify({ style: "classic-round" }),
+    });
+    assert.strictEqual(htDenied.status, 402, "halftone after free used " + htDenied.status);
+    console.log("ok free first image: anon refused, 1 free, re-tweak free, then 402 on both services");
+
     const job = await uploadJob(port, shopCk, "PPI one");
     const denied = await req(port, "POST", "/api/jobs/" + job.id + "/vectorize", {
       headers: { Cookie: shopCk },

@@ -203,8 +203,13 @@ function vectorCreditBalance(user) {
   return Math.max(0, Math.floor(Number(user && user.vector_credits) || 0));
 }
 
+/** One free image per account (Vectorize OR Halftones, one total). Admin never uses it. */
+function freeImageAvailable(user) {
+  return !!(user && !isComped(user) && !user.free_image_used);
+}
+
 function canApplyHalftone(user) {
-  return !!(user && (halftoneIncluded(user) || halftoneCreditBalance(user) > 0));
+  return !!(user && (halftoneIncluded(user) || halftoneCreditBalance(user) > 0 || freeImageAvailable(user)));
 }
 
 function dollarsLabel(cents) {
@@ -264,7 +269,7 @@ function canUseService(user, job, service) {
   if (service === "halftones" && halftoneIncluded(user)) return true;
   if (job && job.unlocks && job.unlocks[service]) return true;
   const bal = service === "vectorize" ? vectorCreditBalance(user) : halftoneCreditBalance(user);
-  return bal >= 1;
+  return bal >= 1 || freeImageAvailable(user);
 }
 
 function consumeServiceCredit(user, job, service) {
@@ -273,7 +278,16 @@ function consumeServiceCredit(user, job, service) {
   if (!job.unlocks || typeof job.unlocks !== "object") job.unlocks = {};
   if (job.unlocks[service]) return { ok: true, consumed: false, unlocked: true };
   const bal = service === "vectorize" ? vectorCreditBalance(user) : halftoneCreditBalance(user);
+  if (bal < 1 && freeImageAvailable(user)) {
+    user.free_image_used = true;
+    user.free_image_service = service;
+    user.free_image_at = new Date().toISOString();
+    user.images_processed = (Number(user.images_processed) || 0) + 1;
+    job.unlocks[service] = true;
+    return { ok: true, consumed: false, free: true, remaining: bal };
+  }
   if (bal < 1) return { ok: false };
+  user.images_processed = (Number(user.images_processed) || 0) + 1;
   if (service === "vectorize") user.vector_credits = bal - 1;
   else user.halftone_credits = bal - 1;
   job.unlocks[service] = true;
@@ -312,6 +326,11 @@ function requireHalftoneApply(user, res, settings) {
 function consumeHalftoneCredit(user) {
   if (halftoneIncluded(user)) return { ok: true, consumed: false, included: true, remaining: halftoneCreditBalance(user) };
   const bal = halftoneCreditBalance(user);
+  if (bal < 1 && freeImageAvailable(user)) {
+    user.free_image_used = true; user.free_image_service = "halftones"; user.free_image_at = new Date().toISOString();
+    user.images_processed = (Number(user.images_processed) || 0) + 1;
+    return { ok: true, consumed: false, free: true, included: false, remaining: 0 };
+  }
   if (bal < 1) return { ok: false, consumed: false, included: false, remaining: 0 };
   user.halftone_credits = bal - 1;
   return { ok: true, consumed: true, included: false, remaining: user.halftone_credits };
@@ -1176,6 +1195,7 @@ function publicUser(u) {
     halftoneIncluded: halftoneIncluded(u),
     vectorCredits: vectorCreditBalance(u),
     vectorIncluded: vectorIncluded(u),
+    freeImageAvailable: freeImageAvailable(u),
     services: serviceEntitlements(u),
   };
 }
@@ -1893,7 +1913,8 @@ async function handleApi(req, res, url) {
         });
       }
       var htNote = "";
-      if (creditUse.consumed) htNote = " · −1 halftone credit (" + creditUse.remaining + " left)";
+      if (creditUse.free) htNote = " · free first image";
+      else if (creditUse.consumed) htNote = " · −1 halftone credit (" + creditUse.remaining + " left)";
       else if (creditUse.unlocked) htNote = " · image already unlocked";
       else if (creditUse.included && features.membershipEnabled() && !isComped(user)) htNote = " · Studio included";
       else if (creditUse.included) htNote = " · admin";
@@ -2560,6 +2581,8 @@ async function handleApi(req, res, url) {
       vector_credits: vectorCreditBalance(u),
       vector_included: vectorIncluded(u),
       disabled: !!u.disabled, created_at: u.created_at,
+      free_image_used: !!u.free_image_used, free_image_service: u.free_image_service || null, free_image_at: u.free_image_at || null,
+      images_processed: Number(u.images_processed) || 0,
       jobs: (db.jobs || []).filter(function (j) { return j.owner_id === u.id || j.client_id === u.id; }).length,
     };
   }
@@ -2642,6 +2665,7 @@ async function handleApi(req, res, url) {
       vectorizer_ai: false,
       vai_trace: vaiTrace.available(),
       vtracer: vtracer.available(),
+      data_dir_env: !!process.env.DATA_DIR,
     });
   }
 
