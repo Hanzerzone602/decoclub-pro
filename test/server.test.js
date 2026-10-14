@@ -84,7 +84,7 @@ function stop(child) {
     const appJs = await req(port, "GET", "/app.js");
     assert.ok(appJs.text.indexOf("Drop art. Vectorize. Recolor. Export.") !== -1);
     assert.ok(appJs.text.indexOf("or tap to pick a file") !== -1);
-    assert.ok(appJs.text.indexOf("Professional background removal") !== -1);
+    assert.ok(appJs.text.indexOf("Background removal, one click") !== -1);
     assert.ok(appJs.text.indexOf("AI Generate") !== -1);
     assert.ok(appJs.text.indexOf("Grok Imagine") === -1);
     assert.ok(appJs.text.indexOf("crossOrigin") === -1);

@@ -232,7 +232,7 @@ async function boot() {
   const whoEl = $("#who");
   const logoutBtn = $("#logout");
   if (user && user.name) {
-    let whoLine = user.name + " · " + user.role + " · " + user.plan;
+    let whoLine = [user.name, user.role, user.plan].filter(Boolean).join(" · ");
     if (!entitled() && user.plan !== "trial") whoLine += " · trial";
     if (user.halftoneIncluded) whoLine += " · HT∞";
     else if (user.halftoneCredits > 0) whoLine += " · HT×" + user.halftoneCredits;
@@ -526,7 +526,7 @@ async function renderMake() {
         </div>
         <input id="makeFile" type="file" accept="image/*,.svg,.pdf" hidden />
       </div>
-      <label class="remember"><input id="rmbg" type="checkbox" checked /> Professional background removal</label>
+      <label class="remember"><input id="rmbg" type="checkbox" checked /> Background removal, one click</label>
       ${cfg.imagine ? `<div class="card" style="margin-top:18px">
         <div class="kicker">AI Generate</div>
         <p class="muted">Describe a graphic — we place it on this job.</p>
@@ -646,7 +646,7 @@ async function renderIntake() {
       <label>Shop margin %</label><input name="margin_pct" type="number" step="0.1" value="${shop && shop.margin_pct != null ? shop.margin_pct : 20}" />
       <label>Notes</label><textarea name="notes" rows="2"></textarea>
       <label>Artwork</label><input name="artwork" type="file" accept="image/*,.svg,.pdf" />
-      <label class="remember"><input name="remove_bg" type="checkbox" checked /> Professional background removal</label>
+      <label class="remember"><input name="remove_bg" type="checkbox" checked /> Background removal, one click</label>
       <p class="notice" id="err"></p>
       <button class="btn" type="submit">Create job</button>
     </form>`;
@@ -676,14 +676,14 @@ async function renderJob(id) {
   if (!PRICE_STATION_ENABLED && station === "price") station = "art";
   if (station === "digitize" && !canDigitize()) station = "art";
   main.innerHTML = `
-    <button class="btn ghost small" id="back">← Board</button>
-    <div class="row" style="margin-top:12px">
-      <h1 style="margin:0;font-size:26px">${escapeHtml(job.title)}</h1>
+    <div class="studio-top">
+      <button class="btn ghost small" id="back">← Board</button>
+      <div class="tabs builder-tabs" role="tablist" aria-label="Service">${tabs.map(([k,l]) => `<button data-tab="${k}" class="${station===k?"on":""}">${l}</button>`).join("")}</div>
+      <h1 class="studio-title">${escapeHtml(job.title)}</h1>
       <span class="status">${STAT_LABEL[job.status]||job.status}</span>
+      <span class="muted studio-meta">${job.method} · ${job.width_in}×${job.height_in} in · qty ${job.qty}${job.due_at ? " · due " + escapeHtml(job.due_at) : ""}</span>
     </div>
-    <p class="muted">${job.method} · ${job.width_in}×${job.height_in} in · qty ${job.qty}${job.due_at ? " · due " + escapeHtml(job.due_at) : ""}</p>
     ${paywallNote()}
-    <div class="tabs">${tabs.map(([k,l]) => `<button data-tab="${k}" class="${station===k?"on":""}">${l}</button>`).join("")}</div>
     <div id="station"></div>
     <h3>Timeline</h3>
     <ul class="muted">${(events||[]).map((e) => `<li>${escapeHtml(sanitizeEventMessage(e.message))} · ${new Date(e.created_at).toLocaleString()}</li>`).join("")}</ul>`;
@@ -856,24 +856,54 @@ async function fillArt(el, job, shopControls) {
     ? `<p class="muted vz-used" id="vzUsed">Last run · Detail ${escapeHtml(detailReadout(toPct(lastSet.detail, DETAIL_LEGACY, 50)))} · Smoothing ${escapeHtml(smoothReadout(toPct(lastSet.smoothing, SMOOTH_LEGACY, 50)))} · Corners ${escapeHtml(cornerReadout(toPct(lastSet.cornerSmooth, CORNER_LEGACY, 50)))}</p>`
     : `<p class="muted vz-used" id="vzUsed" hidden></p>`;
 
-  el.innerHTML = `
-    <div class="split art-simple">
-      <div class="art-stage">
-        <div class="preview art-drop${hasArt ? " has-art" : ""}" id="artDrop" tabindex="0">
-          <div class="art-zoom-inner" id="artZoomInner">${preview}</div>
-          <div class="ht-preview-frame" id="htPreviewFrame" hidden aria-live="polite"></div>
+  const RAIL_ICO = {
+    upload: '<path d="M12 16V4M7 9l5-5 5 5"/><path d="M4 16v4h16v-4"/>',
+    vectorize: '<path d="M4 17l4-10 4 6 3-4 5 8"/><path d="M4 19h16"/>',
+    halftones: '<circle cx="6" cy="8" r="1.4"/><circle cx="12" cy="6" r="2"/><circle cx="18" cy="9" r="1.2"/><circle cx="8" cy="14" r="1.8"/><circle cx="14" cy="15" r="1.3"/><circle cx="19" cy="16" r="1.6"/>',
+    colors: '<circle cx="12" cy="12" r="8"/><circle cx="9" cy="10" r="1.3"/><circle cx="14" cy="9" r="1.3"/><circle cx="15" cy="14" r="1.3"/>',
+    clean: '<path d="M4 20l7-7"/><path d="M14 4l6 6-8 8-6-6z"/>',
+    digitize: '<path d="M4 12c3-6 5 6 8 0s5 6 8 0"/><path d="M4 18h16"/>',
+    export: '<path d="M12 4v12M7 11l5 5 5-5"/><path d="M4 20h16"/>',
+  };
+  const railBtn = (key, label) => `<button type="button" class="rail-btn" data-rail="${key}" title="${escapeHtml(label)}"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" aria-hidden="true">${RAIL_ICO[key]}</svg><span>${escapeHtml(label)}</span></button>`;
+  const exportPanel = `
+        ${shopControls && (layers.length || job.vector_svg) ? `<div class="export-grid export-hero art-dl">
+          <a href="/api/export/${job.id}/art.svg">Download SVG</a>
+          <a href="/api/export/${job.id}/art.eps">Download EPS</a>
+          <a href="/api/export/${job.id}/art.pdf">Download PDF</a>
+          <a href="/api/export/${job.id}/art.dxf">Download DXF</a>
         </div>
-        ${hasArt ? `<div class="zoom-bar">
-          <button type="button" class="zoom-btn" id="zoomOut" title="Zoom out">−</button>
-          <button type="button" class="zoom-btn" id="zoomFit" title="Fit">Fit</button>
-          <button type="button" class="zoom-btn" id="zoomIn" title="Zoom in">+</button>
-          <span class="zoom-readout" id="zoomRead">100%</span>
-          <button type="button" class="zoom-btn" id="bgToggle" title="Switch preview background (light / dark) so every ink stands out">Light bg</button>
-          <span class="muted">Scroll to zoom · drag to pan</span>
-        </div>` : ""}
-        <input id="artFile" type="file" accept="image/*,.svg,.pdf" hidden />
-      </div>
-      <div class="art-tools">
+        <div class="export-grid art-dl">
+          <a href="/api/export/${job.id}/art-300dpi.png" title="Transparent PNG, 300 DPI at print size">PNG 300 DPI</a>
+          <a href="/api/export/${job.id}/art.tiff" title="Transparent TIFF, 300 DPI at print size">TIFF 300 DPI</a>
+          <a href="/api/export/${job.id}/art-dtf.tiff" title="TIFF page 2 = white underbase, choked 0.35 px, none under semi-transparent pixels">DTF TIFF + white</a>
+          <a href="/api/export/${job.id}/art-underbase.png" title="White underbase only, choked 0.35 px">White underbase</a>
+        </div>
+        <p class="muted">Vector: SVG / EPS / PDF / DXF (laser + cutter) · Raster: 300 DPI at true print size, transparent · DTF white choked in, none under soft edges</p>` : ""}
+        ${shopControls && job.file_path && !job.vector_svg ? `<div class="export-grid export-hero art-dl">
+          <a href="/api/export/${job.id}/art.png" id="dlArtPng">Download PNG</a>
+        </div>
+        <p class="muted">Raster art · PNG</p>` : ""}
+        ${shopControls && canDigitize() && (layers.length || job.vector_svg) ? `<div class="export-grid art-dl art-dl-stitch">
+          <a href="/api/export/${job.id}/design.dst">DST</a>
+          <a href="/api/export/${job.id}/design.exp">EXP</a>
+          <a href="/api/export/${job.id}/design.pes">PES</a>
+        </div>
+        <p class="muted">Stitch files (admin) · tune on the Digitize tab</p>` : ""}
+        ${shopControls ? `<button type="button" class="btn ghost small studio-more-files" id="moreFilesBtn">All production files →</button>` : ""}`;
+
+  el.innerHTML = `
+    <div class="studio art-simple${shopControls ? "" : " studio-view"}">
+      ${shopControls ? `<nav class="studio-rail" aria-label="Studio tools">
+        ${railBtn("upload", "Upload")}
+        ${railBtn("vectorize", "Vectorize")}
+        ${railBtn("halftones", "Halftones")}
+        ${layers.length ? railBtn("colors", "Colors") : ""}
+        ${railBtn("clean", "Clean up")}
+        ${canDigitize() ? railBtn("digitize", "Digitize") : ""}
+        ${railBtn("export", "Export")}
+      </nav>` : ""}
+      <aside class="studio-panel art-tools">
         ${shopControls ? `
         ${runRiskHtml(job)}
         <div class="art-actions">
@@ -909,7 +939,7 @@ async function fillArt(el, job, shopControls) {
           </div>
           <p class="muted ht-hint" id="htHint">Live preview on the art · Apply commits real vector SVG.</p>
         </div>
-        <p class="muted">Best on clean Canva / shop logos (smooth SVG/EPS for Corel). Soft junk JPEGs and busy posters improve, but are not Vectorizer.AI-class yet.</p>
+        <p class="muted vz-best">Best on clean Canva / shop logos (smooth SVG/EPS for Corel). Soft junk JPEGs and busy posters improve, but are not Vectorizer.AI-class yet.</p>
         <div class="vz-options" id="vzOptions">
           ${continuousSliderRow("detailRow", "Detail", "How many colors to keep — drag for live preview",
             initDetail, "Simple", "Fine art", detailReadout)}
@@ -928,31 +958,14 @@ async function fillArt(el, job, shopControls) {
             <button type="button" class="vz-seg${initColorMode==="cmyk"?" on":""}" data-mode="cmyk" title="Edit as print CMYK">CMYK</button>
           </div>
         </div>` : ""}
-        <div class="layer-list${shopControls ? " color-mode-" + initColorMode : ""}">${layerRows}</div>
-        ${shopControls && (layers.length || job.vector_svg) ? `<div class="export-grid export-hero art-dl">
-          <a href="/api/export/${job.id}/art.svg">Download SVG</a>
-          <a href="/api/export/${job.id}/art.eps">Download EPS</a>
-          <a href="/api/export/${job.id}/art.pdf">Download PDF</a>
-          <a href="/api/export/${job.id}/art.dxf">Download DXF</a>
-        </div>
-        <div class="export-grid art-dl">
-          <a href="/api/export/${job.id}/art-300dpi.png" title="Transparent PNG, 300 DPI at print size">PNG 300 DPI</a>
-          <a href="/api/export/${job.id}/art.tiff" title="Transparent TIFF, 300 DPI at print size">TIFF 300 DPI</a>
-          <a href="/api/export/${job.id}/art-dtf.tiff" title="TIFF page 2 = white underbase, choked 0.35 px, none under semi-transparent pixels">DTF TIFF + white</a>
-          <a href="/api/export/${job.id}/art-underbase.png" title="White underbase only, choked 0.35 px">White underbase</a>
-        </div>
-        <p class="muted">Vector: SVG / EPS / PDF / DXF (laser + cutter) · Raster: 300 DPI at true print size, transparent · DTF white choked in, none under soft edges</p>` : ""}
-        ${shopControls && job.file_path && !job.vector_svg ? `<div class="export-grid export-hero art-dl">
-          <a href="/api/export/${job.id}/art.png" id="dlArtPng">Download PNG</a>
-        </div>
-        <p class="muted">Raster art · PNG</p>` : ""}
+        <div class="layer-list${shopControls ? " color-mode-" + initColorMode : ""}" id="layerList">${layerRows}</div>
         ${shopControls ? `
-        <details class="art-more">
+        <details class="art-more" id="artMore">
           <summary>More tools</summary>
-          <label class="remember"><input id="rmbg" type="checkbox" checked /> Professional background removal</label>
+          <label class="remember"><input id="rmbg" type="checkbox" checked /> Background removal, one click</label>
           <div class="row">
             <button class="btn small" type="button" id="replaceBtn">Replace art</button>
-            <button class="btn small" type="button" id="rmbgBtn">Professional background removal</button>
+            <button class="btn small" type="button" id="rmbgBtn">Background removal, one click</button>
             <button class="btn ghost small" type="button" id="ko">Knockout white</button>
           </div>
           ${cfg.imagine ? `<div class="more-block">
@@ -965,8 +978,61 @@ async function fillArt(el, job, shopControls) {
           <button class="btn small" id="saveArtN" type="button">Save notes</button>
         </details>
         <p class="notice" id="err"></p>` : ""}
-      </div>
+      </aside>
+      <section class="studio-center art-stage">
+        <div class="canvas-toolbar">
+          <span class="ct-name" title="Design name">${escapeHtml(job.title)}</span>
+          <span class="ct-size mono" title="Print size">${escapeHtml(String(job.width_in))} × ${escapeHtml(String(job.height_in))} in</span>
+          ${hasArt ? `<div class="zoom-bar">
+            <button type="button" class="zoom-btn" id="zoomOut" title="Zoom out">−</button>
+            <button type="button" class="zoom-btn" id="zoomFit" title="Fit">Fit</button>
+            <button type="button" class="zoom-btn" id="zoomIn" title="Zoom in">+</button>
+            <span class="zoom-readout" id="zoomRead">100%</span>
+            <button type="button" class="zoom-btn" id="bgToggle" title="Switch preview background (light / dark) so every ink stands out">Light bg</button>
+          </div>` : ""}
+          ${shopControls ? `<button type="button" class="btn small ct-export" id="ctExport">Export</button>` : ""}
+        </div>
+        <div class="canvas-ruled">
+          <div class="ruler ruler-x" aria-hidden="true"></div>
+          <div class="ruler ruler-y" aria-hidden="true"></div>
+          <div class="preview art-drop${hasArt ? " has-art" : ""}" id="artDrop" tabindex="0">
+            <div class="art-zoom-inner" id="artZoomInner">${preview}</div>
+            <div class="ht-preview-frame" id="htPreviewFrame" hidden aria-live="polite"></div>
+          </div>
+        </div>
+        ${hasArt ? `<p class="muted canvas-hint">Scroll to zoom · drag to pan · drop new art to replace</p>` : ""}
+        <input id="artFile" type="file" accept="image/*,.svg,.pdf" hidden />
+      </section>
+      <aside class="studio-right">
+        <div class="studio-card price-card">
+          <div class="kicker">Pricing</div>
+          <div class="price-line"><strong>$3</strong> <span class="muted">per image</span></div>
+          <div class="price-line"><strong>$20</strong> <span class="muted">10-pack credits · never expire</span></div>
+          <p class="muted">Re-tweak the same image free. $0 transaction fees.</p>
+          ${user && (user.vectorCredits != null || user.halftoneCredits != null) ? `<p class="mono price-credits">Credits · Vectorize ${escapeHtml(String(user.vectorCredits != null ? user.vectorCredits : 0))} · Halftones ${escapeHtml(String(user.halftoneCredits != null ? user.halftoneCredits : 0))}</p>` : ""}
+        </div>
+        <div class="studio-card export-card" id="exportCard">
+          <div class="kicker">Export</div>
+          ${exportPanel}
+          ${shopControls && !hasArt ? `<p class="muted">Drop art to unlock downloads.</p>` : ""}
+          ${shopControls ? "" : `<p class="muted">Downloads are shop-only.</p>`}
+        </div>
+      </aside>
     </div>`;
+  if (shopControls) {
+    const railGo = {
+      upload: () => $("#artFile").click(),
+      vectorize: () => { const p = $("#htPanel"); if (p && !p.hidden) $("#htCancel").click(); const o = $("#vzOptions"); if (o) o.scrollIntoView({ block: "nearest", behavior: "smooth" }); const v = $("#vectorizeBtn"); if (v) v.focus(); },
+      halftones: () => { const p = $("#htPanel"); if (p && p.hidden) $("#halftoneBtn").click(); if (p) p.scrollIntoView({ block: "nearest", behavior: "smooth" }); },
+      colors: () => { const p = $("#htPanel"); if (p && !p.hidden) $("#htCancel").click(); const l = $("#layerList"); if (l) l.scrollIntoView({ block: "start", behavior: "smooth" }); },
+      clean: () => { const m = $("#artMore"); if (m) { m.open = true; m.scrollIntoView({ block: "nearest", behavior: "smooth" }); } },
+      digitize: () => { station = "digitize"; renderJob(job.id); },
+      export: () => { const c = $("#exportCard"); if (c) { c.classList.add("flash"); c.scrollIntoView({ block: "nearest", behavior: "smooth" }); setTimeout(() => c.classList.remove("flash"), 900); } },
+    };
+    el.querySelectorAll("[data-rail]").forEach((b) => { b.onclick = () => { el.querySelectorAll("[data-rail]").forEach((x) => x.classList.toggle("on", x === b)); (railGo[b.dataset.rail] || (() => {}))(); }; });
+    const ctx = $("#ctExport"); if (ctx) ctx.onclick = railGo.export;
+    const mf = $("#moreFilesBtn"); if (mf) mf.onclick = () => { station = "export"; renderJob(job.id); };
+  }
   if (!shopControls) return;
 
   let vzDetail = initDetail;
@@ -1141,7 +1207,7 @@ async function fillArt(el, job, shopControls) {
       renderJob(job.id);
     } catch (err) {
       if (errEl) errEl.textContent = err.message;
-      if (btn) { btn.disabled = false; btn.textContent = "Professional background removal"; }
+      if (btn) { btn.disabled = false; btn.textContent = "Background removal, one click"; }
     }
   };
   $("#ko").onclick = async () => {
@@ -1428,7 +1494,7 @@ async function fillArt(el, job, shopControls) {
     if (grey) grey.hidden = on;
     if (inv) inv.hidden = on;
     // Keep Halftones primary; mute leftover art-actions noise
-    const hintVz = el.querySelector(".art-card > p.muted");
+    const hintVz = el.querySelector(".vz-best");
     if (hintVz && /Best on clean Canva/.test(hintVz.textContent || "")) {
       hintVz.hidden = on;
     }

@@ -7,60 +7,143 @@
   <meta name="description" content="Pay per image: clean SVG/EPS vectors or real vector halftones for DTF and screen print. $3 per image or $20 for 10. No subscription, $0 transaction fees." />
   <link rel="icon" href="/logo.png" />
   <link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Sans:wght@400;500;600;700&family=IBM+Plex+Serif:wght@600&display=swap" rel="stylesheet" />
-  <link rel="stylesheet" href="/styles.css?v=ppi1" />
+  <link rel="stylesheet" href="/styles.css?v=plp2" />
 </head>
-<body>
+<body class="home">
+  <div class="announce">Pay per image · <strong>$0 transaction fees</strong> · no subscription <a href="/signup.html">Get started →</a></div>
   <header class="topbar">
     <a class="brand" href="/"><img src="/logo.png" alt="" /> DECOCLUB PRO</a>
     <nav class="nav">
+      <a href="#problem">Why</a>
       <a href="#tools">Art tools</a>
+      <a href="#method">How it works</a>
       <a href="#pricing">Pricing</a>
+      <a href="#faq">FAQ</a>
       <a href="/login.html">Log in</a>
       <a class="btn small" href="/signup.html">Get started</a>
     </nav>
   </header>
-  <section class="hero">
+
+  <section class="hero hero-split">
     <div>
       <div class="kicker">Customer file in · machine file out</div>
-      <h1>Production art, ready for the press.</h1>
+      <h1>Production art, <span class="hl">ready for the press.</span></h1>
       <p class="lede">Drop a clean logo or Canva export. Get smooth, crisp SVG/EPS for Corel and Illustrator. Pay per image: $3, or $20 for 10. No subscription. $0 transaction fees. Best on clean logos and flat graphics; soft AI art and low-res JPEGs vary.</p>
       <div class="cta-row">
         <a class="btn" href="/signup.html">Get started</a>
         <a class="btn ghost" href="/login.html">Log in</a>
       </div>
       <p class="muted" id="demoHint" style="margin-top:16px;font-size:13px"></p>
+      <div class="badges">
+        <span>Real vector paths</span><span>300 DPI print exports</span><span>Credits never expire</span>
+      </div>
     </div>
-    <div class="hero-art"><img src="/brand.jpg" alt="DecoClub Pro — vectorize art studio for Corel and Illustrator" /></div>
+    <div class="hero-shots">
+      <div class="hero-art shot-main"><img src="/studio-shot.jpg" alt="DecoClub Pro Studio editor: tools, canvas, pricing and export" /></div>
+      <div class="hero-art shot-badge"><img src="/brand.jpg" alt="DecoClub Pro — vectorize art studio for Corel and Illustrator" /></div>
+    </div>
   </section>
+
+  <section class="section problem" id="problem">
+    <div class="kicker">The problem</div>
+    <div class="problem-grid">
+      <h2>Customer art shows up as a blurry JPEG. The press needs clean vector.</h2>
+      <div>
+        <p class="lede">Redrawing logos by hand eats your shop time, and most online tools stop at a rough trace. DecoClub Pro takes the file you were sent and hands back production files you can open straight in Corel, Illustrator, your RIP or your cutter.</p>
+        <div class="chain"><span>JPEG / PNG / Canva</span><span>Clean</span><span>Approve</span><span>SVG · EPS · PDF · DXF · TIFF</span></div>
+      </div>
+    </div>
+  </section>
+
   <section class="section catalog" id="tools">
-    <div class="kicker">Art studio</div>
-    <h2>Vectorize first. Production SVG/EPS out.</h2>
-    <p class="muted" style="max-width:42rem;margin:0 0 1.25rem">Drop a logo or Canva export. Get smooth paths for Corel and Illustrator — recolor layers, greyscale, invert, and download.</p>
-    <div class="process-grid" style="grid-template-columns:repeat(auto-fit,minmax(220px,280px));justify-content:start">
-      <a class="process-tile" href="/start.html?method=apparel&tool=vectorize">
+    <div class="kicker">Art tools</div>
+    <h2>What DecoClub Pro does today</h2>
+    <div class="product-cards">
+      <a class="pcard" href="/start.html?method=apparel&tool=vectorize">
+        <span class="pnum">01 · Vectorize</span>
         <svg class="process-ico" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" aria-hidden="true"><path d="M4 17l4-10 4 6 3-4 5 8"/><path d="M4 19h16"/></svg>
-        <span class="process-name">Vectorize</span>
-        <span class="process-out">Clean logos / Canva → SVG/EPS</span>
+        <strong>Clean logos / Canva → SVG/EPS</strong>
+        <span class="muted">Smooth paths with Detail, Smoothing and Corner controls. Recolor layers in RGB or CMYK, Pantone match, greyscale, invert.</span>
         <span class="process-go">$3 / image · $20 for 10</span>
       </a>
-      <a class="process-tile" href="/start.html?method=apparel&tool=halftones">
+      <a class="pcard" href="/start.html?method=apparel&tool=halftones">
+        <span class="pnum">02 · Halftones</span>
         <svg class="process-ico" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" aria-hidden="true"><circle cx="6" cy="8" r="1.4"/><circle cx="12" cy="6" r="2"/><circle cx="18" cy="9" r="1.2"/><circle cx="8" cy="14" r="1.8"/><circle cx="14" cy="15" r="1.3"/><circle cx="19" cy="16" r="1.6"/><circle cx="5" cy="19" r="1.1"/></svg>
-        <span class="process-name">Halftones</span>
-        <span class="process-out">Real color vector dots · DTF &amp; screen</span>
+        <strong>Real color vector dots · DTF &amp; screen</strong>
+        <span class="muted">Full-color marks for DTF or one ink for screen. Set LPI, angle and contrast, knockout to transparent.</span>
         <span class="process-go">Free preview · $3 / image</span>
       </a>
+      <div class="pcard">
+        <span class="pnum">03 · Print exports</span>
+        <svg class="process-ico" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" aria-hidden="true"><path d="M12 4v12M7 11l5 5 5-5"/><path d="M4 20h16"/></svg>
+        <strong>PDF · DXF · 300 DPI PNG/TIFF</strong>
+        <span class="muted">Laser- and cutter-ready DXF, transparent 300 DPI raster at true print size, and DTF TIFF with a choked white underbase.</span>
+        <span class="process-go">Included with every image</span>
+      </div>
+      <div class="pcard">
+        <span class="pnum">04 · Clean up</span>
+        <svg class="process-ico" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" aria-hidden="true"><path d="M4 20l7-7"/><path d="M14 4l6 6-8 8-6-6z"/></svg>
+        <strong>Background removal &amp; knockout</strong>
+        <span class="muted">Background removal, one click. Knockout white, hi-res greyscale and black/white invert.</span>
+        <span class="process-go">Included</span>
+      </div>
     </div>
   </section>
+
+  <section class="section method" id="method">
+    <div class="kicker">How it works</div>
+    <h2>Upload once. Walk out with press files.</h2>
+    <ol class="steps">
+      <li><span class="snum">01</span><strong>Upload</strong><span class="muted">Drop a PNG, JPG, WebP or Canva export. Background removal, one click.</span></li>
+      <li><span class="snum">02</span><strong>Clean</strong><span class="muted">Vectorize or halftone it, then tune detail, smoothing, corners and layer colors with a live preview.</span></li>
+      <li><span class="snum">03</span><strong>Check</strong><span class="muted">Check it on a light or dark background, zoom in, and tweak colors.</span></li>
+      <li><span class="snum">04</span><strong>Export</strong><span class="muted">SVG, EPS, PDF, DXF, 300 DPI PNG/TIFF and DTF white underbase in one place.</span></li>
+    </ol>
+  </section>
+
+  <section class="section fees" id="fees">
+    <div class="kicker">$0 transaction fees</div>
+    <h2>Your orders stay yours.</h2>
+    <p class="lede">Other print-shop platforms charge a monthly plan and take 4–8% of every order you sell. We take nothing. You pay per image, and every dollar of your orders stays yours.</p>
+    <table class="compare">
+      <thead><tr><th></th><th>DecoClub Pro</th><th>Typical print-shop platform</th></tr></thead>
+      <tbody>
+        <tr><td>Monthly fee</td><td><strong>$0</strong></td><td>Monthly plan</td></tr>
+        <tr><td>Fee on your store orders</td><td><strong>$0</strong></td><td>4–8% per order</td></tr>
+        <tr><td>Raster → vector tracing</td><td><strong>Yes</strong></td><td>Often not included</td></tr>
+        <tr><td>Vector halftones</td><td><strong>Yes</strong></td><td>Often not included</td></tr>
+        <tr><td>EPS for Corel / Illustrator</td><td><strong>Yes</strong></td><td>Often not included</td></tr>
+      </tbody>
+    </table>
+  </section>
+
   <section class="section" id="pricing">
     <h2>Pricing — pay per image</h2>
     <p class="muted">No subscription. Credits are per service and never expire. One credit = one image.</p>
     <p class="lede"><strong>$0 transaction fees.</strong> Other print-shop platforms take 4–8% of every order you sell. We take nothing — you pay per image, and every dollar of your orders stays yours.</p>
     <div class="plans">
-      <div class="plan featured"><div class="kicker">Vectorize</div><div class="price">$3 <span>/ image</span></div><p class="muted">or <strong>$20 for 10 images</strong>. Clean SVG/EPS/PDF/DXF for CorelDRAW, Illustrator, lasers and cutters, plus 300 DPI PNG/TIFF with a choked DTF white underbase — recolor, greyscale, invert. Re-tweak the same image free.</p></div>
-      <div class="plan"><div class="kicker">Halftones</div><div class="price">$3 <span>/ image</span></div><p class="muted">or <strong>$20 for 10 images</strong>. Real vector halftone dots — full color for DTF or one ink for screen. Preview free before you buy.</p></div>
+      <div class="plan featured"><div class="kicker">Vectorize</div><div class="price">$3 <span>/ image</span></div><p class="muted">or <strong>$20 for 10 images</strong>. Clean SVG/EPS/PDF/DXF for CorelDRAW, Illustrator, lasers and cutters, plus 300 DPI PNG/TIFF with a choked DTF white underbase — recolor, greyscale, invert. Re-tweak the same image free.</p><a class="btn" href="/signup.html">Get started</a></div>
+      <div class="plan"><div class="kicker">Halftones</div><div class="price">$3 <span>/ image</span></div><p class="muted">or <strong>$20 for 10 images</strong>. Real vector halftone dots — full color for DTF or one ink for screen. Preview free before you buy.</p><a class="btn ghost" href="/start.html?method=apparel&tool=halftones">Try a free preview</a></div>
     </div>
   </section>
-  <footer>DecoClub Pro. Art studio for production-ready decoration files.</footer>
+
+  <section class="section faq" id="faq">
+    <div class="kicker">FAQ</div>
+    <h2>Questions shops ask</h2>
+    <details><summary>What files do I get?</summary><p>Vector SVG, EPS, PDF and DXF, plus transparent 300 DPI PNG and TIFF at true print size, a DTF TIFF with a white underbase page, and the underbase on its own as PNG.</p></details>
+    <details><summary>What art works best?</summary><p>Clean logos, Canva exports and flat graphics. Soft AI art, busy photos and low-res JPEGs improve, but results vary.</p></details>
+    <details><summary>Is there a subscription or a cut of my sales?</summary><p>No. You pay $3 per image or $20 for 10, credits never expire, and there are $0 transaction fees on your orders.</p></details>
+    <details><summary>Can I fix the colors after tracing?</summary><p>Yes. Every color layer can be edited in RGB or CMYK, matched to Pantone, or swapped with a color picker. Re-tweaking the same image is free.</p></details>
+    <details><summary>Can I preview halftones before paying?</summary><p>Yes. Halftone previews are free; you only use a credit when you apply it.</p></details>
+  </section>
+
+  <footer class="footer-cols">
+    <div><a class="brand" href="/"><img src="/logo.png" alt="" /> DECOCLUB PRO</a><p>Art studio for production-ready decoration files.</p></div>
+    <div><strong>Tools</strong><a href="/start.html?method=apparel&tool=vectorize">Vectorize</a><a href="/start.html?method=apparel&tool=halftones">Halftones</a><a href="#tools">Print exports</a><a href="#tools">Background removal</a></div>
+    <div><strong>Product</strong><a href="#method">How it works</a><a href="#pricing">Pricing</a><a href="#fees">$0 transaction fees</a><a href="#faq">FAQ</a></div>
+    <div><strong>Account</strong><a href="/signup.html">Get started</a><a href="/login.html">Log in</a></div>
+    <p class="footer-legal">DecoClub Pro. Art studio for production-ready decoration files.</p>
+  </footer>
   <script>
     fetch("/api/config").then(r => r.json()).then(c => {
       if (c.demo && c.seed) document.getElementById("demoHint").textContent = "Seed: " + c.seed.owner + " and " + c.seed.client + " / " + c.seed.password;
