@@ -498,7 +498,7 @@ function serviceCatalog(settings, user) {
   const mem = features.membershipEnabled();
   const vectorize = {
     name: "Vectorize",
-    description: "Clean logos / Canva → SVG/EPS",
+    description: "Clean logos and AI-generated images → SVG/EPS",
     pricing: buyOptions("vectorize", settings),
     unit: "image",
     credits_expire: false,
@@ -2451,11 +2451,11 @@ async function handleApi(req, res, url) {
     const job = db.jobs.find(function (j) { return j.id === corelImp[1] && j.shop_id === user.shop_id; });
     if (!job) return json(res, 404, { error: "Job not found" });
     const body = parseJsonBody(await readBody(req));
-    if (!job.file_path) return json(res, 400, { error: "Upload a CorelDRAW SVG first" });
+    if (!job.file_path) return json(res, 400, { error: "Upload an SVG from your design software first" });
     const abs = path.join(UPLOADS, path.basename(job.file_path));
     if (!fs.existsSync(abs)) return json(res, 404, { error: "Artwork missing" });
     const buf = fs.readFileSync(abs);
-    if (!corelImport.looksLikeSvg(buf)) return json(res, 400, { error: "Artwork is not SVG — export SVG from CorelDRAW" });
+    if (!corelImport.looksLikeSvg(buf)) return json(res, 400, { error: "Artwork is not SVG — export SVG from your design software" });
     try {
       const result = runCorelImportOnJob(job, buf, body);
       if (body.apply_mockup !== false) applyMockup(job);
@@ -2463,7 +2463,7 @@ async function handleApi(req, res, url) {
       save(db);
       return json(res, 200, { job: presentJob(job, req), vector: clientVector(job, req), meta: presentVzMeta(result.meta) });
     } catch (err) {
-      return json(res, 400, { error: IS_PROD ? "Could not import Corel SVG" : err.message });
+      return json(res, 400, { error: IS_PROD ? "Could not import that SVG" : err.message });
     }
   }
 
@@ -2509,7 +2509,7 @@ async function handleApi(req, res, url) {
     /* Explicit Corel path-transfer — NOT the default PNG Vectorize button. Import stays free. */
     if (wantCorel || isCorelSvg) {
       if (!requireProduce(user, res)) return;
-      if (!isSvg) return json(res, 400, { error: "corel-import needs a CorelDRAW SVG upload" });
+      if (!isSvg) return json(res, 400, { error: "This import needs an SVG from your design software" });
       try {
         const result = runCorelImportOnJob(job, buf, body);
         if (body.apply_mockup) applyMockup(job);
@@ -2517,10 +2517,10 @@ async function handleApi(req, res, url) {
         save(db);
         return json(res, 200, { job: presentJob(job, req), vector: clientVector(job, req), meta: presentVzMeta(result.meta) });
       } catch (err) {
-        return json(res, 400, { error: IS_PROD ? "Could not import Corel SVG" : err.message });
+        return json(res, 400, { error: IS_PROD ? "Could not import that SVG" : err.message });
       }
     }
-    if (isSvg) return json(res, 400, { error: "SVG is not CorelDRAW — use engine corel-import only for Corel exports, or upload PNG to Vectorize" });
+    if (isSvg) return json(res, 400, { error: "That SVG is not a supported design-software export. Upload a PNG to Vectorize." });
     if (buf[0] !== 0x89 || buf[1] !== 0x50) {
       try {
         buf = vaiTrace.decodeRasterToPng(buf);
@@ -2580,7 +2580,7 @@ async function handleApi(req, res, url) {
       }
       if (wantApi) {
         if (!vectorizerAi.configured()) {
-          return json(res, 501, { error: "Vectorizer.AI keys not configured" });
+          return json(res, 501, { error: "Pro vector service is not configured" });
         }
         await runProVectorize(job, buf, Object.assign({}, body, { engine: "vectorizer.ai", api: true }));
         if (body.apply_mockup) applyMockup(job);

@@ -571,7 +571,7 @@ async function renderMake() {
   main.innerHTML = `
     <div class="make-home">
       <h1 class="make-title">Drop art. Vectorize. Recolor. Export.</h1>
-      <p class="muted make-sub">Vectorize-first studio — clean SVG/EPS for Corel and Illustrator.</p>
+      <p class="muted make-sub">Vectorize-first studio — clean SVG/EPS for your design software.</p>
       ${paywallNote()}
       <div class="make-drop" id="makeDrop" tabindex="0" role="button" aria-label="Drop art. Vectorize. Recolor. Export. or tap to pick a file">
         <div class="drop-hint">
@@ -881,8 +881,8 @@ async function fillArt(el, job, shopControls) {
         </div>
       </div>
       <input type="color" class="layer-pick" value="${escapeHtml((L.hex || "#111111").slice(0, 7))}" title="Pick print color" />
-      ${pantones.length ? `<select class="layer-pal" data-layer="${i}" title="Optional Pantone match">
-        <option value="">Pantone (optional)</option>
+      ${pantones.length ? `<select class="layer-pal" data-layer="${i}" title="Optional spot color match">
+        <option value="">Spot color (optional)</option>
         ${pantones.map((c) => `<option value="${escapeHtml(c.hex)}" data-name="${escapeHtml(c.name)}" ${String(L.pantone||"")===String(c.name)?"selected":""}>${escapeHtml(c.name)}</option>`).join("")}
       </select>` : ""}
     </div>`;
@@ -997,7 +997,7 @@ async function fillArt(el, job, shopControls) {
           </div>
           <p class="muted ht-hint" id="htHint">Live preview on the art · Apply commits real vector SVG.</p>
         </div>
-        <p class="muted vz-best">Best on clean Canva / shop logos (smooth SVG/EPS for Corel). Soft junk JPEGs and busy posters improve, but are not Vectorizer.AI-class yet.</p>
+        <p class="muted vz-best">Best on clean logos and AI-generated art (smooth SVG/EPS for your design software). Soft photos and busy posters improve, but results vary.</p>
         <div class="vz-options" id="vzOptions">
           ${continuousSliderRow("detailRow", "Detail", "How many colors to keep — drag for live preview",
             initDetail, "Simple", "Fine art", detailReadout)}
@@ -1583,7 +1583,7 @@ async function fillArt(el, job, shopControls) {
     if (inv) inv.hidden = on;
     // Keep Halftones primary; mute leftover art-actions noise
     const hintVz = el.querySelector(".vz-best");
-    if (hintVz && /Best on clean Canva/.test(hintVz.textContent || "")) {
+    if (hintVz && /Best on clean logos/.test(hintVz.textContent || "")) {
       hintVz.hidden = on;
     }
     document.body.classList.toggle("ht-mode", on);
@@ -2431,7 +2431,7 @@ function fillProduce(el, job, shopControls) {
   const stones = job.stones && job.stones.count != null ? job.stones.count : "—";
   const extraFiles = studioExtras().map((m) => (m && typeof m.produceHtml === "function") ? m.produceHtml(job) : "").join("");
   el.innerHTML = `
-    <p class="muted">Process files from this art. SVG + EPS for Corel. Rhinestone SS map + CSV.</p>
+    <p class="muted">Process files from this art. SVG + EPS for your design software. Rhinestone SS map + CSV.</p>
     <p class="mono">Stones ${escapeHtml(String(stones))}</p>
     <div class="export-grid export-hero">
       <a href="/api/export/${job.id}/art.svg">SVG</a>

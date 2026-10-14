@@ -68,7 +68,7 @@ async function renderOverview() {
     <div class="row" style="margin-top:8px">
       <span class="pill ${sys.billing_configured ? "ok" : "off"}">Stripe ${sys.billing_configured ? "configured" : "not configured"}</span>
       <span class="pill off">Imagine off</span>
-      <span class="pill off">Vectorizer.AI off</span>
+      <span class="pill off">Pro vector off</span>
       <span class="pill ${sys.vai_trace ? "ok" : "warn"}">vai-trace ${sys.vai_trace ? "ready" : "missing"}</span>
     </div>
     <h2 style="font-size:18px;margin:28px 0 10px">Recent signups</h2>
@@ -360,7 +360,7 @@ async function renderSettings() {
     <p><span class="pill ${data.billing_configured ? "ok" : "off"}">Stripe ${data.billing_configured ? "configured" : "not configured"}</span>
        <span class="pill ok">Halftones service</span>
        <span class="pill off">Imagine off</span>
-       <span class="pill off">Vectorizer.AI off</span></p>
+       <span class="pill off">Pro vector off</span></p>
     <form class="form" id="pf" style="max-width:420px">
       <label>Trial days</label>
       <input name="trial_days" type="number" min="0" value="${settings.trial_days}" />
@@ -410,7 +410,7 @@ async function renderSystem() {
         <tr><td>Health</td><td><span class="pill ok">ok</span></td></tr>
         <tr><td>Stripe / billing configured</td><td><span class="pill ${data.billing_configured ? "ok" : "off"}">${data.billing_configured ? "yes" : "no"}</span> <span class="muted">(boolean only — no secrets)</span></td></tr>
         <tr><td>Imagine / AI</td><td><span class="pill off">false</span></td></tr>
-        <tr><td>Vectorizer.AI</td><td><span class="pill off">false</span></td></tr>
+        <tr><td>Pro vector</td><td><span class="pill off">false</span></td></tr>
         <tr><td>vai-trace</td><td><span class="pill ${data.vai_trace ? "ok" : "warn"}">${data.vai_trace ? "available" : "unavailable"}</span></td></tr>
         <tr><td>VTracer</td><td><span class="pill ${data.vtracer ? "ok" : "off"}">${data.vtracer ? "available" : "unavailable"}</span></td></tr>
         <tr><td>Trial days</td><td class="mono">${data.feature_flags && data.feature_flags.trial_days}</td></tr>
