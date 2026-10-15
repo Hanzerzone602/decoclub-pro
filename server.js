@@ -1555,6 +1555,34 @@ function jobHasVectorArt(job) {
 /** Clean vector file (no preview watermark, raw SVG URL allowed).
  * Admin is always entitled. free_image jobs are previews even if unlocks.vectorize is set.
  * Paid credit unlocks and included memberships count as entitled. */
+/** Any file from /api/export/<job>/... (svg, eps, pdf, dxf, tiff, 300dpi png, underbase, packet, cut files).
+ * Downloadable only when the job was paid for (credit consumed or verified free image claimed on
+ * this job), the user has an included plan, or the user is admin. Halftone art needs a halftones unlock. */
+function isHalftoneArt(job) {
+  return !!(job && job.vector && job.vector.source === "vector-halftone");
+}
+function exportEntitled(user, job) {
+  if (user && user.role === "admin") return true;
+  if (!user || !job) return false;
+  const unlocks = job.unlocks || {};
+  if (isHalftoneArt(job)) return halftoneIncluded(user) || !!unlocks.halftones;
+  return vectorIncluded(user) || halftoneIncluded(user) || !!(unlocks.vectorize || unlocks.halftones);
+}
+function requireExportEntitled(user, job, res, settings) {
+  if (exportEntitled(user, job)) return true;
+  const service = isHalftoneArt(job) ? "halftones" : "vectorize";
+  const vector = service === "vectorize";
+  json(res, 402, {
+    error: vector ? VECTOR_CREDIT_MSG : HALFTONE_CREDIT_MSG,
+    code: vector ? "vector_credits_required" : "halftone_credits_required",
+    service: service,
+    freeImage: freeImageStatus(user),
+    buy: buyOptions(service, settings),
+    vectorCredits: vectorCreditBalance(user),
+    halftoneCredits: halftoneCreditBalance(user),
+  });
+  return false;
+}
 function previewArtEntitled(user, job) {
   if (user && user.role === "admin") return true;
   if (!user || !job) return false;
@@ -2956,6 +2984,7 @@ async function handleApi(req, res, url) {
     }
     const job = db.jobs.find(function (j) { return j.id === expFile[1] && j.shop_id === user.shop_id; });
     if (!job) return json(res, 404, { error: "Job not found" });
+    if (!requireExportEntitled(user, job, res, ensureSettings(db))) return;
     job._shop = db.shops.find(function (s) { return s.id === user.shop_id; });
     if (expFile[2] === "art.svg" && job.vector_svg) {
       const abs = path.join(UPLOADS, path.basename(job.vector_svg));
@@ -3009,6 +3038,7 @@ async function handleApi(req, res, url) {
     if (!requireProduce(user, res)) return;
     const job = db.jobs.find(function (j) { return j.id === exp[1] && j.shop_id === user.shop_id; });
     if (!job) return json(res, 404, { error: "Job not found" });
+    if (!requireExportEntitled(user, job, res, ensureSettings(db))) return;
     job._shop = db.shops.find(function (s) { return s.id === user.shop_id; });
     const exportJob = digitizeFor(user) ? job : Object.assign({}, job, { _hideMachineFiles: true });
     const pack = writeExports(exportJob, UPLOADS, path.join(EXPORTS, job.id));
