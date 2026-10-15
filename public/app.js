@@ -267,13 +267,8 @@ async function boot() {
   cfg = await api("/api/config");
   const me = await api("/api/me");
   if (!me.user) {
-    const m = new URLSearchParams(location.search).get("method") || sessionStorage.getItem("decoclub_start_method") || "";
-    if (methodChoices().indexOf(m) !== -1) {
-      sessionStorage.setItem("decoclub_start_method", m);
-      location.href = "/login.html?method=" + encodeURIComponent(m);
-    } else {
-      location.href = "/login.html";
-    }
+    const next = location.pathname + location.search;
+    location.replace("/login.html?next=" + encodeURIComponent(next));
     return;
   }
   user = me.user;

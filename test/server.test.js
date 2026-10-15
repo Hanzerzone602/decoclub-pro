@@ -77,10 +77,9 @@ function stop(child) {
     assert.ok(loginPage.text.indexOf("owner@anvil.local") === -1);
     assert.ok(loginPage.text.indexOf("/admin.html") === -1);
     assert.ok(loginPage.text.indexOf("/app.html") !== -1);
-    const appPage = await req(port, "GET", "/app.html");
-    assert.strictEqual(appPage.status, 200);
-    assert.ok(appPage.text.indexOf("data-view=\"make\"") !== -1);
-    assert.ok(appPage.text.indexOf("Office") !== -1);
+    const appAnon = await req(port, "GET", "/app.html");
+    assert.strictEqual(appAnon.status, 302);
+    assert.ok(String(appAnon.headers.location || "").indexOf("/login.html?next=") === 0, appAnon.headers.location);
     const appJs = await req(port, "GET", "/app.js");
     assert.ok(appJs.text.indexOf("Drop art. Vectorize. Recolor. Export.") !== -1);
     assert.ok(appJs.text.indexOf("or tap to pick a file") !== -1);
@@ -104,6 +103,10 @@ function stop(child) {
     });
     assert.strictEqual(adminSeedLogin.status, 200);
     const adminSeedCookie = String(adminSeedLogin.headers["set-cookie"] || "").split(";")[0];
+    const appPage = await req(port, "GET", "/app.html", { headers: { Cookie: adminSeedCookie } });
+    assert.strictEqual(appPage.status, 200);
+    assert.ok(appPage.text.indexOf("data-view=\"make\"") !== -1);
+    assert.ok(appPage.text.indexOf("Office") !== -1);
     const adminPreview = await req(port, "GET", "/digitize-preview.js", { headers: { Cookie: adminSeedCookie } });
     assert.strictEqual(adminPreview.status, 200);
     assert.ok(adminPreview.text.indexOf("DigitizePreview") !== -1);

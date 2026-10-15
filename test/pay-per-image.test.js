@@ -239,7 +239,7 @@ async function uploadJob(port, cookie, title) {
 
     // Free-first-image rule: logged-out is refused; first image free; second needs credits.
     const anon = await req(port, "POST", "/api/jobs/x/vectorize", { body: JSON.stringify({ colors: 2 }) });
-    assert.ok(anon.status === 401 || anon.status === 403, "anon vectorize must be refused, got " + anon.status);
+    assert.strictEqual(anon.status, 401, "anon vectorize must be refused, got " + anon.status);
     // Signup hardening: weak passwords and disposable domains are refused.
     const weak = await req(port, "POST", "/api/signup", { body: JSON.stringify({ name: "W", email: "weak@test.local", password: "abcdefgh", role: "shop" }) });
     assert.strictEqual(weak.status, 400, "letters-only password must fail");

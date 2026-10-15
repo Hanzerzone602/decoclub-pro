@@ -29,12 +29,22 @@
     (function () {
       var METHODS = ["dtf","uvdtf","uv","vinyl","laser","sticker","hat","apparel","patch","sublimation","rhinestone","sign"];
       var LABELS = { dtf: "Vectorize", uvdtf: "UV / UV-DTF", uv: "UV print-ready", vinyl: "Vinyl art", laser: "Laser-ready", sticker: "Screenprint-ready", hat: "Hat art", apparel: "Apparel art", patch: "Patch art", sublimation: "Sublimation art", rhinestone: "Rhinestone art", sign: "Sign art" };
-      var q = new URLSearchParams(location.search).get("method") || "";
+      function safeNext(raw) {
+        if (!raw || raw.charAt(0) !== "/" || raw.charAt(1) === "/" || raw.charAt(1) === "\\") return "";
+        if (raw.indexOf("\\") !== -1 || raw.indexOf("://") !== -1 || /[\r\n\t]/.test(raw) || raw.length > 512) return "";
+        return raw;
+      }
+      var params = new URLSearchParams(location.search);
+      var q = params.get("method") || "";
       var stored = sessionStorage.getItem("decoclub_start_method") || "";
       var method = METHODS.indexOf(q) !== -1 ? q : (METHODS.indexOf(stored) !== -1 ? stored : "");
+      var next = safeNext(params.get("next") || "");
+      var altQs = [];
+      if (method) altQs.push("method=" + encodeURIComponent(method));
+      if (next) altQs.push("next=" + encodeURIComponent(next));
+      if (altQs.length) document.getElementById("altAuth").href = "/signup.html?" + altQs.join("&");
       if (method) {
         sessionStorage.setItem("decoclub_start_method", method);
-        document.getElementById("altAuth").href = "/signup.html?method=" + encodeURIComponent(method);
         var mh = document.getElementById("methodHint");
         if (mh) mh.textContent = "We will open " + (LABELS[method] || method) + " in the art studio after you log in.";
       }
@@ -52,7 +62,7 @@
         const res = await fetch("/api/login", { method: "POST", credentials: "include", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ email: fd.get("email"), password: fd.get("password"), remember_me: remember }) });
         const data = await res.json();
         if (!res.ok) { document.getElementById("err").textContent = data.error; return; }
-        location.href = method ? "/app.html?method=" + encodeURIComponent(method) : "/app.html";
+        location.href = next || (method ? "/app.html?method=" + encodeURIComponent(method) : "/app.html");
       };
     })();
   </script>

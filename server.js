@@ -531,6 +531,22 @@ function enabledServiceNames(user) {
   return list;
 }
 
+/** Studio tool calls need a signed-in account. Logged-out callers get 401; signed-in checks stay as they are. */
+function studioToolApi(method, pth) {
+  if (method === "POST" && pth === "/api/jobs") return true;
+  if (method === "POST" && /^\/api\/jobs\/[^/]+\/artwork$/.test(pth)) return true;
+  if (method === "POST" && /^\/api\/jobs\/[^/]+\/artops$/.test(pth)) return true;
+  if (method === "POST" && /^\/api\/jobs\/[^/]+\/vectorize$/.test(pth)) return true;
+  if (method === "POST" && /^\/api\/jobs\/[^/]+\/corel-import$/.test(pth)) return true;
+  if (method === "POST" && /^\/api\/jobs\/[^/]+\/recolor$/.test(pth)) return true;
+  if (method === "POST" && /^\/api\/jobs\/[^/]+\/halftone$/.test(pth)) return true;
+  if (method === "POST" && /^\/api\/jobs\/[^/]+\/halftone\/preview$/.test(pth)) return true;
+  if (method === "GET" && pth === "/api/halftone/styles") return true;
+  if (method === "GET" && /^\/api\/export\/[^/]+(?:\/[^/]+)?$/.test(pth)) return true;
+  if (/^\/api\/(?:guest|trial|anonymous)(?:\/|$)/.test(pth)) return true;
+  return false;
+}
+
 function requireProduce(user, res) {
   if (canProduce(user)) return true;
   if (!features.membershipEnabled()) {
@@ -1687,6 +1703,10 @@ async function handleApi(req, res, url) {
 
   if (/digitiz|embroider/i.test(pth)) {
     if (forbidDigitize(user, res)) return;
+  }
+
+  if (!user && studioToolApi(method, pth)) {
+    return json(res, 401, { error: "Sign in required" });
   }
 
   if (pth === "/api/config" && method === "GET") {
@@ -3385,11 +3405,21 @@ function serveStatic(req, res, url) {
   let rel = decodeURIComponent(url.pathname);
   // Trailing slash → bare path so /admin/ and /login/ match aliases like /admin and /login.
   if (rel.length > 1 && rel.charAt(rel.length - 1) === "/") rel = rel.slice(0, -1);
+  const requested = (rel === "" ? "/" : rel) + (url.search || "");
   if (rel === "/" || rel === "") rel = "/index.html";
+  const viewer = currentUser(req, load());
   const digitizeAsset = rel === "/digitize-demo.html" || rel === "/digitize-preview.js" || rel === "/digitize-admin.js";
-  if (digitizeAsset && !digitizeFor(currentUser(req, load()))) return send(res, 404, "Not found");
+  if (digitizeAsset && !digitizeFor(viewer)) return send(res, 404, "Not found");
   const ALIAS = { "/login": "/login.html", "/app": "/app.html", "/admin": "/admin.html", "/signup": "/signup.html", "/start": "/start.html", "/contact": "/contact.html" };
   if (ALIAS[rel]) rel = ALIAS[rel];
+  // Studio shell and tool entry require an account. Public pages stay on disk.
+  if ((rel === "/app.html" || rel === "/start.html") && !viewer) {
+    return send(res, 302, "", {
+      Location: "/login.html?next=" + encodeURIComponent(requested),
+      "Cache-Control": "private, no-store",
+      Vary: "Cookie",
+    });
+  }
   if (rel.indexOf("/uploads/") === 0) {
     const file = path.join(UPLOADS, path.basename(rel));
     if (!fs.existsSync(file)) return send(res, 404, "Not found");
@@ -3408,7 +3438,7 @@ function serveStatic(req, res, url) {
   if (!fs.existsSync(file) || fs.statSync(file).isDirectory()) return send(res, 404, "Not found");
   const ext = path.extname(file).toLowerCase();
   const headers = { "Content-Type": MIME[ext] || "application/octet-stream" };
-  if (digitizeAsset) {
+  if (digitizeAsset || rel === "/app.html" || rel === "/start.html") {
     headers["Cache-Control"] = "private, no-store";
     headers["Vary"] = "Cookie";
   } else if (ext === ".html" || ext === ".js" || ext === ".css") {

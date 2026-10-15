@@ -30,11 +30,12 @@
       qsParts.push("station=art");
       if (tool) qsParts.push("tool=" + encodeURIComponent(tool));
       var qs = qsParts.length ? ("?" + qsParts.join("&")) : "";
-      fetch("/api/me").then(function (r) { return r.json(); }).then(function (data) {
+      var back = "/login.html?next=" + encodeURIComponent(location.pathname + location.search);
+      fetch("/api/me", { credentials: "include" }).then(function (r) { return r.json(); }).then(function (data) {
         if (data.user) location.replace("/app.html" + qs);
-        else location.replace("/signup.html" + (method ? "?method=" + encodeURIComponent(method) : ""));
+        else location.replace(back);
       }).catch(function () {
-        location.replace("/signup.html" + (method ? "?method=" + encodeURIComponent(method) : ""));
+        location.replace(back);
       });
     })();
   </script>

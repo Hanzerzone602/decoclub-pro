@@ -79,11 +79,19 @@ function cookieOf(res) {
   const s = startServer({ PORT: String(port), NODE_ENV: "production", ALLOW_DEMO: "0", FEATURE_DIGITIZE: "1", FEATURE_MEMBERSHIP: "1" });
   try {
     await waitHealth(port);
-    const pages = ["/", "/index.html", "/signup.html", "/login.html", "/start.html", "/app.html", "/app.js", "/styles.css", "/api/config"];
+    const pages = ["/", "/index.html", "/signup.html", "/login.html", "/app.js", "/styles.css", "/api/config"];
+    const studioPages = ["/start.html", "/app.html"];
     for (const p of pages) {
       const r = await req(port, "GET", p);
       assert.strictEqual(r.status, 200, p + " " + r.status);
       assertClean("anon " + p, r.text);
+    }
+    for (const p of studioPages) {
+      const r = await req(port, "GET", p);
+      assert.strictEqual(r.status, 302, "anon studio " + p + " " + r.status);
+      const loc = String(r.headers.location || "");
+      assert.ok(loc.indexOf("/login.html?next=") === 0, loc);
+      assertClean("anon " + p, r.text + " " + loc);
     }
     const anonJson = ["/api/me", "/api/shop", "/api/catalog", "/api/services", "/api/palettes", "/health"];
     for (const p of anonJson) {
@@ -114,7 +122,7 @@ function cookieOf(res) {
     assert.strictEqual(signup.status, 200, JSON.stringify(signup.json));
     const cookie = cookieOf(signup);
     assert.ok(cookie.indexOf("decoclub=") === 0);
-    for (const p of pages) {
+    for (const p of pages.concat(studioPages)) {
       const r = await req(port, "GET", p, { headers: { Cookie: cookie } });
       assert.strictEqual(r.status, 200, "shop " + p);
       assertClean("shop " + p, r.text);
