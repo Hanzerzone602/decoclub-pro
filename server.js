@@ -2368,6 +2368,11 @@ async function handleApi(req, res, url) {
         creditConsumed: !!creditUse.consumed,
       });
     } catch (err) {
+      if (err && err.status === 413) {
+        return json(res, 413, {
+          error: String(err.message || "That size and LPI would need too many dots. Lower the LPI or print size."),
+        });
+      }
       return json(res, 400, { error: clientFacingError(err, "Could not build halftone") });
     }
   }
