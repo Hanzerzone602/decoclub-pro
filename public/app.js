@@ -6,7 +6,7 @@ const STAT_LABEL = { new: "New", art_in: "Art in", mockup: "Mockup", priced: "Pr
 const METHODS = ["dtf","uvdtf","uv","vinyl","laser","sticker","screen","hat","apparel","patch","sublimation","rhinestone","sign"];
 const METHOD_LABELS = {
   dtf: "DTF", uvdtf: "UV DTF", uv: "UV print", vinyl: "Vinyl", laser: "Laser",
-  sticker: "Stickers", screen: "Screen", hat: "Hats", apparel: "Apparel", patch: "Patches",
+  sticker: "Stickers", screen: "Spot color", hat: "Hats", apparel: "Apparel", patch: "Patches",
   sublimation: "Sublimation", rhinestone: "Rhinestone", sign: "Signs",
 };
 const METHOD_OUTCOMES = {
@@ -982,7 +982,7 @@ async function fillArt(el, job, shopControls) {
             <label>Angle <input type="number" id="htAngle" min="0" max="90" step="1" value="45" title="Screen angle degrees" /></label>
             <label>Contrast <input type="number" id="htContrast" min="0.25" max="2.5" step="0.05" value="1" title="Dot gain / punch" /></label>
             <label class="ht-ko" title="Print knockout — transparent plate, ink marks only (true HT / DTF)"><input type="checkbox" id="htKnockout" checked /> Knockout (transparent)</label>
-            <label class="ht-ink-toggle" title="Optional single-ink override for screen / one-color shops"><input type="checkbox" id="htUseInk" /> Use one ink color</label>
+            <label class="ht-ink-toggle" title="Optional single-ink override for one-color shops"><input type="checkbox" id="htUseInk" /> Use one ink color</label>
             <label id="htInkRow" class="ht-ink-row" hidden>Ink override <input type="color" id="htColor" value="#000000" title="Ink override (optional)" /></label>
           </div>
           <p class="muted ht-color-hint" id="htColorHint">Art colors (DTF) — each mark keeps real artwork color; spot size follows tone.</p>
