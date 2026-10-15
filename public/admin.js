@@ -67,7 +67,7 @@ async function renderOverview() {
       <div class="admin-stat"><div class="n">${c.disabled_users || 0}</div><div class="l">Disabled</div></div>
     </div>
     <div class="row" style="margin-top:8px">
-      <span class="pill ${sys.billing_configured ? "ok" : "off"}">Stripe ${sys.billing_configured ? "configured" : "not configured"}</span>
+      <span class="pill ${sys.billing_configured ? "ok" : "off"}">Square ${sys.billing_configured ? "configured" : "not configured"}</span>
       <span class="pill off">Imagine off</span>
       <span class="pill off">Pro vector off</span>
       <span class="pill ${sys.vai_trace ? "ok" : "warn"}">vai-trace ${sys.vai_trace ? "ready" : "missing"}</span>
@@ -105,21 +105,56 @@ async function grant(id, months) {
   render();
 }
 async function grantHtCredits(id, n) {
+  const reason = (prompt("Reason for +" + n + " Halftone credits (required):") || "").trim();
+  if (!reason) return alert("A reason is required");
   await api("/api/admin/users/" + id + "/halftone-credits", {
     method: "POST",
     headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ add: n }),
+    body: JSON.stringify({ add: n, reason: reason }),
   });
   render();
+}
+async function openCredits(id, email) {
+  const panel = $("#creditPanel");
+  if (!panel) return;
+  const { history } = await api("/api/admin/users/" + id + "/credit-history");
+  panel.innerHTML = `<div class="card" style="margin-top:16px">
+    <h2 style="margin:0 0 8px">Credits · ${escapeHtml(email)}</h2>
+    <div class="row" style="gap:8px;flex-wrap:wrap;align-items:end">
+      <label>Service <select id="crSvc"><option value="vector-credits">Vectorize</option><option value="halftone-credits">Halftones</option></select></label>
+      <label>Add (negative removes) <input id="crN" type="number" step="1" value="1" style="width:90px"></label>
+      <label style="flex:1">Reason <input id="crReason" type="text" maxlength="300" required placeholder="e.g. QA test, goodwill, refund by hand" style="width:100%"></label>
+      <button class="btn" id="crGo">Apply</button>
+    </div>
+    <h3 style="margin:16px 0 6px">History</h3>
+    <table class="admin-table"><thead><tr><th>When</th><th>Service</th><th>Change</th><th>Balance</th><th>Source</th><th>Admin</th><th>Reason</th></tr></thead>
+    <tbody>${(history || []).map((r) => `<tr><td class="mono">${fmtDate(r.at)}</td><td>${r.service === "halftones" ? "Halftones" : "Vectorize"}</td><td class="mono">${r.delta > 0 ? "+" : ""}${r.delta}</td><td class="mono">${r.balance == null ? "—" : r.balance}</td><td>${escapeHtml(r.source)}</td><td class="mono">${r.admin_id ? escapeHtml(r.admin_id.slice(0, 8)) : "—"}</td><td>${escapeHtml(r.reason)}</td></tr>`).join("") || `<tr><td colspan="7" class="muted">No credit changes yet</td></tr>`}</tbody></table>
+  </div>`;
+  $("#crGo").onclick = async () => {
+    const n = Math.trunc(Number($("#crN").value) || 0);
+    if (!n) return alert("Enter a non-zero amount");
+    if (!$("#crReason").value.trim()) return alert("A reason is required");
+    await api("/api/admin/users/" + id + "/" + $("#crSvc").value, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ add: n, reason: $("#crReason").value.trim() }),
+    });
+    await renderUsers();
+    openCredits(id, email);
+  };
+  panel.scrollIntoView({ behavior: "smooth" });
 }
 async function setHtCredits(id) {
   const v = prompt("Set Halftone credits (integer ≥ 0):");
   if (v === null) return;
-  const n = Math.max(0, Math.floor(Number(v) || 0));
+  if (!/^\d+$/.test(String(v).trim())) return alert("Enter a whole number ≥ 0");
+  const n = Number(String(v).trim());
+  const reason = (prompt("Reason (required):") || "").trim();
+  if (!reason) return alert("A reason is required");
   await api("/api/admin/users/" + id + "/halftone-credits", {
     method: "POST",
     headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ credits: n }),
+    body: JSON.stringify({ credits: n, reason: reason }),
   });
   render();
 }
@@ -183,6 +218,7 @@ async function renderUsers() {
         <td class="mono">${u.plan_expires ? fmtDay(u.plan_expires) : "—"}</td>
         <td>${u.disabled ? '<span class="pill warn">disabled</span>' : '<span class="pill ok">active</span>'}</td>
         <td class="actions">
+          <button class="btn small" data-credits="${u.id}" data-email="${escapeHtml(u.email)}">Credits…</button>
           ${u.role === "admin" ? `
             <button class="btn ghost small" data-htadd="${u.id}" data-n="1">+1 HT</button>
             <button class="btn ghost small" data-htadd="${u.id}" data-n="10">+10 HT</button>
@@ -201,7 +237,9 @@ async function renderUsers() {
             <button class="btn ghost small" data-del="${u.id}" data-email="${escapeHtml(u.email)}">Delete</button>`}
         </td>
       </tr>`).join("")}</tbody>
-    </table>`;
+    </table>
+    <div id="creditPanel"></div>`;
+  main.querySelectorAll("[data-credits]").forEach((b) => { b.onclick = () => openCredits(b.dataset.credits, b.dataset.email); });
   $("#userSearch").onclick = () => renderUsers();
   $("#userq").onkeydown = (e) => { if (e.key === "Enter") renderUsers(); };
   main.querySelectorAll("[data-grant]").forEach((b) => { b.onclick = () => grant(b.dataset.grant, Number(b.dataset.m)); });
@@ -376,8 +414,8 @@ async function renderSettings() {
   const settings = data.settings;
   main.innerHTML = `
     <h1 style="font-size:28px;margin-top:0">Membership &amp; services pricing</h1>
-    <p class="muted">Trial length applies to new shop signups. Membership prices in cents (Shop $79, Studio $149). Halftones is a separate service — included with Studio / admin, or buy standalone ($3 / image · $20 for 10). Stripe checkout only works when billing env is configured — we do not invent fake Stripe. Credits are always grantable here for testing.</p>
-    <p><span class="pill ${data.billing_configured ? "ok" : "off"}">Stripe ${data.billing_configured ? "configured" : "not configured"}</span>
+    <p class="muted">Trial length applies to new shop signups. Membership prices in cents (Shop $79, Studio $149). Halftones is a separate service — included with Studio / admin, or buy standalone ($3 / image · $20 for 10). Square checkout only works when billing env is configured. Credits are always grantable here for testing.</p>
+    <p><span class="pill ${data.billing_configured ? "ok" : "off"}">Square ${data.billing_configured ? "configured" : "not configured"}</span>
        <span class="pill ok">Halftones service</span>
        <span class="pill off">Imagine off</span>
        <span class="pill off">Pro vector off</span></p>
@@ -428,7 +466,7 @@ async function renderSystem() {
     <table>
       <tbody>
         <tr><td>Health</td><td><span class="pill ok">ok</span></td></tr>
-        <tr><td>Stripe / billing configured</td><td><span class="pill ${data.billing_configured ? "ok" : "off"}">${data.billing_configured ? "yes" : "no"}</span> <span class="muted">(boolean only — no secrets)</span></td></tr>
+        <tr><td>Square / billing configured</td><td><span class="pill ${data.billing_configured ? "ok" : "off"}">${data.billing_configured ? "yes" : "no"}</span> <span class="muted">(boolean only — no secrets)</span></td></tr>
         <tr><td>Imagine / AI</td><td><span class="pill off">false</span></td></tr>
         <tr><td>Pro vector</td><td><span class="pill off">false</span></td></tr>
         <tr><td>vai-trace</td><td><span class="pill ${data.vai_trace ? "ok" : "warn"}">${data.vai_trace ? "available" : "unavailable"}</span></td></tr>

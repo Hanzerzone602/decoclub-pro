@@ -51,10 +51,11 @@ const { digitizeJobCached, getDigitizeCache, ensureStitchFiles, pickPrepPython }
 const { stonesForJob } = require("./lib/stones");
 const features = require("./lib/features");
 const {
-  loadEnvFile, createCheckoutSession, billingConfigured,
-  verifyStripeSignature, applyStripeEvent,
+  loadEnvFile,
   isCreditProduct, isKnownProduct, grantHalftoneCredits, grantVectorCredits,
 } = require("./lib/stripe");
+const { recordCredit, historyFor } = require("./lib/ledger");
+const { billingConfigured, verifySquareSignature, createSquareCheckout, applySquareEvent } = require("./lib/square");
 
 const ROOT = __dirname;
 loadEnvFile(ROOT);
@@ -250,6 +251,7 @@ function recordFreeClaim(user, service) {
   if (ctx && ctx.db) {
     if (!ctx.db.free_claims) ctx.db.free_claims = [];
     ctx.db.free_claims.push({ user_id: user.id, device: ctx.device || null, ip: ctx.ipHash || null, at: user.free_image_at, service: service });
+    recordCredit(ctx.db, { user_id: user.id, service: service, delta: 0, source: "free", reason: "Free image used" });
   }
 }
 
@@ -1101,6 +1103,30 @@ function rewriteVectorSvg(job) {
   delete job.vector_eps;
 }
 
+/** Admin credit change (add | set | credits) with a ledger row. Negative add removes. */
+function adminSetCredits(db, admin, u, service, field, body) {
+  const before = Math.max(0, Math.floor(Number(u[field]) || 0));
+  const reason = typeof body.reason === "string" ? body.reason.trim() : "";
+  if (!reason) return { error: "Reason is required" };
+  const isInt = function (v) { return (typeof v === "number" || (typeof v === "string" && /^-?\d+$/.test(v.trim()))) && Number.isInteger(Number(v)); };
+  let after;
+  if (body.add != null) {
+    if (!isInt(body.add)) return { error: "add must be an integer" };
+    const n = Number(body.add);
+    if (n < -10000 || n > 10000) return { error: "add must be between -10000 and 10000" };
+    if (before + n < 0) return { error: "Cannot remove more than the current balance (" + before + ")" };
+    after = before + n;
+  } else if (body.set != null || body.credits != null) {
+    const v = body.set != null ? body.set : body.credits;
+    if (!isInt(v)) return { error: "set must be an integer" };
+    after = Number(v);
+    if (after < 0 || after > 100000) return { error: "set must be between 0 and 100000" };
+  } else return { error: "Pass add, set, or credits" };
+  return { apply: function () {
+    u[field] = after;
+    return after === before ? null : recordCredit(db, { user_id: u.id, service: service, delta: after - before, balance: after, source: "admin", admin_id: admin.id, reason: reason });
+  } };
+}
 function requireAdmin(user, res) {
   if (!user || user.role !== "admin") {
     json(res, 403, { error: "Admin required" });
@@ -1940,8 +1966,9 @@ async function handleApi(req, res, url) {
       return json(res, 404, { error: "Memberships are not offered. Buy image credits instead." });
     }
     if (!billingConfigured()) return json(res, 501, { error: "Billing not configured" });
-    if (pth === "/api/plan") return json(res, 400, { error: "Use checkout. Plan updates after Stripe webhook." });
+    if (pth === "/api/plan") return json(res, 400, { error: "Use checkout. Credits are added after the Square webhook." });
     if (!isKnownProduct(product)) return json(res, 400, { error: "Unknown plan or product" });
+    if (!isCreditProduct(product)) return json(res, 400, { error: "Only image credits can be bought right now." });
     try {
       const st = ensureSettings(db);
       const opts = {};
@@ -1949,20 +1976,24 @@ async function handleApi(req, res, url) {
         opts.amountCents = productAmountCents(product, st);
         opts.quantity = body.quantity;
       }
-      const session = await createCheckoutSession(product, user, originOf(req), opts);
-      return json(res, 200, { user: publicUser(user), checkoutUrl: session.checkoutUrl, mode: session.mode, product: session.product, plan: session.plan, message: "Redirecting to Stripe Checkout" });
+      const session = await createSquareCheckout(db, product, user, originOf(req), opts);
+      save(db);
+      return json(res, 200, { user: publicUser(user), checkoutUrl: session.checkoutUrl, mode: session.mode, product: session.product, plan: null, message: "Redirecting to Square Checkout" });
     } catch (err) {
       const code = err.status || 502;
       return json(res, code, { error: code === 501 ? "Billing not configured" : (IS_PROD ? "Billing error" : err.message) });
     }
   }
-  if (pth === "/api/billing/webhook" && method === "POST") {
+  if (pth === "/api/billing/square/webhook" && method === "POST") {
     const raw = await readBody(req);
-    if (!billingConfigured() || !process.env.STRIPE_WEBHOOK_SECRET) return json(res, 501, { error: "Billing not configured" });
-    if (!verifyStripeSignature(raw, req.headers["stripe-signature"], process.env.STRIPE_WEBHOOK_SECRET)) return json(res, 400, { error: "Invalid signature" });
-    try { applyStripeEvent(db, JSON.parse(raw.toString("utf8"))); save(db); }
+    if (!billingConfigured()) return json(res, 501, { error: "Billing not configured" });
+    if (!verifySquareSignature(raw, req.headers["x-square-hmacsha256-signature"], process.env.SQUARE_WEBHOOK_SIGNATURE_KEY, process.env.SQUARE_WEBHOOK_URL)) return json(res, 401, { error: "Invalid signature" });
+    let result;
+    try { result = applySquareEvent(db, JSON.parse(raw.toString("utf8"))); save(db); }
     catch (e) { return json(res, 400, { error: "Invalid payload" }); }
-    return json(res, 200, { received: true });
+    // Not processed yet (e.g. refund before its payment): non-2xx so Square retries; event is not marked seen.
+    if (result === "retry_later") return json(res, 409, { received: false, result: result });
+    return json(res, 200, { received: true, result: result });
   }
   if (pth === "/api/clients" && method === "GET") {
     if (!canRunFloor(user)) return json(res, 403, { error: "Shop login required" });
@@ -3228,6 +3259,12 @@ async function handleApi(req, res, url) {
     const u = db.users.find(function (x) { return x.id === delUser[1]; });
     if (!u) return json(res, 404, { error: "User not found" });
     const body = parseJsonBody(await readBody(req));
+    // Validate credit changes before mutating anything.
+    const creditOps = [];
+    if (body.halftone_credits != null) creditOps.push(adminSetCredits(db, user, u, "halftones", "halftone_credits", { set: body.halftone_credits, reason: body.reason }));
+    if (body.vector_credits != null) creditOps.push(adminSetCredits(db, user, u, "vectorize", "vector_credits", { set: body.vector_credits, reason: body.reason }));
+    const badCredit = creditOps.find(function (c) { return c.error; });
+    if (badCredit) return json(res, 400, { error: badCredit.error });
     if (body.role === "shop" || body.role === "client") {
       if (u.role === "admin") return json(res, 400, { error: "Cannot change admin role" });
       u.role = body.role;
@@ -3257,12 +3294,7 @@ async function handleApi(req, res, url) {
       if (u.email_verified) { u.email_verified_at = new Date().toISOString(); u.verify_token_hash = null; u.verify_expires = null; }
     }
     if (body.name) u.name = String(body.name).trim();
-    if (body.halftone_credits != null) {
-      u.halftone_credits = Math.max(0, Math.floor(Number(body.halftone_credits) || 0));
-    }
-    if (body.vector_credits != null) {
-      u.vector_credits = Math.max(0, Math.floor(Number(body.vector_credits) || 0));
-    }
+    for (const c of creditOps) c.apply();
     save(db);
     return json(res, 200, { user: publicAdminUser(u) });
   }
@@ -3272,17 +3304,15 @@ async function handleApi(req, res, url) {
     const u = db.users.find(function (x) { return x.id === htCreditPath[1]; });
     if (!u) return json(res, 404, { error: "User not found" });
     const body = parseJsonBody(await readBody(req));
-    if (body.credits != null) {
-      u.halftone_credits = Math.max(0, Math.floor(Number(body.credits) || 0));
-    } else if (body.add != null) {
-      grantHalftoneCredits(u, body.add);
-    } else if (body.set != null) {
-      u.halftone_credits = Math.max(0, Math.floor(Number(body.set) || 0));
-    } else {
-      return json(res, 400, { error: "Pass credits, set, or add" });
-    }
+    const r = adminSetCredits(db, user, u, "halftones", "halftone_credits", body);
+    if (r.error) return json(res, 400, { error: r.error });
+    const entry = r.apply();
     save(db);
-    return json(res, 200, { user: publicAdminUser(u) });
+    return json(res, 200, { user: publicAdminUser(u), entry: entry });
+  }
+  if (htCreditPath && method === "GET") {
+    if (!requireAdmin(user, res)) return;
+    return json(res, 200, { history: historyFor(db, htCreditPath[1]).filter(function (r) { return r.service === "halftones"; }) });
   }
   const vecCreditPath = pth.match(/^\/api\/admin\/users\/([^/]+)\/vector-credits$/);
   if (vecCreditPath && method === "POST") {
@@ -3290,17 +3320,20 @@ async function handleApi(req, res, url) {
     const u = db.users.find(function (x) { return x.id === vecCreditPath[1]; });
     if (!u) return json(res, 404, { error: "User not found" });
     const body = parseJsonBody(await readBody(req));
-    if (body.credits != null) {
-      u.vector_credits = Math.max(0, Math.floor(Number(body.credits) || 0));
-    } else if (body.add != null) {
-      grantVectorCredits(u, body.add);
-    } else if (body.set != null) {
-      u.vector_credits = Math.max(0, Math.floor(Number(body.set) || 0));
-    } else {
-      return json(res, 400, { error: "Pass credits, set, or add" });
-    }
+    const r = adminSetCredits(db, user, u, "vectorize", "vector_credits", body);
+    if (r.error) return json(res, 400, { error: r.error });
+    const entry = r.apply();
     save(db);
-    return json(res, 200, { user: publicAdminUser(u) });
+    return json(res, 200, { user: publicAdminUser(u), entry: entry });
+  }
+  if (vecCreditPath && method === "GET") {
+    if (!requireAdmin(user, res)) return;
+    return json(res, 200, { history: historyFor(db, vecCreditPath[1]).filter(function (r) { return r.service === "vectorize"; }) });
+  }
+  const ledgerPath = pth.match(/^\/api\/admin\/users\/([^/]+)\/credit-history$/);
+  if (ledgerPath && method === "GET") {
+    if (!requireAdmin(user, res)) return;
+    return json(res, 200, { history: historyFor(db, ledgerPath[1]) });
   }
   const planPath = pth.match(/^\/api\/admin\/users\/([^/]+)\/plan$/);
   if (planPath && method === "POST") {

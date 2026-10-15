@@ -313,7 +313,7 @@ async function uploadJob(port, cookie, title) {
     const dupJob = await uploadJob(port, dupCk, "dup");
     const dupRun = await req(port, "POST", "/api/jobs/" + dupJob.id + "/vectorize", { headers: { Cookie: dupCk }, body: JSON.stringify({ colors: 2, maxEdge: 96 }) });
     assert.strictEqual(dupRun.status, 402);
-    await req(port, "POST", "/api/admin/users/" + su2.json.user.id + "/vector-credits", { headers: { Cookie: adCk0 }, body: JSON.stringify({ add: 1 }) });
+    await req(port, "POST", "/api/admin/users/" + su2.json.user.id + "/vector-credits", { headers: { Cookie: adCk0 }, body: JSON.stringify({ add: 1, reason: "test grant" }) });
     const dupPaid = await req(port, "POST", "/api/jobs/" + dupJob.id + "/vectorize", { headers: { Cookie: dupCk }, body: JSON.stringify({ colors: 2, maxEdge: 96 }) });
     assert.strictEqual(dupPaid.status, 200, "paid still works on a used device");
     assert.ok(!dupPaid.json.job.free_image, "paid job not watermarked");
@@ -343,7 +343,7 @@ async function uploadJob(port, cookie, title) {
     const adminCk = cookieFrom(adminLogin);
     const grantV = await req(port, "POST", "/api/admin/users/" + shopId + "/vector-credits", {
       headers: { Cookie: adminCk },
-      body: JSON.stringify({ add: 1 }),
+      body: JSON.stringify({ add: 1, reason: "test grant" }),
     });
     assert.strictEqual(grantV.status, 200, JSON.stringify(grantV.json));
     assert.strictEqual(grantV.json.user.vector_credits, 1);
@@ -385,7 +385,7 @@ async function uploadJob(port, cookie, title) {
     assert.strictEqual(apply0.json.code, "halftone_credits_required");
     const grantH = await req(port, "POST", "/api/admin/users/" + shopId + "/halftone-credits", {
       headers: { Cookie: adminCk },
-      body: JSON.stringify({ add: 1 }),
+      body: JSON.stringify({ add: 1, reason: "test grant" }),
     });
     assert.strictEqual(grantH.status, 200, JSON.stringify(grantH.json));
     const apply1 = await req(port, "POST", "/api/jobs/" + job.id + "/halftone", {

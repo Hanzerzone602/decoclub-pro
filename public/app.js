@@ -1647,7 +1647,7 @@ async function fillArt(el, job, shopControls) {
       if (note) {
         note.textContent = cfg.billing
           ? (included ? "" : "Checkout grants credits after payment webhook.")
-          : (included ? "" : "Billing off — ask admin to grant credits, or wait for Stripe.");
+          : (included ? "" : "Billing off — ask admin to grant credits, or wait for checkout.");
       }
     }
     async function buyHalftoneProduct(product) {
@@ -2519,7 +2519,7 @@ async function renderSettings() {
   main.innerHTML = `
     <h1 style="font-size:28px;margin-top:0">Shop settings</h1>
     <p class="muted">${escapeHtml(user.email)} · plan <strong>${user.plan}</strong>${user.planExpires ? " · trial until " + user.planExpires : ""}</p>
-    ${billed === "ok" ? `<p class="ok">Stripe returned success. Plan updates when the webhook lands.</p>` : ""}
+    ${billed === "ok" ? `<p class="ok">Square returned success. Credits appear once Square confirms the payment.</p>` : ""}
     ${canFloor() ? `
       <form class="form" id="sf">
         <label>Shop name (proofs, tickets, booth poster)</label>
@@ -2534,7 +2534,7 @@ async function renderSettings() {
       </form>
       <h3>Billing</h3>
       ${paywallNote()}
-      <p class="muted" id="billnote">${cfg.billing ? "Stripe is configured. Checkout does not mark the shop paid until the webhook. Halftone packs grant credits (not a plan change)." : "Billing not configured — STRIPE_SECRET_KEY is unset. Checkout returns 501. We will not fake a paid plan. Admin still runs the floor for free and can grant Halftone credits."}</p>
+      <p class="muted" id="billnote">${cfg.billing ? "Square is configured. Credits are added only after Square confirms payment." : "Billing not configured — Square env is unset. Checkout returns 501. Admin can still grant credits."}</p>
       <div class="cta-row">
         <button class="btn ghost" data-plan="trial">Trial</button>
         <button class="btn ghost" data-plan="shop">Shop $79</button>
