@@ -16169,6 +16169,601 @@ def _speed_from_cache(cache_dir, path, colors, inches, mode, merge=None, keep=No
     return svg, meta
 
 
+def is_hard_edged_lowres(rgb, alpha=None) -> bool:
+    """Small few-colour art with almost no anti-aliased fringe.
+
+    A 4× upsample of this kind of bitmap turns each pixel stair into a long
+    straight edge, and potrace draws a scallop per tread. Soft-AA logos,
+    photos, and multi-colour marks stay on the ordinary path. The decision
+    uses only the raster: palette size, step softness, and artboard size.
+    """
+    src = np.asarray(rgb)
+    if src.ndim != 3 or src.shape[2] < 3:
+        return False
+    h, w = int(src.shape[0]), int(src.shape[1])
+    # Same cutoff as the logo 4× upsample. Larger marks are not this defect.
+    if max(h, w) >= 400 or max(h, w) < 16:
+        return False
+    src = src[:, :, :3]
+    if alpha is not None:
+        al = np.asarray(alpha)
+        if al.shape[:2] == (h, w) and int((al < 250).sum()) > 0:
+            a = np.clip(al.astype(np.float32) / 255.0, 0.0, 1.0)
+            comp = src.astype(np.float32) * a[:, :, None] + 255.0 * (1.0 - a[:, :, None])
+            src = np.clip(np.round(comp), 0, 255).astype(np.uint8)
+    n_exact = unique_color_bins(src, 0)
+    if n_exact > 80 or n_exact < 2:
+        return False
+    if junk_raster_score(src) >= 12.0:
+        return False
+    diff = src.astype(np.int16)
+    hard = 0
+    soft = 0
+    for axis in (0, 1):
+        step = np.abs(np.diff(diff, axis=axis)).sum(axis=2)
+        hard += int((step >= 96).sum())
+        soft += int(((step >= 20) & (step < 96)).sum())
+    if hard < 8:
+        return False
+    if soft / float(hard + soft) > 0.18:
+        return False
+    flat = src.reshape(-1, 3)
+    cols, cnt = np.unique(flat, axis=0, return_counts=True)
+    order = np.argsort(-cnt)
+    centers = []
+    weights = []
+    area = float(h * w)
+    for i in order:
+        c = cols[i].astype(np.int16)
+        k = int(cnt[i])
+        if centers:
+            d = np.abs(np.stack(centers).astype(np.int16) - c).sum(axis=1)
+            j = int(np.argmin(d))
+            if int(d[j]) <= 36:
+                weights[j] += k
+                continue
+        centers.append(c)
+        weights.append(k)
+    # A text crumb still counts; a 10-ink mark does not.
+    dominant = sum(1 for wgt in weights if wgt >= max(24.0, 0.004 * area))
+    if dominant < 1 or dominant > 6:
+        return False
+    return True
+
+
+def drop_white_boundary_specks(assign, palette, src_rgb, alpha=None):
+    """Drop tiny white components that sit on the outer ink edge.
+
+    A stair notch can be promoted to white ink even though the source has no
+    white region there. Real interior white (a ring hole, a letter counter)
+    overlaps a source white region that is not border-connected, and stays.
+    """
+    a = np.array(assign, dtype=np.int32, copy=True)
+    if a.ndim != 2 or a.size == 0 or not palette:
+        return a
+    h, w = a.shape
+    src = np.asarray(src_rgb)
+    if src.ndim != 3 or src.shape[2] < 3:
+        return a
+    src = src[:, :, :3]
+    if src.shape[:2] != (h, w):
+        src = cv2.resize(src, (w, h), interpolation=cv2.INTER_NEAREST)
+    if alpha is None:
+        al_ok = np.ones((h, w), dtype=bool)
+    else:
+        al = np.asarray(alpha)
+        if al.shape[:2] != (h, w):
+            al = cv2.resize(al.astype(np.uint8), (w, h), interpolation=cv2.INTER_NEAREST)
+        al_ok = np.asarray(al) >= 28
+    lab = to_lab(src)
+    chroma = np.hypot(lab[:, :, 1] - 128.0, lab[:, :, 2] - 128.0)
+    white_like = (lab[:, :, 0] >= 220.0) & (chroma < 14.0) & al_ok
+    m = white_like.astype(np.uint8)
+    _n, cc = cv2.connectedComponents(m, connectivity=8)
+    border = set(int(x) for x in np.unique(cc[0, :]) if int(x))
+    border.update(int(x) for x in np.unique(cc[h - 1, :]) if int(x))
+    border.update(int(x) for x in np.unique(cc[:, 0]) if int(x))
+    border.update(int(x) for x in np.unique(cc[:, w - 1]) if int(x))
+    interior = white_like.copy()
+    for b in border:
+        interior[cc == b] = False
+    if int(interior.sum()) > 0:
+        interior = cv2.dilate(interior.astype(np.uint8), np.ones((3, 3), np.uint8)) > 0
+    else:
+        interior = np.zeros((h, w), dtype=bool)
+    paper8 = cv2.dilate((a < 0).astype(np.uint8), np.ones((3, 3), np.uint8)) > 0
+    limit = max(48, int(round(0.002 * h * w)))
+    for i, col in enumerate(palette):
+        if i >= a.max() + 1 and int((a == i).sum()) == 0:
+            continue
+        if not _ink_is_white(col):
+            continue
+        mask = (a == i).astype(np.uint8)
+        if int(mask.sum()) == 0:
+            continue
+        nn, labc, stats, _ = cv2.connectedComponentsWithStats(mask, connectivity=8)
+        for ci in range(1, nn):
+            area = int(stats[ci, cv2.CC_STAT_AREA])
+            if area <= 0 or area >= limit:
+                continue
+            comp = labc == ci
+            if int((comp & interior).sum()) * 2 >= area:
+                continue
+            if not np.any(paper8[comp]):
+                continue
+            a[comp] = -1
+    return a
+
+
+def _label_trace_factor(assign_shape, src_hw, up_scale) -> int:
+    """Integer scale of `assign` over the original artboard, or 1."""
+    try:
+        f = int(up_scale)
+    except (TypeError, ValueError):
+        return 1
+    if f < 2:
+        return 1
+    ah, aw = int(assign_shape[0]), int(assign_shape[1])
+    sh, sw = int(src_hw[0]), int(src_hw[1])
+    if sh < 2 or sw < 2:
+        return 1
+    if ah == sh * f and aw == sw * f:
+        return f
+    return 1
+
+
+def _majority_downsample_labels(assign, factor):
+    """Block vote. A 4× stair block collapses back to one source pixel."""
+    f = int(factor)
+    a = np.asarray(assign, dtype=np.int32)
+    if f < 2 or a.ndim != 2:
+        return a
+    h, w = a.shape
+    h2, w2 = h // f, w // f
+    if h2 < 2 or w2 < 2:
+        return a
+    crop = a[: h2 * f, : w2 * f]
+    blocks = np.ascontiguousarray(crop.reshape(h2, f, w2, f).swapaxes(1, 2).reshape(h2, w2, f * f))
+    shift = int(blocks.min())
+    b = blocks - shift
+    k = int(b.max()) + 1
+    if k < 1 or k > 64:
+        return a
+    counts = np.zeros((h2 * w2, k), np.uint16)
+    rows = np.arange(h2 * w2)
+    flat = b.reshape(h2 * w2, f * f)
+    for t in range(f * f):
+        np.add.at(counts, (rows, flat[:, t]), 1)
+    return (counts.argmax(axis=1).astype(np.int32) + shift).reshape(h2, w2)
+
+
+# Half-pixel of overlap so a ring and the disk inside it share one edge
+# instead of a paper hairline. The fit itself sits on the pixel crack.
+_HARD_ROUND_PAD = 0.20
+# Non-round thick shapes: low alphamax keeps star points and square corners
+# as corners; stair runs still collapse to straight lines.
+_HARD_PLAIN_ALPHAMAX = 0.5
+_HARD_ROUND_KAPPA = 0.5522847498307936
+
+
+def _hard_edge_samples(mask, contour):
+    """Boundary samples on the crack, half a pixel out of the foreground.
+
+    Contour pixels sit on the ink. The neighbouring colour's contour sits on
+    the other side of the same crack. Moving half a pixel toward the background
+    puts both fits on that shared edge.
+    """
+    h, w = mask.shape
+    pts = contour.reshape(-1, 2).astype(np.float64)
+    out = np.empty_like(pts)
+    for i, (x, y) in enumerate(pts):
+        xi = int(round(float(x)))
+        yi = int(round(float(y)))
+        vx = vy = 0.0
+        n_out = 0
+        for dy in (-1, 0, 1):
+            for dx in (-1, 0, 1):
+                if dx == 0 and dy == 0:
+                    continue
+                xx = xi + dx
+                yy = yi + dy
+                outside = xx < 0 or yy < 0 or xx >= w or yy >= h or mask[yy, xx] == 0
+                if outside:
+                    vx += dx
+                    vy += dy
+                    n_out += 1
+        if n_out == 0:
+            out[i, 0] = x
+            out[i, 1] = y
+            continue
+        norm = math.hypot(vx, vy)
+        if norm < 1e-9:
+            out[i, 0] = x
+            out[i, 1] = y
+        else:
+            out[i, 0] = x + 0.5 * vx / norm
+            out[i, 1] = y + 0.5 * vy / norm
+    return out
+
+
+def _hard_residual_is_round(radius, max_err, rms):
+    """True when the fit leftover is raster noise, not a corner or a lump.
+
+    A stair-stepped circle stays inside about 0.6 px. A square or a star
+    misses its best circle by several pixels, and by a large fraction of
+    the radius.
+    """
+    r = float(radius)
+    if r < 4.0:
+        return False
+    if max_err > 1.25:
+        return False
+    if max_err / r > 0.08:
+        return False
+    if rms > 0.70:
+        return False
+    if rms / r > 0.05:
+        return False
+    return True
+
+
+def _hard_circle_fit(pts):
+    """Algebraic circle fit. Returns cx, cy, r, max_abs, rms in pixels."""
+    if pts is None or len(pts) < 8:
+        return None
+    x = np.asarray(pts[:, 0], dtype=np.float64)
+    y = np.asarray(pts[:, 1], dtype=np.float64)
+    A = np.column_stack((2.0 * x, 2.0 * y, np.ones(len(x), dtype=np.float64)))
+    b = x * x + y * y
+    try:
+        sol, _resid, rank, _sv = np.linalg.lstsq(A, b, rcond=None)
+    except np.linalg.LinAlgError:
+        return None
+    if int(rank) < 3:
+        return None
+    cx = float(sol[0])
+    cy = float(sol[1])
+    r2 = float(sol[2]) + cx * cx + cy * cy
+    if not math.isfinite(r2) or r2 <= 1.0:
+        return None
+    r = math.sqrt(r2)
+    if not math.isfinite(r) or r > 1.0e6:
+        return None
+    err = np.abs(np.hypot(x - cx, y - cy) - r)
+    return cx, cy, r, float(err.max()), float(np.sqrt(np.mean(err * err)))
+
+
+def _hard_ellipse_err(pts, cx, cy, rx, ry, ang_deg):
+    """Distance from each point to the ellipse along the ray from its centre."""
+    th = math.radians(float(ang_deg))
+    co = math.cos(th)
+    si = math.sin(th)
+    dx = pts[:, 0] - cx
+    dy = pts[:, 1] - cy
+    # Image y grows downward. OpenCV's RotatedRect angle is clockwise there,
+    # which is this matrix (local x axis along the width).
+    xr = co * dx + si * dy
+    yr = -si * dx + co * dy
+    rho = np.sqrt((xr / rx) ** 2 + (yr / ry) ** 2)
+    rho = np.maximum(rho, 1e-8)
+    dist = np.hypot(dx, dy)
+    return np.abs(dist * (1.0 - 1.0 / rho))
+
+
+def _hard_ellipse_fit(pts):
+    """cv2 ellipse fit with the same residual test as a circle. None if not round."""
+    if pts is None or len(pts) < 8:
+        return None
+    try:
+        (cx, cy), (aw, ah), ang = cv2.fitEllipse(np.ascontiguousarray(pts, dtype=np.float32))
+    except cv2.error:
+        return None
+    rx = float(aw) * 0.5
+    ry = float(ah) * 0.5
+    if min(rx, ry) < 4.0 or max(rx, ry) > 2.8 * min(rx, ry):
+        return None
+    err = _hard_ellipse_err(pts, float(cx), float(cy), rx, ry, float(ang))
+    if err.size == 0 or not np.isfinite(err).all():
+        return None
+    max_err = float(err.max())
+    rms = float(np.sqrt(np.mean(err * err)))
+    if not _hard_residual_is_round(min(rx, ry), max_err, rms):
+        return None
+    area = abs(float(cv2.contourArea(pts.astype(np.float32))))
+    ell = math.pi * rx * ry
+    if ell < 8.0 or area < ell * 0.82 or area > ell * 1.18:
+        return None
+    return float(cx), float(cy), rx, ry, float(ang)
+
+
+def _hard_bezier_ellipse_d(cx, cy, rx, ry, ang_deg, sx, sy):
+    """Four cubic Bézier arcs of an ellipse, in the potrace inch frame."""
+    k = _HARD_ROUND_KAPPA
+    th = math.radians(float(ang_deg))
+    co = math.cos(th)
+    si = math.sin(th)
+
+    def P(lx, ly):
+        # Inverse of the clockwise image rotation used in _hard_ellipse_err.
+        x = cx + co * lx - si * ly
+        y = cy + si * lx + co * ly
+        return fmt(x * sx), fmt(y * sy)
+
+    start = P(rx, 0.0)
+    quads = (
+        (P(rx, k * ry), P(k * rx, ry), P(0.0, ry)),
+        (P(-k * rx, ry), P(-rx, k * ry), P(-rx, 0.0)),
+        (P(-rx, -k * ry), P(-k * rx, -ry), P(0.0, -ry)),
+        (P(k * rx, -ry), P(rx, -k * ry), P(rx, 0.0)),
+    )
+    parts = [f"M {start[0]} {start[1]}"]
+    for a, b, c in quads:
+        parts.append(f"C {a[0]} {a[1]} {b[0]} {b[1]} {c[0]} {c[1]}")
+    parts.append("Z")
+    return " ".join(parts)
+
+
+def _hard_round_bezier(pts, sx, sy, hole):
+    """Bézier circle or ellipse when the crack is near-round. Else None.
+
+    Circles win over ellipses so a square cannot hide inside a stretched fit.
+    `hole` shrinks the radius a hair; an outer grows it. The darker ink is
+    painted later and covers the overlap.
+    """
+    if pts is None or len(pts) < 8:
+        return None
+    pad = -_HARD_ROUND_PAD if hole else _HARD_ROUND_PAD
+    circ = _hard_circle_fit(pts)
+    if circ is not None:
+        cx, cy, r, max_err, rms = circ
+        minx = float(pts[:, 0].min())
+        maxx = float(pts[:, 0].max())
+        miny = float(pts[:, 1].min())
+        maxy = float(pts[:, 1].max())
+        bw = maxx - minx
+        bh = maxy - miny
+        aspect = max(bw, bh) / max(1.0, min(bw, bh))
+        if (
+            aspect <= 1.35
+            and _hard_residual_is_round(r, max_err, rms)
+            and abs((minx + maxx) * 0.5 - cx) <= 1.6
+            and abs((miny + maxy) * 0.5 - cy) <= 1.6
+            and abs(bw * 0.5 - r) <= 1.6
+            and abs(bh * 0.5 - r) <= 1.6
+        ):
+            rr = r + pad
+            if rr >= 1.0:
+                return _hard_bezier_ellipse_d(cx, cy, rr, rr, 0.0, sx, sy)
+    ell = _hard_ellipse_fit(pts)
+    if ell is None:
+        return None
+    cx, cy, rx, ry, ang = ell
+    # A near-circle already passed above. Keep a real ellipse only when the
+    # circle test missed and the axes actually differ.
+    if abs(rx - ry) <= 0.04 * max(rx, ry) + 0.4:
+        return None
+    prx = rx + pad
+    pry = ry + pad
+    if min(prx, pry) < 1.0:
+        return None
+    return _hard_bezier_ellipse_d(cx, cy, prx, pry, ang, sx, sy)
+
+
+def _hard_hole_mask(comp, contour):
+    """Pixels of one hole, exact from the component (not a redraw of the contour)."""
+    h, w = comp.shape
+    m = cv2.moments(contour)
+    if abs(float(m["m00"])) < 1e-6:
+        return None
+    cx = int(round(float(m["m10"]) / float(m["m00"])))
+    cy = int(round(float(m["m01"]) / float(m["m00"])))
+    cx = min(max(cx, 0), w - 1)
+    cy = min(max(cy, 0), h - 1)
+    if comp[cy, cx] != 0:
+        found = None
+        for rad in range(1, 6):
+            for dy in range(-rad, rad + 1):
+                for dx in range(-rad, rad + 1):
+                    x = cx + dx
+                    y = cy + dy
+                    if 0 <= x < w and 0 <= y < h and comp[y, x] == 0:
+                        found = (x, y)
+                        break
+                if found:
+                    break
+            if found:
+                break
+        if not found:
+            return None
+        cx, cy = found
+    inv = (comp == 0).astype(np.uint8)
+    ff = inv.copy()
+    fmask = np.zeros((h + 2, w + 2), np.uint8)
+    cv2.floodFill(ff, fmask, (int(cx), int(cy)), 2)
+    hole = (ff == 2).astype(np.uint8)
+    if int(hole.sum()) < 4:
+        return None
+    if hole[0].any() or hole[-1].any() or hole[:, 0].any() or hole[:, -1].any():
+        return None
+    return hole
+
+
+def _hard_potrace_blob(blob, sx, sy):
+    """Sharp potrace of one filled blob. Same knobs as the thick native plate."""
+    if blob is None or int(blob.sum()) < 4:
+        return None
+    ds = potrace_paths(
+        blob, sx, sy, alphamax=1.0, opttol=0.2, turdsize=2, smooth=0.0,
+    )
+    if not ds:
+        return None
+    return " ".join(ds)
+
+
+def _hard_round_component_d(comp, sx, sy):
+    """One evenodd path: Bézier arcs where a contour is round, potrace where it is not.
+
+    Returns None when nothing is round, so the caller can potrace the original
+    mask in one shot and keep squares, stars, and text boxes byte-identical.
+    """
+    cnts, hier = cv2.findContours(comp, cv2.RETR_CCOMP, cv2.CHAIN_APPROX_NONE)
+    if not cnts or hier is None:
+        return None
+    hier = hier[0]
+    bezier = {}
+    for i, c in enumerate(cnts):
+        if c is None or len(c) < 8:
+            continue
+        hole = int(hier[i][3]) >= 0
+        pts = _hard_edge_samples(comp, c)
+        bez = _hard_round_bezier(pts, sx, sy, hole)
+        if bez:
+            bezier[i] = bez
+    if not bezier:
+        return None
+    externals = [i for i in range(len(cnts)) if int(hier[i][3]) < 0]
+    if not externals:
+        return None
+    subs = []
+    for i in externals:
+        if i in bezier:
+            chunks = [bezier[i]]
+        else:
+            filled = comp.copy()
+            child = int(hier[i][2])
+            while child >= 0:
+                hole = _hard_hole_mask(comp, cnts[child])
+                if hole is not None:
+                    filled[hole > 0] = 1
+                child = int(hier[child][0])
+            piece = _hard_potrace_blob(filled, sx, sy)
+            if not piece:
+                return None
+            chunks = [piece]
+        child = int(hier[i][2])
+        while child >= 0:
+            if child in bezier:
+                chunks.append(bezier[child])
+            else:
+                hole = _hard_hole_mask(comp, cnts[child])
+                piece = _hard_potrace_blob(hole, sx, sy)
+                if not piece:
+                    return None
+                chunks.append(piece)
+            child = int(hier[child][0])
+        subs.append(" ".join(chunks))
+    return " ".join(subs)
+
+
+def _hard_native_paths(mask, sx, sy):
+    """Thick native plate. Near-round contours become four Bézier arcs.
+
+    Components with no round contour are potrace'd together, same call as
+    before, so a square or a star does not move.
+    """
+    mask = (np.asarray(mask) > 0).astype(np.uint8)
+    n, lab, _stats, _ = cv2.connectedComponentsWithStats(mask, connectivity=8)
+    plain = np.zeros(mask.shape, np.uint8)
+    round_paths = []
+    for ci in range(1, n):
+        comp = (lab == ci).astype(np.uint8)
+        d = _hard_round_component_d(comp, sx, sy)
+        if d:
+            round_paths.append(d)
+        else:
+            plain[lab == ci] = 1
+    paths = []
+    if int(plain.sum()) >= 4:
+        paths.extend(
+            potrace_paths(
+                plain, sx, sy, alphamax=_HARD_PLAIN_ALPHAMAX, opttol=0.2, turdsize=2, smooth=0.0,
+            )
+        )
+    paths.extend(round_paths)
+    return paths
+
+
+def _trace_hard_pixel_plates(assign_hi, palette, factor, sx_lo, sy_lo, width_in, height_in, paper_hex):
+    """Smooth thick stairs on the source grid; keep thin strokes polygonal.
+
+    A circle's median radius is many pixels. Where that contour's fit residual
+    is small next to the radius, four Bézier arcs replace the stair fit so a
+    ring stays round. A square's long straight runs stay corners. A text stroke
+    is about a pixel thick. Curving that mask melts the letters, so those
+    components are traced as polygons on the upscaled plate.
+    """
+    a = np.asarray(assign_hi, dtype=np.int32)
+    f = max(2, int(factor))
+    sx_hi = float(sx_lo) / float(f)
+    sy_hi = float(sy_lo) / float(f)
+    # Source-pixel radius. Text on these marks sits under 1px; a ring is ~6.
+    thin_r = 2.0 * float(f)
+    order = list(range(len(palette)))
+    order.sort(key=lambda i: (-lum(palette[i]), -int((a == i).sum())))
+    layers = []
+    for ink in order:
+        mask = (a == ink).astype(np.uint8)
+        if int(mask.sum()) < 4:
+            continue
+        n, lab, stats, _ = cv2.connectedComponentsWithStats(mask, connectivity=8)
+        thin = np.zeros(mask.shape, np.uint8)
+        thick = np.zeros(mask.shape, np.uint8)
+        for ci in range(1, n):
+            area = int(stats[ci, cv2.CC_STAT_AREA])
+            if area < 4:
+                continue
+            bw = int(stats[ci, cv2.CC_STAT_WIDTH])
+            bh = int(stats[ci, cv2.CC_STAT_HEIGHT])
+            long = max(bw, bh)
+            short = max(1, min(bw, bh))
+            comp = lab == ci
+            # Sub-pixel AA crumbs (a grey snapped onto the wrong ink). A real
+            # stroke is at least a couple of source pixels even when it is thin.
+            src_area = area / float(f * f)
+            if src_area < 1.5:
+                continue
+            if src_area < 3.0 and (long / float(short)) < 4.0:
+                continue
+            dt = cv2.distanceTransform(comp.astype(np.uint8), cv2.DIST_L2, 3)
+            med = float(np.median(dt[comp])) if int(comp.sum()) else 99.0
+            if med <= thin_r:
+                thin[comp] = 1
+            else:
+                thick[comp] = 1
+        paths = []
+        if int(thick.sum()) >= 4:
+            labels = np.where(thick > 0, np.int32(ink), np.int32(-1))
+            lo = _majority_downsample_labels(labels, f)
+            mlo = (lo == ink).astype(np.uint8)
+            if int(mlo.sum()) >= 4:
+                paths.extend(_hard_native_paths(mlo, sx_lo, sy_lo))
+        if int(thin.sum()) >= 4:
+            paths.extend(
+                potrace_paths(
+                    thin, sx_hi, sy_hi,
+                    alphamax=0.0, opttol=0.2, turdsize=0, smooth=0.0,
+                )
+            )
+        if not paths:
+            continue
+        col = palette[ink]
+        layers.append(
+            {
+                "hex": to_hex(col),
+                "name": layer_name(col),
+                "paths": paths,
+                "lum": lum(col),
+                "n": int(mask.sum()),
+            }
+        )
+    if not layers:
+        return None
+    svg = svg_from_layers_with_gaps(
+        layers, width_in, height_in, paper_hex, gap_strokes=[], overlay_strokes=[]
+    )
+    return svg, layers, {"iso_fallback": 0, "vector_graph": "hard-pixel-stairs"}
+
+
 def vectorize(path: str, inches: float = 10.0, colors=None, mode: str = "auto", cache_dir=None, from_cache=None, merge=None, keep=None, list_inks=False, smooth=None, corners=None):
     global _SPEED_SINK, _LAST_PLATES, _SMOOTH_CTRL, _CORNERS_CTRL, _SMOOTH_APPLIED
     _SMOOTH_CTRL = smooth
@@ -16752,10 +17347,41 @@ def _vectorize_body(path: str, inches: float = 10.0, colors=None, mode: str = "a
     assign, palette = restore_white_art_ink(
         assign, palette, src_white, alpha=a_white
     )
+    # Hard pixel art: the 4× grid makes every stair tread a long edge, so
+    # potrace scallops it. Drop white notches that are not source white art,
+    # vote each block back to one source pixel, and trace that map once.
+    # Soft-AA / photo / multi-colour logos never set this and keep V6C.
+    hard_pixel = (
+        kind == "logo"
+        and glyph is None
+        and ov_mask is None
+        and is_hard_edged_lowres(rgb0, alpha0)
+    )
+    hard_pixel_hi = None
+    hard_pixel_factor = 1
+    if hard_pixel:
+        try:
+            assign = drop_white_boundary_specks(assign, palette, rgb0, alpha0)
+            factor = _label_trace_factor(assign.shape, (h0, w0), up_scale)
+            if factor >= 2:
+                hard_pixel_hi = np.asarray(assign, dtype=np.int32).copy()
+                hard_pixel_factor = factor
+                assign = _majority_downsample_labels(assign, factor)
+                sx = width_in / float(assign.shape[1])
+                sy = height_in / float(assign.shape[0])
+            else:
+                hard_pixel = False
+        except Exception as e:
+            sys.stderr.write(f"hard-pixel stair smooth skipped: {e}\n")
+            hard_pixel = False
+            hard_pixel_hi = None
     if kind == "logo" and glyph is None and ov_mask is None:
         global _SMOOTH_APPLIED
         trace_assign = assign
-        _sig_try = _logo_smooth_sigma(max(assign.shape) if assign.size else 1)
+        if hard_pixel:
+            _sig_try = 0.0
+        else:
+            _sig_try = _logo_smooth_sigma(max(assign.shape) if assign.size else 1)
         _SMOOTH_APPLIED = False
         # Heavy vote (native plates, tight fit) when it actually redrew the
         # image. Otherwise a 2× anti-aliased partition, traced on that grid.
@@ -16791,6 +17417,10 @@ def _vectorize_body(path: str, inches: float = 10.0, colors=None, mode: str = "a
                 smooth_scale = 1
         long_side = max(assign.shape) if assign.size else 1
         min_area_px = max(4 if keylined else 10, int(0.00003 * assign.size))
+        # Pixel text on a hard mark is only a few source pixels. The speck
+        # cut used on a 4× plate would delete those strokes.
+        if hard_pixel:
+            min_area_px = 2
         paper_hex = to_hex(paper_rgb)
         try:
             built = None
@@ -16978,10 +17608,16 @@ def _vectorize_body(path: str, inches: float = 10.0, colors=None, mode: str = "a
             else:
                 _SMOOTH_APPLIED = False
                 smooth_kind = "base"
-                built = _logo_mask_svg(
-                    assign, palette, sx, sy, width_in, height_in, paper_hex,
-                    min_area_px, _logo_fit_knobs(long_side, applied=False),
-                )
+                if hard_pixel and hard_pixel_hi is not None:
+                    built = _trace_hard_pixel_plates(
+                        hard_pixel_hi, palette, hard_pixel_factor,
+                        sx, sy, width_in, height_in, paper_hex,
+                    )
+                else:
+                    built = _logo_mask_svg(
+                        assign, palette, sx, sy, width_in, height_in, paper_hex,
+                        min_area_px, _logo_fit_knobs(long_side, applied=False),
+                    )
             if built is not None:
                 svg, glayers, gaux = built
                 _amax, _opt, _sig = _logo_fit_knobs(long_side)
@@ -17015,6 +17651,7 @@ def _vectorize_body(path: str, inches: float = 10.0, colors=None, mode: str = "a
                     "smooth_opttol": _opt,
                     "smooth_alphamax": round(float(_amax), 3),
                     "smooth_curve": smooth_kind,
+                    "hard_pixel": bool(hard_pixel),
                 }
                 return _speed_finish(
                     svg,
