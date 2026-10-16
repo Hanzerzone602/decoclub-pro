@@ -22,8 +22,10 @@ def arg(name):
 def main():
     if os.environ.get("VAI_ROUTE_DISABLE") == "1":
         return run_trace("disabled")
-    # Only the plain auto request was scored; colour drops / modes / caches stay on trace.py.
-    if arg("--colors") or arg("--from-cache") or arg("--cache-dir") or (arg("--mode") or "auto") != "auto":
+    # The server always sends --colors (detail slider) and --cache-dir. Routing ignores both:
+    # flat art goes to trace.py with the original args (unchanged), busy art gets VTracer as scored.
+    # A live colour drop from cache and explicit non-auto modes stay on trace.py.
+    if arg("--from-cache") or (arg("--mode") or "auto") != "auto":
         return run_trace("options")
     inp, out = arg("--input"), arg("--output")
     inches = float(arg("--inches") or 10.0)
