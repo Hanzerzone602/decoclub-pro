@@ -6,3 +6,4 @@ shapely>=2.0
 scipy>=1.10
 scikit-image>=0.21
 onnxruntime>=1.16
+vtracer==0.6.15
