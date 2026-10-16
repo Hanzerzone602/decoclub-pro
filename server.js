@@ -918,8 +918,13 @@ async function runVaiTraceSafe(buf, job, body, sizeMeta) {
   return result;
 }
 
+// Trace cache is keyed on the busy engine file too, so a new engine never serves old results.
+const TRACE_ENGINE_VER = (function () {
+  try { return require("crypto").createHash("md5").update(fs.readFileSync(path.join(__dirname, "lib", "vai-trace", "engine_r3.py"))).digest("hex").slice(0, 8); }
+  catch (e) { return "noengine"; }
+})();
 function traceCacheDir(job) {
-  return path.join(DATA, "trace-cache", String(job && job.id || "none"));
+  return path.join(DATA, "trace-cache", String(job && job.id || "none") + "-" + TRACE_ENGINE_VER);
 }
 function clearTraceCache(job) {
   if (!job || !job.id) return;
@@ -3570,6 +3575,7 @@ const server = http.createServer(async function (req, res) {
         services: enabledServiceNames(healthUser),
         pricing: "ppi",
         traceDeps: TRACE_DEPS,
+        traceEngine: TRACE_ENGINE_VER,
       };
       if (digitizeFor(healthUser)) health.digitizeDeps = DIGITIZE_DEPS;
       return json(res, 200, health);

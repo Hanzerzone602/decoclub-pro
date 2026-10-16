@@ -7,6 +7,23 @@ import json, os, runpy, sys, time
 HERE = os.path.dirname(os.path.abspath(__file__))
 TRACE = os.path.join(HERE, "trace.py")
 
+def _engine_ver():
+    import hashlib
+    with open(os.path.join(HERE, "engine_r3.py"), "rb") as f:
+        return "r11-" + hashlib.md5(f.read()).hexdigest()[:8]
+ENGINE_VER = _engine_ver()
+
+def busy_r11(E, inp, inches, rgb):
+    """r11 per-image chooser, exactly as E.vectorise: >=2 Mpx -> r8 route only;
+    smaller -> trace both, quick_score, choose(). Returns (svg, route label actually chosen)."""
+    H, W = rgb.shape[:2]
+    if H * W / 1e6 >= E.BIG_MPX:
+        return E.trace_busy_r8(inp, inches), "r11-r8-big"
+    s3 = E.trace_busy(inp, 10.0); s8 = E.trace_busy_r8(inp, 10.0)
+    if E.choose(E.quick_score(inp, s3), E.quick_score(inp, s8)):
+        return (s8 if inches == 10.0 else E.trace_busy_r8(inp, inches)), "r11-r8"
+    return (s3 if inches == 10.0 else E.trace_busy(inp, inches)), "r11-r3"
+
 def log(msg):
     sys.stderr.write("[vai-route] " + msg + "\n"); sys.stderr.flush()
 
@@ -37,14 +54,14 @@ def main():
         _idx, _pr, stats, flat = E.decide(rgb)
         if flat:
             return run_trace("flat k=%d" % stats["k"])
-        svg = E.trace_busy(inp, inches)
+        svg, route = busy_r11(E, inp, inches, rgb)
         if "<path" not in svg:
             raise RuntimeError("empty VTracer svg")
         with open(out, "w") as f:
             f.write(svg)
         dt = time.perf_counter() - t0
-        log("engine=vtracer-r3 busy k=%d %.2fs" % (stats["k"], dt))
-        sys.stdout.write(json.dumps({"mode": "busy", "route": "vtracer-r3", "seconds": round(dt, 2)}) + "\n")
+        log("engine=%s busy k=%d %.2fs" % (route, stats["k"], dt))
+        sys.stdout.write(json.dumps({"mode": "busy", "route": route, "engine": ENGINE_VER, "seconds": round(dt, 2)}) + "\n")
     except SystemExit:
         raise
     except Exception as e:
