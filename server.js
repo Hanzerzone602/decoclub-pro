@@ -3520,6 +3520,18 @@ function serveStatic(req, res, url) {
 // Digitize runtime check (python libs for digitize_prep + pyembroidery, potrace),
 // probed once in the background after start; reported on /health.
 let DIGITIZE_DEPS = null;
+// Vectorize r11 runtime check: busy-art engine needs potrace + rsvg-convert. Logged at start, on /health.
+let TRACE_DEPS = null;
+function probeTraceDeps() {
+  const cp = require("child_process");
+  cp.execFile("potrace", ["--version"], { timeout: 10000 }, function (pe) {
+    cp.execFile("rsvg-convert", ["--version"], { timeout: 10000 }, function (re) {
+      TRACE_DEPS = { potrace: !pe, rsvgConvert: !re };
+      console.log("[trace-deps] potrace=" + TRACE_DEPS.potrace + " rsvg-convert=" + TRACE_DEPS.rsvgConvert);
+    });
+  });
+}
+
 function probeDigitizeDeps() {
   const cp = require("child_process");
   const py = process.env.DIGITIZE_PYTHON || pickPrepPython();
@@ -3557,6 +3569,7 @@ const server = http.createServer(async function (req, res) {
         vaiTrace: vaiTrace.available(),
         services: enabledServiceNames(healthUser),
         pricing: "ppi",
+        traceDeps: TRACE_DEPS,
       };
       if (digitizeFor(healthUser)) health.digitizeDeps = DIGITIZE_DEPS;
       return json(res, 200, health);
@@ -3577,5 +3590,6 @@ const PORT = process.env.PORT || 3847;
 const HOST = process.env.HOST || "0.0.0.0";
 server.listen(PORT, HOST, function () {
   console.log("DecoClub Pro running at http://" + HOST + ":" + PORT);
+  probeTraceDeps();
   setTimeout(probeDigitizeDeps, 5000).unref();
 });

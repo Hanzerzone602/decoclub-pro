@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Vectorize router. Busy art -> VTracer round 3 (engine_r3.trace_busy); everything else
+"""Vectorize router. Busy art -> VTracer round 11 (engine_r3.py = r11cand-6bc6eb5e); everything else
 -> trace.py unchanged. Routing is engine_r3.decide() exactly as scored (r3final-1709485d).
 Any VTracer/router error falls back to trace.py. Engine choice is logged to stderr."""
 import json, os, runpy, sys, time
