@@ -199,7 +199,7 @@ def main():
         data = dxf(root, a)
     elif a.format == "pdf":
         _, _, win, hin = target_px(root, a.width_in, a.height_in, 1)
-        data = rsvg(a.svg, "pdf", int(round(win * 72)), int(round(hin * 72)), dpi=72)  # 1pt = 1/72 in, vector
+        data = rsvg(a.svg, "pdf", "%.4fin" % win, "%.4fin" % hin, dpi=72)  # 1pt = 1/72 in, vector
     else:
         img, _, _ = raster(a.svg, root, a); buf = io.BytesIO(); dpi = (a.dpi, a.dpi)
         if a.format == "underbase":
