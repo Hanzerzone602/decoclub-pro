@@ -922,7 +922,11 @@ async function runVaiTraceSafe(buf, job, body, sizeMeta) {
 const TRACE_ENGINE_VER = (function () {
   try { return require("crypto").createHash("md5").update(fs.readFileSync(path.join(__dirname, "lib", "vai-trace", "engine_r3.py"))).digest("hex").slice(0, 8); }
   catch (e) { return "noengine"; }
-})();
+})() + (process.env.VECTORIZE_R2 === "1" ? (function () {
+  // Round-2 route on: key the cache on the r2 file too, so r2 and r11 results never mix.
+  try { return "-r2" + require("crypto").createHash("md5").update(fs.readFileSync(path.join(__dirname, "lib", "vai-trace", "vt1_cut_r2.py"))).digest("hex").slice(0, 8); }
+  catch (e) { return "-r2none"; }
+})() : "");
 function traceCacheDir(job) {
   return path.join(DATA, "trace-cache", String(job && job.id || "none") + "-" + TRACE_ENGINE_VER);
 }
