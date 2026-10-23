@@ -235,4 +235,12 @@
     },
     open: function (el, job, shopControls) { return fillDigitize(el, job, shopControls); },
   });
+  if (typeof DS.registerSuiteTool === "function") {
+    DS.registerSuiteTool({
+      id: "digitize",
+      name: "Digitize",
+      blurb: "Stitch preview and machine files. Shown only while this tool is enabled for an admin.",
+      station: "digitize",
+    });
+  }
 })();

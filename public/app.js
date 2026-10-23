@@ -34,6 +34,72 @@ const BLANKS = ["tee","hoodie","hat","tumbler","plaque","sticker","sign","hoop"]
 function studioExtras() {
   return (window.DecoStudio && window.DecoStudio.extras) || [];
 }
+let suiteTool = "";
+const upscaleStarted = {};
+function builtinSuiteTools() {
+  return [
+    { id: "vectorize", name: "Vectorize", blurb: "Convert raster logos & artwork into clean, gap-free SVG, EPS, PDF & DXF cut/print files." },
+    { id: "bgremove", name: "Remove Background", blurb: "One-click clean background removal with transparent PNG & SVG download." },
+    { id: "halftones", name: "Halftones", blurb: "20+ true print halftone styles with transparent ink marks for DTF & screen print." },
+    { id: "upscale", name: "300 DPI Upscaler", blurb: "Upscale low-res 72 DPI client images to crisp, true 300 DPI print-size PNGs for DTF printing." },
+    { id: "stones", name: "Rhinestones", blurb: "Rhinestone template & crystal layout generator." },
+  ];
+}
+function extraSuiteTools() {
+  const list = (window.DecoStudio && window.DecoStudio.suiteTools) || [];
+  return list.filter((t) => t && t.id && !builtinSuiteTools().some((b) => b.id === t.id));
+}
+function suiteToolList() {
+  return builtinSuiteTools().concat(extraSuiteTools());
+}
+function suiteToolById(id) {
+  const key = String(id || "").toLowerCase() === "halftone" ? "halftones" : String(id || "").toLowerCase();
+  return suiteToolList().find((t) => t.id === key) || null;
+}
+function syncSuiteChrome() {
+  const tool = suiteToolById(suiteTool);
+  document.body.classList.toggle("suite-focus", !!tool);
+  if (tool) document.body.dataset.suite = tool.id;
+  else delete document.body.dataset.suite;
+  const label = document.getElementById("studioHeaderTool");
+  if (label) label.textContent = tool ? tool.name : "Choose Your Tool";
+}
+function showAllTools() {
+  suiteTool = "";
+  currentJob = null;
+  view = canFloor() ? "make" : "board";
+  station = "art";
+  htPanelWantOpen = false;
+  document.body.classList.remove("ht-mode");
+  history.replaceState({}, "", "/app");
+  syncSuiteChrome();
+  nav();
+  render();
+}
+function launcherHtml() {
+  const cards = suiteToolList().map((t) => `
+    <a class="suite-card" href="/app?tool=${encodeURIComponent(t.id)}">
+      <span class="suite-kicker">DecoClub</span>
+      <strong>${escapeHtml(t.name)}</strong>
+      <span>${escapeHtml(t.blurb)}</span>
+      <span class="suite-go">Open</span>
+    </a>`).join("");
+  return `
+    <section class="tool-launcher" id="toolLauncher">
+      <p class="kicker">Studio</p>
+      <h1 class="make-title">Choose Your Tool</h1>
+      <p class="muted make-sub">Each card opens that tool. All Tools brings you back here.</p>
+      <div class="suite-grid">${cards}</div>
+    </section>`;
+}
+function applySuiteFocus(root) {
+  syncSuiteChrome();
+  if (!suiteTool || !root) return;
+  root.querySelectorAll("[data-suite]").forEach((node) => {
+    const tags = (node.getAttribute("data-suite") || "").split(/\s+/);
+    node.hidden = tags.indexOf("shared") === -1 && tags.indexOf(suiteTool) === -1;
+  });
+}
 function methodChoices() {
   if (cfg && Array.isArray(cfg.methods) && cfg.methods.length) return cfg.methods;
   return METHODS;
@@ -218,7 +284,7 @@ function sanitizeEventMessage(message) {
 function runRiskHtml(job) {
   const r = runRiskForJob(job);
   const cls = r.level === "go" ? "risk-go" : (r.level === "hold" ? "risk-hold" : "risk-review");
-  return `<div class="run-risk ${cls}" id="runRisk"><strong>${escapeHtml(r.title)}</strong> · ${escapeHtml(r.line)}</div>`;
+  return `<div class="run-risk ${cls}" id="runRisk" data-suite="vectorize"><strong>${escapeHtml(r.title)}</strong> · ${escapeHtml(r.line)}</div>`;
 }
 function canFloor() {
   return !!(user && (user.role === "shop" || (user.role === "admin" && user.shopId)));
@@ -301,6 +367,8 @@ async function boot() {
     if (shop.logo_path) $("#sideLogo").src = shop.logo_path;
   }
   if (user && cfg && Array.isArray(cfg.adminModules)) await loadAdminScripts(cfg.adminModules);
+  const allToolsBtn = document.getElementById("allTools");
+  if (allToolsBtn) allToolsBtn.onclick = () => showAllTools();
   const startMethod = consumeStartMethod();
   if (startMethod) makeMethod = startMethod;
   consumeStartTool();
@@ -323,21 +391,26 @@ function consumeStartMethod() {
   return method;
 }
 
-/** Deep-link ?tool=halftones (or start.html session) → open HT panel, hide Vectorize chrome. */
+/** Deep-link ?tool= keeps the Studio on that tool and hides the other modes. */
 function consumeStartTool() {
   const params = new URLSearchParams(location.search);
   const fromUrl = (params.get("tool") || "").toLowerCase();
   const fromStore = (sessionStorage.getItem("decoclub_start_tool") || "").toLowerCase();
   sessionStorage.removeItem("decoclub_start_tool");
-  const tool = fromUrl || fromStore;
-  if (tool === "halftones" || tool === "halftone") {
+  const picked = suiteToolById(fromUrl || fromStore);
+  suiteTool = picked ? picked.id : "";
+  if (suiteTool === "halftones") {
     htPanelWantOpen = true;
     station = "art";
+  } else if (suiteTool) {
+    htPanelWantOpen = false;
+    station = picked.station || "art";
   }
-  if (params.get("tool") || params.get("method") || params.get("station")) {
-    history.replaceState({}, "", "/app.html");
+  if (params.get("tool") || params.get("method") || params.get("station") || suiteTool) {
+    history.replaceState({}, "", suiteTool ? ("/app?tool=" + encodeURIComponent(suiteTool)) : "/app");
   }
-  return tool;
+  syncSuiteChrome();
+  return suiteTool;
 }
 
 function titleFromFile(file) {
@@ -509,12 +582,23 @@ async function startJobFromFile(file, method) {
     file = await fileToPng(file);
     const fd = new FormData();
     fd.append("title", titleFromFile(file));
-    fd.append("method", methodChoices().indexOf(method) !== -1 ? method : "apparel");
-    fd.append("width_in", "10");
+    const methodForTool = suiteTool === "stones" ? "rhinestone" : (suiteTool === "upscale" || suiteTool === "halftones" || suiteTool === "bgremove" ? "dtf" : method);
+    fd.append("method", methodChoices().indexOf(methodForTool) !== -1 ? methodForTool : "apparel");
+    const upWidth = document.getElementById("upWidth");
+    fd.append("width_in", suiteTool === "upscale" && upWidth && upWidth.value ? String(upWidth.value) : "10");
     fd.append("height_in", "10");
     fd.append("qty", "1");
-    const rm = document.getElementById("rmbg");
-    fd.append("remove_bg", !rm || rm.checked ? "1" : "0");
+    if (suiteTool) fd.append("suite_tool", suiteTool);
+    let removeBg = "0";
+    if (suiteTool === "bgremove") removeBg = "1";
+    else if (suiteTool === "upscale") {
+      const upBg = document.getElementById("upRemoveBg");
+      removeBg = upBg && upBg.checked ? "1" : "0";
+    } else {
+      const rm = document.getElementById("rmbg");
+      removeBg = rm && rm.checked ? "1" : "0";
+    }
+    fd.append("remove_bg", removeBg);
     fd.append("artwork", file);
     showArtWorking("Uploading…");
     const res = await uploadWithProgress("/api/jobs", fd, {
@@ -547,6 +631,7 @@ function processGridHtml(asButtons) {
 }
 
 async function render() {
+  syncSuiteChrome();
   if (view === "job" && currentJob) return renderJob(currentJob);
   if (view === "make") return renderMake();
   if (view === "intake") return renderIntake();
@@ -555,28 +640,41 @@ async function render() {
   return renderBoard();
 }
 
-async function renderMake() {
-  if (!canFloor()) {
-    view = "board";
-    nav();
-    return renderBoard();
+function toolDeskHtml(tool) {
+  const vectorize = tool.id === "vectorize";
+  const title = vectorize ? "Drop art. Vectorize. Recolor. Export." : tool.name;
+  let extra = "";
+  if (tool.id === "upscale") {
+    extra = `
+      <label class="suite-field">Target print width (inches)
+        <input id="upWidth" type="number" min="1" max="16" step="0.25" value="12" />
+      </label>
+      <p class="muted">Default 12 in. 10 in is a common chest size. 16 in is the max so the 300 DPI file stays fast.</p>
+      <label class="remember"><input id="upRemoveBg" type="checkbox" /> Remove background</label>
+      <p class="mono" id="upscaleDims">72 DPI → 300 DPI</p>`;
+  } else if (tool.id === "bgremove") {
+    extra = `<p class="muted">Background removal runs as the file uploads. Then download a transparent PNG and an SVG.</p>`;
+  } else if (tool.id === "halftones") {
+    extra = `<p class="muted">Halftone controls open on the art. Other tool panels stay out of the way.</p>`;
+  } else if (tool.id === "stones") {
+    extra = `<p class="muted">Drop the artwork, then build the crystal layout.</p>`;
+  } else if (vectorize) {
+    extra = `<label class="remember"><input id="rmbg" type="checkbox" checked /> Background removal, one click</label>`;
   }
-  // Quiet default method — no process-chip picker on Make
-  if (methodChoices().indexOf(makeMethod) === -1) makeMethod = "apparel";
-  main.innerHTML = `
+  return `
     <div class="make-home">
-      <h1 class="make-title">Drop art. Vectorize. Recolor. Export.</h1>
-      <p class="muted make-sub">Vectorize-first studio — clean SVG/EPS for your design software.</p>
+      <h1 class="make-title">${escapeHtml(title)}</h1>
+      <p class="muted make-sub">${escapeHtml(tool.blurb || "")}</p>
       ${paywallNote()}
-      <div class="make-drop" id="makeDrop" tabindex="0" role="button" aria-label="Drop art. Vectorize. Recolor. Export. or tap to pick a file">
+      <div class="make-drop" id="makeDrop" tabindex="0" role="button" aria-label="${escapeHtml(title)}">
         <div class="drop-hint">
-          <strong>Drop art. Vectorize. Recolor. Export.</strong>
-          <span>or tap to pick a file</span>
+          <strong>${escapeHtml(title)}</strong>
+          <span>PNG, JPG, or WebP</span>
         </div>
         <input id="makeFile" type="file" accept="image/*,.svg,.pdf" hidden />
       </div>
-      <label class="remember"><input id="rmbg" type="checkbox" checked /> Background removal, one click</label>
-      ${cfg.imagine ? `<div class="card" style="margin-top:18px">
+      ${extra}
+      ${vectorize && cfg.imagine ? `<div class="card" style="margin-top:18px">
         <div class="kicker">AI Generate</div>
         <p class="muted">Describe a graphic — we place it on this job.</p>
         <textarea id="imaginePrompt" rows="2" placeholder="A varsity mascot, clean print-ready graphic on transparent"></textarea>
@@ -584,6 +682,31 @@ async function renderMake() {
       </div>` : ""}
       <p class="notice" id="makeErr"></p>
     </div>`;
+}
+async function renderMake() {
+  if (!canFloor()) {
+    view = "board";
+    nav();
+    return renderBoard();
+  }
+  if (methodChoices().indexOf(makeMethod) === -1) makeMethod = "apparel";
+  const tool = suiteToolById(suiteTool);
+  if (!tool) {
+    main.innerHTML = launcherHtml();
+    return;
+  }
+  main.innerHTML = toolDeskHtml(tool);
+  const upWidth = $("#upWidth");
+  if (upWidth) {
+    const paint = () => {
+      const dims = $("#upscaleDims");
+      if (!dims) return;
+      const inches = Math.min(16, Math.max(1, Number(upWidth.value) || 12));
+      dims.textContent = "72 DPI → " + Math.round(inches * 300) + " px wide at 300 DPI (" + inches + " in)";
+    };
+    upWidth.oninput = paint;
+    paint();
+  }
   const drop = $("#makeDrop");
   const fileEl = $("#makeFile");
   async function take(file) {
@@ -673,7 +796,16 @@ async function renderBoard() {
   main.querySelectorAll("[data-open]").forEach((b) => { b.onclick = () => openJob(b.dataset.open); });
 }
 
-function openJob(id, st) { currentJob = id; view = "job"; station = st || "art"; nav(); render(); }
+function openJob(id, st) {
+  currentJob = id;
+  view = "job";
+  if (st) station = st;
+  else if (!suiteTool) station = "art";
+  else station = (suiteToolById(suiteTool) && suiteToolById(suiteTool).station) || "art";
+  if (suiteTool === "halftones") htPanelWantOpen = true;
+  nav();
+  render();
+}
 
 async function renderIntake() {
   const { clients } = await api("/api/clients").catch(() => ({ clients: [] }));
@@ -827,12 +959,14 @@ async function fillArt(el, job, shopControls) {
   const initCorner = toPct(lastSet.cornerSmooth != null ? lastSet.cornerSmooth : loadVzPref("corner", "50"), CORNER_LEGACY, 50);
   const initColorMode = loadVzPref("colorMode", "rgb");
   const vectorSrc = job.vector_preview || (job.vector_svg ? ("/api/jobs/" + job.id + "/preview.png") : "");
-  const hasArt = !!(vectorSrc || job.file_path);
+  const rasterFirst = suiteTool === "upscale" || suiteTool === "bgremove" || suiteTool === "stones";
+  const rasterPath = (suiteTool === "upscale" && job.upscale_png) ? job.upscale_png : (job.file_path || "");
+  const hasArt = !!((!rasterFirst && vectorSrc) || rasterPath || job.file_path);
   let previewOutline = false;
   try { previewOutline = localStorage.getItem("dcPreviewMode") === "outline"; } catch (e) { /* ignore */ }
-  const preview = vectorSrc
+  const preview = (!rasterFirst && vectorSrc)
     ? `<img id="artZoomImg" class="art-svg-host" alt="Vector preview" draggable="false" />`
-    : (job.file_path ? `<img id="artZoomImg" class="art-svg-host" src="${escapeHtml(job.file_path)}" alt="Art" draggable="false" />` : `<div class="drop-hint"><strong>Drop art here</strong><span>PNG, JPG, or WebP</span></div>`);
+    : (rasterPath ? `<img id="artZoomImg" class="art-svg-host" src="${escapeHtml(rasterPath)}" alt="Art" draggable="false" />` : `<div class="drop-hint"><strong>Drop art here</strong><span>PNG, JPG, or WebP</span></div>`);
   function layerRgb(L) {
     if (L.rgb) return L.rgb;
     const h = String(L.hex || "#111111").replace("#", "");
@@ -906,8 +1040,8 @@ async function fillArt(el, job, shopControls) {
   }
 
   const usedLine = lastSet.detail != null
-    ? `<p class="muted vz-used" id="vzUsed">Last run · Detail ${escapeHtml(detailReadout(toPct(lastSet.detail, DETAIL_LEGACY, 50)))} · Smoothing ${escapeHtml(smoothReadout(toPct(lastSet.smoothing, SMOOTH_LEGACY, 50)))} · Corners ${escapeHtml(cornerReadout(toPct(lastSet.cornerSmooth, CORNER_LEGACY, 50)))}</p>`
-    : `<p class="muted vz-used" id="vzUsed" hidden></p>`;
+    ? `<p class="muted vz-used" id="vzUsed" data-suite="vectorize">Last run · Detail ${escapeHtml(detailReadout(toPct(lastSet.detail, DETAIL_LEGACY, 50)))} · Smoothing ${escapeHtml(smoothReadout(toPct(lastSet.smoothing, SMOOTH_LEGACY, 50)))} · Corners ${escapeHtml(cornerReadout(toPct(lastSet.cornerSmooth, CORNER_LEGACY, 50)))}</p>`
+    : `<p class="muted vz-used" id="vzUsed" data-suite="vectorize" hidden></p>`;
 
   const extras = studioExtras();
   const RAIL_ICO = {
@@ -919,9 +1053,14 @@ async function fillArt(el, job, shopControls) {
     export: '<path d="M12 4v12M7 11l5 5 5-5"/><path d="M4 20h16"/>',
   };
   extras.forEach((m) => { if (m && m.id && m.railIcon) RAIL_ICO[m.id] = m.railIcon; });
-  const railBtn = (key, label) => `<button type="button" class="rail-btn" data-rail="${key}" title="${escapeHtml(label)}"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" aria-hidden="true">${RAIL_ICO[key]}</svg><span>${escapeHtml(label)}</span></button>`;
+  const railBtn = (key, label, suite) => `<button type="button" class="rail-btn" data-rail="${key}" data-suite="${suite || "shared"}" title="${escapeHtml(label)}"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" aria-hidden="true">${RAIL_ICO[key]}</svg><span>${escapeHtml(label)}</span></button>`;
+  const upMeta = job.upscale || null;
+  const upLine = upMeta && upMeta.src_px && upMeta.out_px
+    ? (upMeta.src_px[0] + " × " + upMeta.src_px[1] + " px · " + (upMeta.src_dpi || 72) + " DPI → " + upMeta.out_px[0] + " × " + upMeta.out_px[1] + " px · " + upMeta.width_in + " × " + upMeta.height_in + " in at 300 DPI · " + upMeta.seconds + "s")
+    : "72 DPI → 300 DPI. Set the print width, then upscale.";
+  const upWidthVal = (upMeta && upMeta.width_in) || 12;
   const exportPanel = `
-        ${shopControls && (layers.length || jobHasVector(job)) ? `<div class="export-grid export-hero art-dl">
+        ${shopControls && (layers.length || jobHasVector(job)) ? `<div data-suite="vectorize halftones"><div class="export-grid export-hero art-dl">
           <a href="/api/export/${job.id}/art.svg">Download SVG</a>
           <a href="/api/export/${job.id}/art.eps">Download EPS</a>
           <a href="/api/export/${job.id}/art.pdf">Download PDF</a>
@@ -933,39 +1072,51 @@ async function fillArt(el, job, shopControls) {
           <a href="/api/export/${job.id}/art-dtf.tiff" title="TIFF page 2 = white underbase, choked 0.35 px, none under semi-transparent pixels">DTF TIFF + white</a>
           <a href="/api/export/${job.id}/art-underbase.png" title="White underbase only, choked 0.35 px">White underbase</a>
         </div>
-        <p class="muted">Vector: SVG / EPS / PDF / DXF (laser + cutter) · Raster: 300 DPI at true print size, transparent · DTF white choked in, none under soft edges</p>` : ""}
-        ${shopControls && job.file_path && !vectorSrc ? `<div class="export-grid export-hero art-dl">
+        <p class="muted">Vector: SVG / EPS / PDF / DXF (laser + cutter) · Raster: 300 DPI at true print size, transparent · DTF white choked in, none under soft edges</p></div>` : ""}
+        ${shopControls && job.file_path && !vectorSrc ? `<div data-suite="vectorize bgremove"><div class="export-grid export-hero art-dl">
           <a href="/api/export/${job.id}/art.png" id="dlArtPng">Download PNG</a>
         </div>
-        <p class="muted">Raster art · PNG</p>` : ""}
+        <p class="muted">Raster art · PNG</p></div>` : ""}
+        ${shopControls ? `<div data-suite="upscale" class="export-grid export-hero art-dl" hidden>
+          <a href="/api/export/${job.id}/art-upscaled-300dpi.png">Download 300 DPI PNG</a>
+        </div>` : ""}
+        ${shopControls ? `<div data-suite="bgremove" class="export-grid export-hero art-dl" hidden>
+          <a href="/api/export/${job.id}/art-nobg.png">Download transparent PNG</a>
+          <a href="/api/export/${job.id}/art-cutout.svg">Download SVG</a>
+        </div>` : ""}
+        ${shopControls ? `<div data-suite="stones" class="export-grid export-hero art-dl" hidden>
+          <a href="/api/export/${job.id}/stones.svg">Stones SVG</a>
+          <a href="/api/export/${job.id}/stones.csv">Stones CSV</a>
+          <a href="/api/export/${job.id}/stones.plt">Stones PLT</a>
+        </div>` : ""}
         ${extras.map((m) => {
           if (!shopControls || !m || typeof m.exportHtml !== "function") return "";
           if (m.needsArt && !(layers.length || jobHasVector(job))) return "";
           return m.exportHtml(job, { layers: layers });
         }).join("")}
-        ${shopControls ? `<button type="button" class="btn ghost small studio-more-files" id="moreFilesBtn">All production files →</button>` : ""}`;
+        ${shopControls ? `<button type="button" class="btn ghost small studio-more-files" id="moreFilesBtn" data-suite="vectorize halftones">All production files →</button>` : ""}`;
 
   el.innerHTML = `
     <div class="studio art-simple${shopControls ? "" : " studio-view"}">
       ${shopControls ? `<nav class="studio-rail" aria-label="Studio tools">
-        ${railBtn("upload", "Upload")}
-        ${railBtn("vectorize", "Vectorize")}
-        ${railBtn("halftones", "Halftones")}
-        ${layers.length ? railBtn("colors", "Colors") : ""}
-        ${railBtn("clean", "Clean up")}
-        ${extras.filter((m) => m && m.railLabel).map((m) => railBtn(m.id, m.railLabel)).join("")}
-        ${railBtn("export", "Export")}
+        ${railBtn("upload", "Upload", "shared")}
+        ${railBtn("vectorize", "Vectorize", "vectorize")}
+        ${railBtn("halftones", "Halftones", "halftones")}
+        ${layers.length ? railBtn("colors", "Colors", "vectorize") : ""}
+        ${railBtn("clean", "Clean up", "bgremove")}
+        ${extras.filter((m) => m && m.railLabel).map((m) => railBtn(m.id, m.railLabel, m.id)).join("")}
+        ${railBtn("export", "Export", "shared")}
       </nav>` : ""}
       <aside class="studio-panel art-tools">
         ${shopControls ? `
         ${runRiskHtml(job)}
-        <div class="art-actions">
-          <button class="btn primary" id="vectorizeBtn" type="button">Vectorize</button>
-          <button class="btn primary" id="halftoneBtn" type="button" title="Real vector half-tones for DTF / screen / print">Halftones</button>
-          <button class="btn ghost" id="greyBtn" type="button">Hi-res greyscale</button>
-          <button class="btn ghost" id="invertBtn" type="button">Invert black &amp; white</button>
+        <div class="art-actions" data-suite="vectorize halftones">
+          <button class="btn primary" id="vectorizeBtn" type="button" data-suite="vectorize">Vectorize</button>
+          <button class="btn primary" id="halftoneBtn" type="button" data-suite="halftones" title="Real vector half-tones for DTF / screen / print">Halftones</button>
+          <button class="btn ghost" id="greyBtn" type="button" data-suite="vectorize">Hi-res greyscale</button>
+          <button class="btn ghost" id="invertBtn" type="button" data-suite="vectorize">Invert black &amp; white</button>
         </div>
-        <div class="ht-panel" id="htPanel" hidden>
+        <div class="ht-panel" id="htPanel" data-suite="halftones" hidden>
           <div class="ht-panel-head">
             <strong>Vector Halftones</strong>
             <span class="muted">Real SVG dots / lines · DTF &amp; screen</span>
@@ -992,8 +1143,44 @@ async function fillArt(el, job, shopControls) {
           </div>
           <p class="muted ht-hint" id="htHint">Live preview on the art · Apply commits real vector SVG.</p>
         </div>
-        <p class="muted vz-best">Best on clean logos and AI-generated art (smooth SVG/EPS for your design software). Soft photos and busy posters improve, but results vary.</p>
-        <div class="vz-options" id="vzOptions">
+        <div class="suite-pane" id="upscalePane" data-suite="upscale" hidden>
+          <h2>300 DPI Upscaler</h2>
+          <p class="muted">Low-res 72 DPI client art becomes a true 300 DPI print PNG. Edges stay sharp.</p>
+          <p class="mono" id="upscaleDims">${escapeHtml(upLine)}</p>
+          <label class="suite-field">Target print width (inches)
+            <input id="upWidth" type="number" min="1" max="16" step="0.25" value="${escapeHtml(String(upWidthVal))}" />
+          </label>
+          <label class="remember"><input id="upRemoveBg" type="checkbox" ${upMeta && upMeta.remove_background ? "checked" : ""} /> Remove background</label>
+          <div class="cta-row">
+            <button class="btn primary" id="upscaleGo" type="button">Upscale to 300 DPI</button>
+            <a class="btn" id="upscaleDl" href="/api/export/${job.id}/art-upscaled-300dpi.png">Download 300 DPI PNG</a>
+          </div>
+        </div>
+        <div class="suite-pane" id="bgPane" data-suite="bgremove" hidden>
+          <h2>Remove Background</h2>
+          <p class="muted">One-click clean background removal. Download a transparent PNG and an SVG of the cutout.</p>
+          <button class="btn primary" id="bgGo" type="button">Remove background</button>
+          <div class="export-grid export-hero art-dl">
+            <a href="/api/export/${job.id}/art-nobg.png">Download transparent PNG</a>
+            <a href="/api/export/${job.id}/art-cutout.svg">Download SVG</a>
+          </div>
+        </div>
+        <div class="suite-pane" id="stonesPane" data-suite="stones" hidden>
+          <h2>Rhinestones</h2>
+          <p class="muted">Build a crystal layout from the artwork. Download the template as SVG, CSV, and PLT.</p>
+          <label class="suite-field">Stone size
+            <select id="stoneSs">
+              <option value="SS6">SS6</option>
+              <option value="SS8">SS8</option>
+              <option value="SS10" selected>SS10</option>
+              <option value="SS12">SS12</option>
+            </select>
+          </label>
+          <button class="btn primary" id="stonesGo" type="button">Build rhinestone template</button>
+          <p class="mono" id="stonesCount">${job.stones && job.stones.count != null ? escapeHtml(String(job.stones.count) + " stones · " + (job.stones.ss || "")) : ""}</p>
+        </div>
+        <p class="muted vz-best" data-suite="vectorize">Best on clean logos and AI-generated art (smooth SVG/EPS for your design software). Soft photos and busy posters improve, but results vary.</p>
+        <div class="vz-options" id="vzOptions" data-suite="vectorize">
           ${continuousSliderRow("detailRow", "Detail", "How many colors to keep — drag for live preview",
             initDetail, "Simple", "Fine art", detailReadout)}
           ${continuousSliderRow("smoothRow", "Smoothing", "Round out jagged edges from photos and screenshots",
@@ -1004,16 +1191,16 @@ async function fillArt(el, job, shopControls) {
           <p class="vz-updating-flag" id="vzUpdating" hidden>Updating…</p>
         </div>
         ${usedLine}` : ""}
-        ${shopControls && layers.length ? `<div class="color-mode-row" id="colorModeRow">
+        ${shopControls && layers.length ? `<div class="color-mode-row" id="colorModeRow" data-suite="vectorize">
           <span class="muted">Layer colors</span>
           <div class="vz-seg-row color-mode-seg">
             <button type="button" class="vz-seg${initColorMode==="rgb"?" on":""}" data-mode="rgb" title="Edit as screen RGB">RGB</button>
             <button type="button" class="vz-seg${initColorMode==="cmyk"?" on":""}" data-mode="cmyk" title="Edit as print CMYK">CMYK</button>
           </div>
         </div>` : ""}
-        <div class="layer-list${shopControls ? " color-mode-" + initColorMode : ""}" id="layerList">${layerRows}</div>
+        <div class="layer-list${shopControls ? " color-mode-" + initColorMode : ""}" id="layerList" data-suite="vectorize">${layerRows}</div>
         ${shopControls ? `
-        <details class="art-more" id="artMore">
+        <details class="art-more" id="artMore" data-suite="vectorize">
           <summary>More tools</summary>
           <label class="remember"><input id="rmbg" type="checkbox" checked /> Background removal, one click</label>
           <div class="row">
@@ -1044,7 +1231,7 @@ async function fillArt(el, job, shopControls) {
             <button type="button" class="zoom-btn" id="bgToggle" title="Switch preview background (light / dark) so every ink stands out">Light bg</button>
             ${vectorSrc ? `<button type="button" class="zoom-btn" id="outlineToggle" aria-pressed="${previewOutline ? "true" : "false"}" title="Outline preview — strokes only">Outline</button>` : ""}
           </div>` : ""}
-          ${shopControls ? `<button type="button" class="btn small ct-export" id="ctExport">Export</button>` : ""}
+          ${shopControls ? `<button type="button" class="btn small ct-export" id="ctExport" data-suite="vectorize halftones">Export</button>` : ""}
         </div>
         <div class="canvas-ruled">
           <div class="ruler ruler-x" aria-hidden="true"></div>
@@ -1059,7 +1246,7 @@ async function fillArt(el, job, shopControls) {
         <input id="artFile" type="file" accept="image/*,.svg,.pdf" hidden />
       </section>
       <aside class="studio-right">
-        <div class="studio-card price-card">
+        <div class="studio-card price-card" data-suite="vectorize halftones">
           <div class="kicker">Pricing</div>
           <div class="price-line"><strong>$3</strong> <span class="muted">per image</span></div>
           <div class="price-line"><strong>$20</strong> <span class="muted">10-pack credits · never expire</span></div>
@@ -1093,7 +1280,7 @@ async function fillArt(el, job, shopControls) {
     const ctx = $("#ctExport"); if (ctx) ctx.onclick = railGo.export;
     const mf = $("#moreFilesBtn"); if (mf) mf.onclick = () => { station = "export"; renderJob(job.id); };
   }
-  if (!shopControls) return;
+  if (!shopControls) { applySuiteFocus(el); return; }
 
   let vzDetail = initDetail;
   let vzSmooth = initSmooth;
@@ -1182,8 +1369,16 @@ async function fillArt(el, job, shopControls) {
       file = await fileToPng(file);
       const fd = new FormData();
       fd.append("artwork", file);
-      const rm = document.getElementById("rmbg");
-      fd.append("remove_bg", !rm || rm.checked ? "1" : "0");
+      let removeBg = "0";
+      if (suiteTool === "bgremove") removeBg = "1";
+      else if (suiteTool === "upscale") {
+        const upBg = document.getElementById("upRemoveBg");
+        removeBg = upBg && upBg.checked ? "1" : "0";
+      } else {
+        const rm = document.getElementById("rmbg");
+        removeBg = rm && rm.checked ? "1" : "0";
+      }
+      fd.append("remove_bg", removeBg);
       showArtWorking("Uploading…");
       const res = await uploadWithProgress("/api/jobs/" + job.id + "/artwork", fd, {
         onProgress: (pct) => showArtWorking(pct == null ? "Uploading…" : ("Uploading " + pct + "%…")),
@@ -1205,6 +1400,7 @@ async function fillArt(el, job, shopControls) {
   }
   const artFile = $("#artFile");
   const drop = $("#artDrop");
+  if (!artFile || !drop) return;
   artFile.onchange = () => { if (artFile.files && artFile.files[0]) uploadArtwork(artFile.files[0]); };
   const replaceBtn = $("#replaceBtn");
   if (replaceBtn) replaceBtn.onclick = () => artFile.click();
@@ -1776,6 +1972,77 @@ async function fillArt(el, job, shopControls) {
       setHtModeUi(false);
     }
   }
+
+  applySuiteFocus(el);
+  async function runUpscale() {
+    const btn = $("#upscaleGo");
+    const errEl = $("#err");
+    const width = Number(($("#upWidth") && $("#upWidth").value) || (job.upscale && job.upscale.width_in) || 12);
+    const removeBg = !!($("#upRemoveBg") && $("#upRemoveBg").checked);
+    try {
+      if (btn) { btn.disabled = true; btn.textContent = "Upscaling…"; }
+      showArtWorking("Upscaling to 300 DPI…");
+      await api("/api/jobs/" + job.id + "/upscale", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ width_in: width, remove_background: removeBg }),
+      });
+      hideArtWorking();
+      renderJob(job.id);
+    } catch (err) {
+      hideArtWorking();
+      if (errEl) errEl.textContent = err.message || "Could not upscale";
+      if (btn) { btn.disabled = false; btn.textContent = "Upscale to 300 DPI"; }
+    }
+  }
+  const upscaleGo = $("#upscaleGo");
+  if (upscaleGo) upscaleGo.onclick = () => runUpscale();
+  const upWidthJob = $("#upWidth");
+  if (upWidthJob) upWidthJob.oninput = () => {
+    const dims = $("#upscaleDims");
+    const img = $("#artZoomImg");
+    if (!dims) return;
+    const inches = Math.min(16, Math.max(1, Number(upWidthJob.value) || 12));
+    const sw = img && img.naturalWidth;
+    const sh = img && img.naturalHeight;
+    if (!sw || !sh) {
+      dims.textContent = "72 DPI → " + Math.round(inches * 300) + " px wide at 300 DPI (" + inches + " in)";
+      return;
+    }
+    let widthIn = inches;
+    let heightIn = widthIn * (sh / sw);
+    if (heightIn > 16) { heightIn = 16; widthIn = heightIn / (sh / sw); }
+    dims.textContent = sw + " × " + sh + " px · 72 DPI → " + Math.round(widthIn * 300) + " × " + Math.round(heightIn * 300) + " px · " + widthIn.toFixed(2) + " × " + heightIn.toFixed(2) + " in at 300 DPI";
+  };
+  if (suiteTool === "upscale" && job.file_path && !job.upscale && !upscaleStarted[job.id]) {
+    upscaleStarted[job.id] = true;
+    runUpscale();
+  }
+  const bgGo = $("#bgGo");
+  if (bgGo) bgGo.onclick = () => { const b = $("#rmbgBtn"); if (b) b.click(); };
+  const stonesGo = $("#stonesGo");
+  if (stonesGo) stonesGo.onclick = async () => {
+    const errEl = $("#err");
+    try {
+      stonesGo.disabled = true;
+      stonesGo.textContent = "Building…";
+      const ss = ($("#stoneSs") && $("#stoneSs").value) || "SS10";
+      const data = await api("/api/jobs/" + job.id + "/stones", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ ss: ss }),
+      });
+      const n = $("#stonesCount");
+      if (n) n.textContent = (data.count != null ? data.count : "?") + " stones · " + (data.ss || ss);
+      if (errEl) errEl.textContent = "";
+      stonesGo.disabled = false;
+      stonesGo.textContent = "Build rhinestone template";
+    } catch (err) {
+      if (errEl) errEl.textContent = err.message || "Could not build the template";
+      stonesGo.disabled = false;
+      stonesGo.textContent = "Build rhinestone template";
+    }
+  };
 
   const ig = $("#imagineGo");
   if (ig) ig.onclick = async () => {
@@ -2569,7 +2836,9 @@ window.DecoStudio = {
   getStation: () => station,
   setStation: (next) => { station = next; },
   extras: [],
+  suiteTools: [],
   register: function (mod) { if (mod && mod.id) this.extras.push(mod); },
+  registerSuiteTool: function (tool) { if (tool && tool.id) this.suiteTools.push(tool); },
 };
 
 boot().catch((err) => { main.innerHTML = `<p class="notice">${escapeHtml(err.message)}</p>`; });

@@ -528,19 +528,113 @@ function serviceCatalog(settings, user) {
     halftones.included_with = ["studio", "admin"];
     halftones.apply = "studio_unlimited_or_credit";
   }
-  if (!digitizeFor(user)) return { vectorize: vectorize, halftones: halftones };
+  const upscale = {
+    name: "300 DPI Upscaler",
+    description: "Low-res 72 DPI client art to a true 300 DPI print PNG",
+    unit: "image",
+  };
+  if (!digitizeFor(user)) return { vectorize: vectorize, halftones: halftones, upscale: upscale };
   const digitize = {
     name: "Digitize",
     description: "Stitch preview · draft DST/EXP",
   };
   if (mem) digitize.included_with = ["trial", "shop", "studio", "admin"];
-  return { vectorize: vectorize, digitize: digitize, halftones: halftones };
+  return { vectorize: vectorize, digitize: digitize, halftones: halftones, upscale: upscale };
 }
 
 function enabledServiceNames(user) {
-  const list = ["vectorize", "halftones"];
+  const list = ["vectorize", "halftones", "upscale"];
   if (digitizeFor(user)) list.splice(1, 0, "digitize");
   return list;
+}
+
+function normalizeSuiteTool(raw, user) {
+  const t = String(raw || "").toLowerCase();
+  if (t === "halftone") return "halftones";
+  if (t === "vectorize" || t === "bgremove" || t === "halftones" || t === "upscale" || t === "stones") return t;
+  if (t === "digitize" && digitizeFor(user)) return "digitize";
+  return "";
+}
+
+function clampUpscaleInches(v) {
+  const n = Number(v);
+  if (!Number.isFinite(n)) return 12;
+  return Math.min(16, Math.max(1, Math.round(n * 1000) / 1000));
+}
+
+function pythonBin() {
+  const candidates = [process.env.INVENT_WARP_PYTHON, process.env.DIGITIZE_PYTHON];
+  for (let i = 0; i < candidates.length; i++) {
+    if (candidates[i] && fs.existsSync(candidates[i])) return candidates[i];
+  }
+  return "python3";
+}
+
+function runDtfUpscale(inAbs, outAbs, opts) {
+  const { execFile } = require("child_process");
+  const width = clampUpscaleInches(opts && opts.widthIn);
+  const args = [path.join(__dirname, "lib", "dtf_upscale.py"), inAbs, outAbs, "--width-in", String(width)];
+  if (opts && opts.removeBg) args.push("--remove-bg");
+  return new Promise(function (resolve, reject) {
+    execFile(pythonBin(), args, { timeout: 90000, maxBuffer: 1 << 20 }, function (err, so, se) {
+      if (err) return reject(new Error(String(se || so || err.message).trim().slice(0, 400)));
+      let meta = null;
+      String(so || "").split(/\r?\n/).forEach(function (line) {
+        const trimmed = line.trim();
+        if (trimmed.charAt(0) !== "{") return;
+        try { meta = JSON.parse(trimmed); } catch (e) { meta = null; }
+      });
+      if (!meta || meta.ok === false) return reject(new Error((meta && meta.error) || "Upscale failed"));
+      if (!fs.existsSync(outAbs)) return reject(new Error("Upscale did not write a PNG"));
+      resolve(meta);
+    });
+  });
+}
+
+async function upscaleJobFile(job, opts) {
+  if (!job || !job.file_path) {
+    const err = new Error("Artwork required for upscale");
+    err.status = 400;
+    throw err;
+  }
+  const abs = path.join(UPLOADS, path.basename(job.file_path));
+  if (!fs.existsSync(abs)) {
+    const err = new Error("Artwork missing");
+    err.status = 404;
+    throw err;
+  }
+  const outName = Date.now() + "-" + uid() + "-upscale-300.png";
+  const outAbs = path.join(UPLOADS, outName);
+  const meta = await runDtfUpscale(abs, outAbs, opts || {});
+  job.upscale_png = "/uploads/" + outName;
+  job.upscale = {
+    src_px: meta.src_px,
+    out_px: meta.out_px,
+    src_dpi: meta.src_dpi,
+    dpi: meta.dpi || 300,
+    width_in: meta.width_in,
+    height_in: meta.height_in,
+    phys_ppm: meta.phys_ppm,
+    remove_background: !!meta.remove_background,
+    seconds: meta.seconds,
+    file: job.upscale_png,
+  };
+  job.width_in = meta.width_in;
+  job.height_in = meta.height_in;
+  return job.upscale;
+}
+
+function pngPixelSize(buf) {
+  if (!buf || buf.length < 24 || buf[0] !== 0x89 || buf[1] !== 0x50) return null;
+  return { width: buf.readUInt32BE(16), height: buf.readUInt32BE(20) };
+}
+
+function cutoutSvg(pngBuf) {
+  const size = pngPixelSize(pngBuf) || { width: 1, height: 1 };
+  const b64 = pngBuf.toString("base64");
+  return '<?xml version="1.0" encoding="UTF-8"?>\n' +
+    '<svg xmlns="http://www.w3.org/2000/svg" width="' + size.width + '" height="' + size.height + '" viewBox="0 0 ' + size.width + " " + size.height + '">\n' +
+    '<image width="' + size.width + '" height="' + size.height + '" href="data:image/png;base64,' + b64 + '"/>\n</svg>\n';
 }
 
 /** Studio tool calls need a signed-in account. Logged-out callers get 401; signed-in checks stay as they are. */
@@ -548,6 +642,7 @@ function studioToolApi(method, pth) {
   if (method === "POST" && pth === "/api/jobs") return true;
   if (method === "POST" && /^\/api\/jobs\/[^/]+\/artwork$/.test(pth)) return true;
   if (method === "POST" && /^\/api\/jobs\/[^/]+\/artops$/.test(pth)) return true;
+  if (method === "POST" && /^\/api\/jobs\/[^/]+\/upscale$/.test(pth)) return true;
   if (method === "POST" && /^\/api\/jobs\/[^/]+\/vectorize$/.test(pth)) return true;
   if (method === "POST" && /^\/api\/jobs\/[^/]+\/corel-import$/.test(pth)) return true;
   if (method === "POST" && /^\/api\/jobs\/[^/]+\/recolor$/.test(pth)) return true;
@@ -1800,7 +1895,7 @@ async function handleApi(req, res, url) {
 
   if (pth === "/api/config" && method === "GET") {
     const st = ensureSettings(db);
-    const services = { vectorize: true, halftones: true };
+    const services = { vectorize: true, halftones: true, upscale: true };
     if (digitizeFor(user)) services.digitize = true;
     const body = { demo: allowDemo(), billing: billingConfigured(), imagine: false, imagineModel: null, vectorizerAi: false, vtracer: vtracer.available(), vaiTrace: vaiTrace.available(), inventVectorize: true, inventWinner: null, rasterCorel: true, inventWarp: inventWarp.available(), inventWarpReason: inventWarp.available() ? null : (inventWarp.unavailableReason && inventWarp.unavailableReason()), corelImport: true, name: "DecoClub Pro", statuses: STATUSES, methods: methodsFor(user), blanks: BLANKS, seed: allowDemo() ? { owner: "owner@anvil.local", client: "client@anvil.local", password: "anvil123" } : null, services: services, features: flagsFor(user), pricing: { vectorize: buyOptions("vectorize", st), halftones: buyOptions("halftones", st) }, halftonePricing: halftoneBuyOptions(st) };
     if (digitizeFor(user)) body.adminModules = ["/digitize-preview.js", "/digitize-admin.js"];
@@ -2108,6 +2203,9 @@ async function handleApi(req, res, url) {
       margin_pct: f.margin_pct != null ? Number(f.margin_pct) : (shop && shop.margin_pct) || 0,
       line_items: [], comments: [], created_at: now, updated_at: now,
     };
+    const suite = normalizeSuiteTool(f.suite_tool, user);
+    if (suite) job.suite_tool = suite;
+    if (suite === "upscale") job.width_in = clampUpscaleInches(f.upscale_width_in != null ? f.upscale_width_in : f.width_in);
     if (parsed.file) job.file_path = applyUploadMatte(job.file_path, f);
     if (job.file_path) job.status = "art_in";
     applyQuote(job); applyMockup(job);
@@ -2276,6 +2374,28 @@ async function handleApi(req, res, url) {
         download: body.invert ? "png" : null,
       });
     } catch (err) { return json(res, 400, { error: IS_PROD ? "Could not process artwork" : err.message }); }
+  }
+  const upJob = pth.match(/^\/api\/jobs\/([^/]+)\/upscale$/);
+  if (upJob && method === "POST") {
+    if (!canRunFloor(user)) return json(res, 403, { error: "Shop login required" });
+    const job = db.jobs.find(function (j) { return j.id === upJob[1] && j.shop_id === user.shop_id; });
+    if (!job) return json(res, 404, { error: "Job not found" });
+    const body = parseJsonBody(await readBody(req));
+    const widthIn = body.width_in != null ? body.width_in : (body.widthIn != null ? body.widthIn : ((job.upscale && job.upscale.width_in) || job.width_in || 12));
+    const removeBg = truthy(body.remove_background || body.remove_bg || body.removeBg);
+    try {
+      const meta = await upscaleJobFile(job, { widthIn: widthIn, removeBg: removeBg });
+      event(db, job, "Upscaled to 300 DPI · " + meta.out_px[0] + "×" + meta.out_px[1]);
+      save(db);
+      return json(res, 200, {
+        job: presentJob(job, req),
+        upscale: meta,
+        download: "/api/export/" + job.id + "/art-upscaled-300dpi.png",
+      });
+    } catch (err) {
+      const code = err.status || 500;
+      return json(res, code, { error: code >= 500 && IS_PROD ? "Could not upscale artwork" : String(err.message || err).slice(0, 300) });
+    }
   }
   const htStyles = pth === "/api/halftone/styles" && method === "GET";
   if (htStyles) {
@@ -3050,6 +3170,37 @@ async function handleApi(req, res, url) {
     }
     const job = db.jobs.find(function (j) { return j.id === expFile[1] && j.shop_id === user.shop_id; });
     if (!job) return json(res, 404, { error: "Job not found" });
+    if (expFile[2] === "art-upscaled-300dpi.png" || expFile[2] === "art-nobg.png" || expFile[2] === "art-cutout.svg") {
+      try {
+        if (expFile[2] === "art-upscaled-300dpi.png") {
+          const qWidth = url.searchParams.get("width_in");
+          const qBg = url.searchParams.has("remove_bg") || url.searchParams.has("remove_background");
+          const wantBg = qBg ? truthy(url.searchParams.get("remove_bg") || url.searchParams.get("remove_background")) : !!(job.upscale && job.upscale.remove_background);
+          const wantW = qWidth != null ? Number(qWidth) : ((job.upscale && job.upscale.width_in) || 12);
+          const cachedAbs = job.upscale_png ? path.join(UPLOADS, path.basename(job.upscale_png)) : "";
+          const cacheOk = cachedAbs && fs.existsSync(cachedAbs) && job.upscale
+            && Math.abs(Number(job.upscale.width_in) - clampUpscaleInches(wantW)) < 0.02
+            && !!job.upscale.remove_background === !!wantBg;
+          if (!cacheOk) {
+            await upscaleJobFile(job, { widthIn: wantW, removeBg: wantBg });
+            event(db, job, "Upscaled to 300 DPI");
+            save(db);
+          }
+          const file = path.join(UPLOADS, path.basename(job.upscale_png));
+          return download(res, "decoclub-" + job.id.slice(0, 8) + "-300dpi.png", fs.readFileSync(file), "image/png");
+        }
+        if (!job.file_path) return json(res, 404, { error: "Artwork missing" });
+        const artAbs = path.join(UPLOADS, path.basename(job.file_path));
+        if (!fs.existsSync(artAbs)) return json(res, 404, { error: "Artwork missing" });
+        const artBuf = fs.readFileSync(artAbs);
+        if (expFile[2] === "art-nobg.png") {
+          return download(res, "decoclub-" + job.id.slice(0, 8) + "-nobg.png", artBuf, "image/png");
+        }
+        return download(res, "decoclub-" + job.id.slice(0, 8) + "-cutout.svg", cutoutSvg(artBuf), "image/svg+xml");
+      } catch (err) {
+        return json(res, err.status || 500, { error: String(err && err.message || err).slice(0, 300) });
+      }
+    }
     if (!requireExportEntitled(user, job, res, ensureSettings(db))) return;
     job._shop = db.shops.find(function (s) { return s.id === user.shop_id; });
     if (expFile[2] === "art.svg" && job.vector_svg) {
@@ -3514,6 +3665,17 @@ function serveStatic(req, res, url) {
   const digitizeAsset = rel === "/digitize-demo.html" || rel === "/digitize-preview.js" || rel === "/digitize-admin.js";
   if (digitizeAsset && !digitizeFor(viewer)) return send(res, 404, "Not found");
   const ALIAS = { "/login": "/login.html", "/app": "/app.html", "/admin": "/admin.html", "/signup": "/signup.html", "/start": "/start.html", "/contact": "/contact.html" };
+  if (rel === "/index.html" && digitizeFor(viewer)) {
+    const html = fs.readFileSync(path.join(PUBLIC, "index.html"), "utf8").replace(
+      "<!-- suite-extra -->",
+      '<a class="suite-card" href="/app?tool=digitize"><span class="suite-kicker">Admin</span><strong>Digitize</strong><span>Stitch preview and machine files. Shown only while this tool is enabled for an admin.</span><span class="suite-go">Open</span></a>'
+    );
+    return send(res, 200, html, {
+      "Content-Type": "text/html; charset=utf-8",
+      "Cache-Control": "private, no-store",
+      "Vary": "Cookie",
+    });
+  }
   if (ALIAS[rel]) rel = ALIAS[rel];
   // Studio shell and tool entry require an account. Public pages stay on disk.
   if ((rel === "/app.html" || rel === "/start.html") && !viewer) {
