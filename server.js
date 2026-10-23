@@ -145,7 +145,7 @@ function ensureAdmin(db) {
   let dirty = false;
   if (!(db.users || []).some(function (u) { return u.role === "admin"; })) {
     const email = String(process.env.ADMIN_EMAIL || "Davidhanes2@yahoo.com").toLowerCase();
-    const password = process.env.ADMIN_PASSWORD || Buffer.from("4463502d755f75524e6f4e6c6a5a483350453163", "hex").toString("utf8");
+    const password = process.env.ADMIN_PASSWORD ? String(process.env.ADMIN_PASSWORD) : crypto.randomBytes(24).toString("hex");
     const now = new Date().toISOString();
     db.users.push({
       id: uid(), email: email, name: (email === "davidhanes2@yahoo.com" || email === "david@coreltrainer.com") ? "David Hanes" : "Admin",
@@ -161,6 +161,16 @@ function ensureAdmin(db) {
       legacy.email = want;
       legacy.name = "David Hanes";
       dirty = true;
+    }
+    const envPw = process.env.ADMIN_PASSWORD ? String(process.env.ADMIN_PASSWORD) : "";
+    if (envPw) {
+      (db.users || []).forEach(function (u) {
+        if (u && u.role === "admin" && !checkPass(envPw, u.password_hash)) {
+          u.password_hash = hashPass(envPw);
+          db.sessions = (db.sessions || []).filter(function (sess) { return sess && sess.user_id !== u.id; });
+          dirty = true;
+        }
+      });
     }
   }
   return dirty;
@@ -1149,15 +1159,27 @@ function seedDemoArt() {
   if (!fs.existsSync(pth)) fs.writeFileSync(pth, generateBadgePng());
   return "/uploads/demo-badge.png";
 }
-/** Drop expired session rows (cheap; store stays small). */
+// Invalidate any session issued before Oct 23, 2026 UTC (post-Oct-21 Railway security reset).
+const SESSION_MIN_CREATED_MS = Date.parse(process.env.SESSION_MIN_CREATED_AT || "2026-10-23T00:00:00Z") || 0;
+function sessionValidAge(s, now) {
+  if (!s) return false;
+  if (s.expires) {
+    const exp = Date.parse(s.expires);
+    if (exp && now > exp) return false;
+  }
+  if (SESSION_MIN_CREATED_MS > 0) {
+    const cr = s.created_at ? Date.parse(s.created_at) : 0;
+    if (!cr || cr < SESSION_MIN_CREATED_MS) return false;
+  }
+  return true;
+}
+/** Drop expired or pre-reset session rows (cheap; store stays small). */
 function pruneExpiredSessions(db) {
   if (!db || !Array.isArray(db.sessions)) return 0;
   const now = Date.now();
   const before = db.sessions.length;
   db.sessions = db.sessions.filter(function (s) {
-    if (!s || !s.expires) return true;
-    const t = Date.parse(s.expires);
-    return !(t && now > t);
+    return sessionValidAge(s, now);
   });
   return before - db.sessions.length;
 }
@@ -1238,10 +1260,15 @@ function ensureDemoJob(db) {
 
 
 const MIME = { ".html": "text/html; charset=utf-8", ".css": "text/css; charset=utf-8", ".js": "text/javascript; charset=utf-8", ".svg": "image/svg+xml", ".png": "image/png", ".jpg": "image/jpeg", ".jpeg": "image/jpeg", ".gif": "image/gif", ".webp": "image/webp", ".pdf": "application/pdf", ".dxf": "application/dxf", ".tiff": "image/tiff", ".json": "application/json", ".plt": "application/vnd.hp-hpgl", ".txt": "text/plain; charset=utf-8", ".eps": "application/postscript", ".dst": "application/octet-stream", ".exp": "application/octet-stream", ".pes": "application/octet-stream", ".csv": "text/csv; charset=utf-8" };
+const BASE_SEC_HEADERS = {
+  "X-Content-Type-Options": "nosniff",
+  "X-Frame-Options": "DENY",
+  "Referrer-Policy": "strict-origin-when-cross-origin",
+};
 function send(res, code, body, headers) {
   headers = headers || {};
   const payload = Buffer.isBuffer(body) ? body : Buffer.from(body || "");
-  res.writeHead(code, Object.assign({ "Content-Length": payload.length }, headers));
+  res.writeHead(code, Object.assign({}, BASE_SEC_HEADERS, { "Content-Length": payload.length }, headers));
   res.end(payload);
 }
 function json(res, code, obj) { send(res, code, JSON.stringify(obj), { "Content-Type": "application/json; charset=utf-8" }); }
@@ -1359,8 +1386,7 @@ function currentUser(req, db) {
   const token = parseCookies(req)[COOKIE];
   if (!token) return null;
   const sess = db.sessions.find(function (s) { return s.token === token; });
-  if (!sess) return null;
-  if (sess.expires && Date.now() > Date.parse(sess.expires)) return null;
+  if (!sess || !sessionValidAge(sess, Date.now())) return null;
   return db.users.find(function (u) { return u.id === sess.user_id; }) || null;
 }
 function publicUser(u) {
@@ -1776,7 +1802,7 @@ async function handleApi(req, res, url) {
     const st = ensureSettings(db);
     const services = { vectorize: true, halftones: true };
     if (digitizeFor(user)) services.digitize = true;
-    const body = { demo: allowDemo(), billing: billingConfigured(), imagine: imagineConfigured(), imagineModel: "latest", vectorizerAi: vectorizerAi.configured(), vtracer: vtracer.available(), vaiTrace: vaiTrace.available(), inventVectorize: true, inventWinner: null, rasterCorel: true, inventWarp: inventWarp.available(), inventWarpReason: inventWarp.available() ? null : (inventWarp.unavailableReason && inventWarp.unavailableReason()), corelImport: true, name: "DecoClub Pro", statuses: STATUSES, methods: methodsFor(user), blanks: BLANKS, seed: allowDemo() ? { owner: "owner@anvil.local", client: "client@anvil.local", password: "anvil123" } : null, services: services, features: flagsFor(user), pricing: { vectorize: buyOptions("vectorize", st), halftones: buyOptions("halftones", st) }, halftonePricing: halftoneBuyOptions(st) };
+    const body = { demo: allowDemo(), billing: billingConfigured(), imagine: false, imagineModel: null, vectorizerAi: false, vtracer: vtracer.available(), vaiTrace: vaiTrace.available(), inventVectorize: true, inventWinner: null, rasterCorel: true, inventWarp: inventWarp.available(), inventWarpReason: inventWarp.available() ? null : (inventWarp.unavailableReason && inventWarp.unavailableReason()), corelImport: true, name: "DecoClub Pro", statuses: STATUSES, methods: methodsFor(user), blanks: BLANKS, seed: allowDemo() ? { owner: "owner@anvil.local", client: "client@anvil.local", password: "anvil123" } : null, services: services, features: flagsFor(user), pricing: { vectorize: buyOptions("vectorize", st), halftones: buyOptions("halftones", st) }, halftonePricing: halftoneBuyOptions(st) };
     if (digitizeFor(user)) body.adminModules = ["/digitize-preview.js", "/digitize-admin.js"];
     return jsonPrivate(res, 200, body);
   }
@@ -3508,7 +3534,9 @@ function serveStatic(req, res, url) {
       });
     }
     const ext = path.extname(file).toLowerCase();
-    return send(res, 200, fs.readFileSync(file), { "Content-Type": MIME[ext] || "application/octet-stream", "Cache-Control": "private, no-store" });
+    const upHeaders = { "Content-Type": MIME[ext] || "application/octet-stream", "Cache-Control": "private, no-store" };
+    if (ext === ".svg") upHeaders["Content-Security-Policy"] = "default-src 'none'; img-src 'self' data:; style-src 'unsafe-inline'; sandbox";
+    return send(res, 200, fs.readFileSync(file), upHeaders);
   }
   const file = path.normalize(path.join(PUBLIC, rel));
   if (file.indexOf(PUBLIC) !== 0) return send(res, 403, "Forbidden");
