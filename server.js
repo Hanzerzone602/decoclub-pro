@@ -577,7 +577,20 @@ function runDtfUpscale(inAbs, outAbs, opts) {
   if (opts && opts.removeBg) args.push("--remove-bg");
   return new Promise(function (resolve, reject) {
     execFile(pythonBin(), args, { timeout: 90000, maxBuffer: 1 << 20 }, function (err, so, se) {
-      if (err) return reject(new Error(String(se || so || err.message).trim().slice(0, 400)));
+      if (err) {
+        let friendly = String(se || so || err.message || "Upscale failed").trim();
+        String(so || "").split(/\r?\n/).forEach(function (line) {
+          const trimmed = line.trim();
+          if (trimmed.charAt(0) !== "{") return;
+          try {
+            const meta = JSON.parse(trimmed);
+            if (meta && meta.error) friendly = String(meta.error);
+          } catch (e) { /* keep the process message */ }
+        });
+        const wrapped = new Error(friendly.slice(0, 300));
+        if (/too large|megapixel/i.test(friendly)) wrapped.status = 400;
+        return reject(wrapped);
+      }
       let meta = null;
       String(so || "").split(/\r?\n/).forEach(function (line) {
         const trimmed = line.trim();
@@ -589,6 +602,53 @@ function runDtfUpscale(inAbs, outAbs, opts) {
       resolve(meta);
     });
   });
+}
+
+const UPSCALE_MAX_PIXELS = 50000000;
+
+function rasterPixelCount(buf) {
+  if (!buf || buf.length < 24) return null;
+  if (buf[0] === 0x89 && buf[1] === 0x50 && buf[2] === 0x4e && buf[3] === 0x47) {
+    return buf.readUInt32BE(16) * buf.readUInt32BE(20);
+  }
+  if (buf[0] === 0xff && buf[1] === 0xd8) {
+    let i = 2;
+    while (i + 9 < buf.length) {
+      if (buf[i] !== 0xff) { i++; continue; }
+      const marker = buf[i + 1];
+      if (marker === 0xc0 || marker === 0xc1 || marker === 0xc2) {
+        return buf.readUInt16BE(i + 7) * buf.readUInt16BE(i + 5);
+      }
+      const len = buf.readUInt16BE(i + 2);
+      if (len < 2) break;
+      i += 2 + len;
+    }
+  }
+  if (buf.length >= 30 && buf.toString("ascii", 0, 4) === "RIFF" && buf.toString("ascii", 8, 12) === "WEBP") {
+    const kind = buf.toString("ascii", 12, 16);
+    if (kind === "VP8X") {
+      const w = 1 + (buf[24] | (buf[25] << 8) | (buf[26] << 16));
+      const h = 1 + (buf[27] | (buf[28] << 8) | (buf[29] << 16));
+      return w * h;
+    }
+  }
+  return null;
+}
+
+function assertUpscaleInputSize(abs) {
+  const fd = fs.openSync(abs, "r");
+  try {
+    const head = Buffer.alloc(65536);
+    const n = fs.readSync(fd, head, 0, head.length, 0);
+    const pixels = rasterPixelCount(head.subarray(0, n));
+    if (pixels != null && pixels > UPSCALE_MAX_PIXELS) {
+      const err = new Error("This image is too large to upscale (" + pixels + " pixels). Please use an image under 50 megapixels.");
+      err.status = 400;
+      throw err;
+    }
+  } finally {
+    fs.closeSync(fd);
+  }
 }
 
 async function upscaleJobFile(job, opts) {
@@ -603,6 +663,7 @@ async function upscaleJobFile(job, opts) {
     err.status = 404;
     throw err;
   }
+  assertUpscaleInputSize(abs);
   const outName = Date.now() + "-" + uid() + "-upscale-300.png";
   const outAbs = path.join(UPLOADS, outName);
   const meta = await runDtfUpscale(abs, outAbs, opts || {});
@@ -635,6 +696,53 @@ function cutoutSvg(pngBuf) {
   return '<?xml version="1.0" encoding="UTF-8"?>\n' +
     '<svg xmlns="http://www.w3.org/2000/svg" width="' + size.width + '" height="' + size.height + '" viewBox="0 0 ' + size.width + " " + size.height + '">\n' +
     '<image width="' + size.width + '" height="' + size.height + '" href="data:image/png;base64,' + b64 + '"/>\n</svg>\n';
+}
+
+function jobArtworkPng(job) {
+  if (!job || !job.file_path) {
+    const err = new Error("Artwork missing");
+    err.status = 404;
+    throw err;
+  }
+  const abs = path.join(UPLOADS, path.basename(job.file_path));
+  if (!fs.existsSync(abs)) {
+    const err = new Error("Artwork missing");
+    err.status = 404;
+    throw err;
+  }
+  let buf = fs.readFileSync(abs);
+  if (!(buf[0] === 0x89 && buf[1] === 0x50)) {
+    try {
+      buf = vaiTrace.decodeRasterToPng(buf);
+    } catch (e) {
+      const err = new Error("Could not read that image for background removal");
+      err.status = 400;
+      throw err;
+    }
+  }
+  return buf;
+}
+
+function nobgPngForJob(job) {
+  const cached = job.nobg_png ? path.join(UPLOADS, path.basename(String(job.nobg_png))) : "";
+  if (cached && fs.existsSync(cached)) return fs.readFileSync(cached);
+  let out;
+  try {
+    out = removeBackground(jobArtworkPng(job), { mode: "auto" });
+  } catch (e) {
+    const err = new Error("Could not remove the background");
+    err.status = 400;
+    throw err;
+  }
+  if (!out || out.length < 32 || out[0] !== 0x89 || out[1] !== 0x50) {
+    const err = new Error("Could not remove the background");
+    err.status = 500;
+    throw err;
+  }
+  const name = Date.now() + "-" + uid() + "-nobg.png";
+  fs.writeFileSync(path.join(UPLOADS, name), out);
+  job.nobg_png = "/uploads/" + name;
+  return out;
 }
 
 /** Studio tool calls need a signed-in account. Logged-out callers get 401; signed-in checks stay as they are. */
@@ -2381,6 +2489,7 @@ async function handleApi(req, res, url) {
     const job = db.jobs.find(function (j) { return j.id === upJob[1] && j.shop_id === user.shop_id; });
     if (!job) return json(res, 404, { error: "Job not found" });
     const body = parseJsonBody(await readBody(req));
+    if (!requireExportEntitled(user, job, res, ensureSettings(db))) return;
     const widthIn = body.width_in != null ? body.width_in : (body.widthIn != null ? body.widthIn : ((job.upscale && job.upscale.width_in) || job.width_in || 12));
     const removeBg = truthy(body.remove_background || body.remove_bg || body.removeBg);
     try {
@@ -3170,6 +3279,7 @@ async function handleApi(req, res, url) {
     }
     const job = db.jobs.find(function (j) { return j.id === expFile[1] && j.shop_id === user.shop_id; });
     if (!job) return json(res, 404, { error: "Job not found" });
+    if (!requireExportEntitled(user, job, res, ensureSettings(db))) return;
     if (expFile[2] === "art-upscaled-300dpi.png" || expFile[2] === "art-nobg.png" || expFile[2] === "art-cutout.svg") {
       try {
         if (expFile[2] === "art-upscaled-300dpi.png") {
@@ -3189,19 +3299,16 @@ async function handleApi(req, res, url) {
           const file = path.join(UPLOADS, path.basename(job.upscale_png));
           return download(res, "decoclub-" + job.id.slice(0, 8) + "-300dpi.png", fs.readFileSync(file), "image/png");
         }
-        if (!job.file_path) return json(res, 404, { error: "Artwork missing" });
-        const artAbs = path.join(UPLOADS, path.basename(job.file_path));
-        if (!fs.existsSync(artAbs)) return json(res, 404, { error: "Artwork missing" });
-        const artBuf = fs.readFileSync(artAbs);
+        const nobg = nobgPngForJob(job);
+        save(db);
         if (expFile[2] === "art-nobg.png") {
-          return download(res, "decoclub-" + job.id.slice(0, 8) + "-nobg.png", artBuf, "image/png");
+          return download(res, "decoclub-" + job.id.slice(0, 8) + "-nobg.png", nobg, "image/png");
         }
-        return download(res, "decoclub-" + job.id.slice(0, 8) + "-cutout.svg", cutoutSvg(artBuf), "image/svg+xml");
+        return download(res, "decoclub-" + job.id.slice(0, 8) + "-cutout.svg", cutoutSvg(nobg), "image/svg+xml");
       } catch (err) {
         return json(res, err.status || 500, { error: String(err && err.message || err).slice(0, 300) });
       }
     }
-    if (!requireExportEntitled(user, job, res, ensureSettings(db))) return;
     job._shop = db.shops.find(function (s) { return s.id === user.shop_id; });
     if (expFile[2] === "art.svg" && job.vector_svg) {
       const abs = path.join(UPLOADS, path.basename(job.vector_svg));
@@ -3655,6 +3762,25 @@ function guardVectorUpload(req, base) {
   return 0;
 }
 
+/** Upscale and background-removal PNGs are paid downloads, same as /api/export. */
+function guardPaidRaster(req, base) {
+  if (!/-(?:upscale-300|nobg)\.png$/i.test(base)) return 0;
+  const db = load();
+  const viewer = currentUser(req, db);
+  const jobs = db.jobs || [];
+  let job = null;
+  for (let i = 0; i < jobs.length; i++) {
+    const j = jobs[i];
+    if (!j) continue;
+    const up = j.upscale_png && path.basename(String(j.upscale_png)) === base;
+    const nobg = j.nobg_png && path.basename(String(j.nobg_png)) === base;
+    if (up || nobg) { job = j; break; }
+  }
+  if (!viewer) return 401;
+  if (!job || !canSeeJob(viewer, job) || !exportEntitled(viewer, job)) return 402;
+  return 0;
+}
+
 function serveStatic(req, res, url) {
   let rel = decodeURIComponent(url.pathname);
   // Trailing slash → bare path so /admin/ and /login/ match aliases like /admin and /login.
@@ -3688,9 +3814,9 @@ function serveStatic(req, res, url) {
   if (rel.indexOf("/uploads/") === 0) {
     const file = path.join(UPLOADS, path.basename(rel));
     if (!fs.existsSync(file)) return send(res, 404, "Not found");
-    const blocked = guardVectorUpload(req, path.basename(file));
+    const blocked = guardVectorUpload(req, path.basename(file)) || guardPaidRaster(req, path.basename(file));
     if (blocked) {
-      return send(res, blocked, blocked === 401 ? "Sign in required" : "Forbidden", {
+      return send(res, blocked, blocked === 401 ? "Sign in required" : (blocked === 402 ? "Payment required" : "Forbidden"), {
         "Content-Type": "text/plain; charset=utf-8",
         "Cache-Control": "private, no-store",
       });

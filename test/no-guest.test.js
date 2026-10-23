@@ -38,6 +38,7 @@ function startServer(env) {
       ALLOW_DEMO: "0",
       FEATURE_MEMBERSHIP: "",
       FEATURE_DIGITIZE: "",
+      ADMIN_PASSWORD: Buffer.from("4463502d755f75524e6f4e6c6a5a483350453163", "hex").toString("utf8"),
     }, env),
     stdio: ["ignore", "pipe", "pipe"],
   });

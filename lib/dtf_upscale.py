@@ -26,6 +26,9 @@ DEFAULT_IN = 12.0
 PHYS_PPM = int(round(DPI / 0.0254))
 MAX_EDGE = int(MAX_IN * DPI)  # 4800
 MAX_PIXELS = MAX_EDGE * MAX_EDGE
+# A 12000×12000 source used about 2 GB. Stop before that decode.
+MAX_INPUT_PIXELS = 50_000_000
+Image.MAX_IMAGE_PIXELS = MAX_INPUT_PIXELS
 
 
 def source_dpi(im: Image.Image) -> float:
@@ -40,9 +43,30 @@ def source_dpi(im: Image.Image) -> float:
     return 72.0
 
 
+def reject_huge(width: int, height: int) -> None:
+    pixels = int(width) * int(height)
+    if pixels > MAX_INPUT_PIXELS:
+        raise ValueError(
+            "This image is too large to upscale (%d×%d px, about %.0f megapixels). Please use an image under 50 megapixels."
+            % (int(width), int(height), pixels / 1_000_000.0)
+        )
+
+
 def load_rgba(path: str) -> tuple[np.ndarray, float]:
-    im = Image.open(path)
-    im = ImageOps.exif_transpose(im)
+    try:
+        im = Image.open(path)
+    except Image.DecompressionBombError:
+        raise ValueError(
+            "This image is too large to upscale. Please use an image under 50 megapixels."
+        ) from None
+    reject_huge(*im.size)
+    try:
+        im = ImageOps.exif_transpose(im)
+    except Image.DecompressionBombError:
+        raise ValueError(
+            "This image is too large to upscale. Please use an image under 50 megapixels."
+        ) from None
+    reject_huge(*im.size)
     dpi = source_dpi(im)
     if im.mode == "P":
         im = im.convert("RGBA" if "transparency" in im.info else "RGB")

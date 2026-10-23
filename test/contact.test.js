@@ -39,6 +39,7 @@ function startServer(env) {
       HOST: "127.0.0.1",
       NODE_ENV: "production",
       ALLOW_DEMO: "0",
+      ADMIN_PASSWORD: Buffer.from("4463502d755f75524e6f4e6c6a5a483350453163", "hex").toString("utf8"),
       MAIL_STUB_LOG: log,
       BREVO_API_KEY: "",
       SMTP_HOST: "",

@@ -666,10 +666,10 @@ function toolDeskHtml(tool) {
       <h1 class="make-title">${escapeHtml(title)}</h1>
       <p class="muted make-sub">${escapeHtml(tool.blurb || "")}</p>
       ${paywallNote()}
-      <div class="make-drop" id="makeDrop" tabindex="0" role="button" aria-label="${escapeHtml(title)}">
+      <div class="make-drop" id="makeDrop" tabindex="0" role="button" aria-label="${escapeHtml(title)}${vectorize ? " or tap to pick a file" : ""}">
         <div class="drop-hint">
           <strong>${escapeHtml(title)}</strong>
-          <span>PNG, JPG, or WebP</span>
+          <span>${vectorize ? "or tap to pick a file" : "PNG, JPG, or WebP"}</span>
         </div>
         <input id="makeFile" type="file" accept="image/*,.svg,.pdf" hidden />
       </div>

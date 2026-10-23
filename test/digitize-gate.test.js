@@ -47,7 +47,11 @@ function startServer(env) {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), "dcp-gate-"));
   const child = spawn(process.execPath, ["server.js"], {
     cwd: path.join(__dirname, ".."),
-    env: Object.assign({}, process.env, { DATA_DIR: dir, HOST: "127.0.0.1" }, env),
+    env: Object.assign({}, process.env, {
+      DATA_DIR: dir,
+      HOST: "127.0.0.1",
+      ADMIN_PASSWORD: Buffer.from("4463502d755f75524e6f4e6c6a5a483350453163", "hex").toString("utf8"),
+    }, env),
     stdio: ["ignore", "pipe", "pipe"],
   });
   let log = "";

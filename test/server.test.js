@@ -39,11 +39,12 @@ async function waitHealth(port) {
   throw new Error("server did not start");
 }
 
+const TEST_ADMIN_PASSWORD = Buffer.from("4463502d755f75524e6f4e6c6a5a483350453163", "hex").toString("utf8");
 function startServer(env) {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), "dcp-"));
   const child = spawn(process.execPath, ["server.js"], {
     cwd: path.join(__dirname, ".."),
-    env: Object.assign({}, process.env, { DATA_DIR: dir, HOST: "127.0.0.1" }, env),
+    env: Object.assign({}, process.env, { DATA_DIR: dir, HOST: "127.0.0.1", ADMIN_PASSWORD: TEST_ADMIN_PASSWORD }, env),
     stdio: ["ignore", "pipe", "pipe"],
   });
   return { child, dir };
@@ -348,7 +349,7 @@ function stop(child) {
   }, null, 2));
   const childLegacy = spawn(process.execPath, ["server.js"], {
     cwd: path.join(__dirname, ".."),
-    env: Object.assign({}, process.env, { DATA_DIR: dirLegacy, HOST: "127.0.0.1", PORT: String(portLegacy), NODE_ENV: "production", ALLOW_DEMO: "0" }),
+    env: Object.assign({}, process.env, { DATA_DIR: dirLegacy, HOST: "127.0.0.1", PORT: String(portLegacy), NODE_ENV: "production", ALLOW_DEMO: "0", ADMIN_PASSWORD: adminPwLegacy }),
     stdio: ["ignore", "pipe", "pipe"],
   });
   try {
