@@ -1136,9 +1136,10 @@ const TRACE_ENGINE_VER = (function () {
   try { return require("crypto").createHash("md5").update(fs.readFileSync(path.join(__dirname, "lib", "vai-trace", "engine_r3.py"))).digest("hex").slice(0, 8); }
   catch (e) { return "noengine"; }
 })() + (process.env.VECTORIZE_R2 === "1" ? (function () {
-  // Round-2 route on (r13 tracer): key the cache on that file so r13 and r11 results never mix.
-  try { return "-r13-" + require("crypto").createHash("md5").update(fs.readFileSync(path.join(__dirname, "lib", "vai-trace", "vt1_cut_r2.py"))).digest("hex").slice(0, 8); }
-  catch (e) { return "-r13-none"; }
+  // Round-2 route on (r15s tracer, approved source md5 prefix 4ec6dc66). The suffix is the live
+  // vt1_cut_r2.py hash so a path-resolution edit cannot serve an older trace cache.
+  try { return "-r15s-" + require("crypto").createHash("md5").update(fs.readFileSync(path.join(__dirname, "lib", "vai-trace", "vt1_cut_r2.py"))).digest("hex").slice(0, 8); }
+  catch (e) { return "-r15s-none"; }
 })() : "");
 function traceCacheDir(job) {
   return path.join(DATA, "trace-cache", String(job && job.id || "none") + "-" + TRACE_ENGINE_VER);

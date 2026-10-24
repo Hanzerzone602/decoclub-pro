@@ -1,5 +1,8 @@
 #!/workspace/vtracer-bakeoff/bakeoff2/venv311_vt1/bin/python
-"""bake-off-2 round-12 candidate (vt1_cut_r12):
+"""r15s = r15vb with the same outputs, less work: mean-shift trace gets a cheap dE-only eval first and the full edge eval only if its dE could pass; split route uses the dE-only eval (only dE/dE95 read); flat-tracer route skipped when unique colours > 10% of pixels (that art always fails it: trace_sb hits its 8 s timeout or gives >1000 seams).
+r14b = r14 with mean-shift checks size-gated (no elapsed-time gate) and flat-tracer route gated on max side <=300 px + opaque (12 s safety).
+r14 = r13 + flat-tracer route: <=700px opaque images that reach the final r13 fallback (fail every _ok) and are under OLD_BUDGET s run trace_sb.py (copy of trace.py 8f9581bc) and lay its paths over a VTracer cutout underlay (fs=8, simplify=0.5, snapfill, no stroke) scaled into the same viewBox; underlay fills slivers with local colours, no background rect; kept only if _ok.
+bake-off-2 round-12 candidate (vt1_cut_r12):
 - <= 700 px: locks all r11c passing outputs via _ok(ev) and adds 3 strictly-gated fallbacks:
   (1) Tiger-class near-miss dE95 (edges pass, 20.0 < dE95 <= 22.0): re-wrap svg10_raw with 0.25 px stroke;
   (2) flat/low-colour <= 700 px (dE95 <= 10.0, dspecks > 0 or fringe_ppm > 50.0): cutout(fs=5, simplify=0.2, optimize=2) + snapfill(thin=0.35) + 0.38 px stroke;
@@ -153,7 +156,7 @@ _R11 = None
 def trace_r8_sil(path):
     global _R11
     if _R11 is None:
-        _l = _im.SourceFileLoader('r11', '/workspace/vtracer-bakeoff/fork/engine.py.r11cand-6bc6eb5e')
+        _l = _im.SourceFileLoader('r11', os.path.join(os.path.dirname(os.path.abspath(__file__)), 'engine_r3.py'))
         spec = importlib.util.spec_from_loader('r11', _l)
         m = importlib.util.module_from_spec(spec)
         sys.modules['r11'] = m
@@ -243,6 +246,25 @@ def _ok(ev):
 MS_BUDGET = 7.0
 MS_BUDGET_S4 = 9.5
 
+OLD_TRACE = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'trace_sb.py')
+OLD_MAXSIDE = 300   # r14b: flat-tracer route only for small (<=300 px) opaque images
+OLD_MAXUNIQ = 0.10  # r15s: run flat-tracer route only if unique colours <= 10% of pixels (bee 0.4%; JPEG timeouts 33-55%)
+OLD_SAFETY = 12.0   # r14b: hard safety only, well above normal load
+def _old_route(i, a, W, H, srgb, fallback):
+    if (a[..., 3] < 255).any(): return fallback
+    c = a[..., :3].reshape(-1, 3).astype(np.int64)  # r15s: flat-art gate (deterministic, no timer): noisy/photo-like art never passes this route
+    if len(np.unique((c[:, 0] << 16) | (c[:, 1] << 8) | c[:, 2])) > OLD_MAXUNIQ * len(c): return fallback
+    try:
+        with tempfile.TemporaryDirectory() as d:
+            subprocess.run(['python3', OLD_TRACE, '--input', i, '--output', d + '/o.svg', '--colors', '14', '--inches', '10'], check=True, capture_output=True, timeout=8)
+            t = open(d + '/o.svg').read()
+        m = re.search(r'<svg\b[^>]*>', t); vb = float(re.search(r'viewBox="[^"]*?([\d.]+) [\d.]+"', m.group(0)).group(1))
+        u = snapfill(ungroup(vtracer.convert_pixels(a.tobytes(), W, H, vtracer.Config(hierarchical='cutout', filter_speckle=8, simplify=0.5, optimize=2))), a, thin=0.25)
+        so = t[:m.end()] + f'<g transform="scale({vb / W:.8f})">' + u[u.index('<path'):u.rindex('</svg>')] + '</g>' + t[m.end():]
+    except Exception:
+        return fallback
+    return so if _ok(_small_eval(srgb, a, so, check_edges=True)) else fallback
+
 def convert(i):
     t0 = time.time(); src = Image.open(i); a = np.array(src.convert('RGBA')); H, W = a.shape[:2]
     if max(H, W) <= GATE:
@@ -270,18 +292,24 @@ def convert(i):
             s_fl = gapfill_r1(snapfill(svg_fl, a, thin=0.35), 0.38)
             if _ok(_small_eval(srgb, a, s_fl, check_edges=True)):
                 return s_fl
+        s_ms = _ms_trace(a, W, H); dEm = _small_eval(srgb, a, s_ms, check_edges=False)['dE']  # r15s: cheap dE first; full edge eval only when dE could pass
+        _evm = []
+        def ms_ok(ref_stair, ref_dE):  # == _ok(evm) and evm stair <= ref_stair - 3 and evm dE <= ref_dE (dE is computed identically in both eval modes)
+            if dEm > 4.65 or dEm > ref_dE: return False
+            if not _evm: _evm.append(_small_eval(srgb, a, s_ms, check_edges=True))
+            e = _evm[0]; return _ok(e) and e['stair_pct'] <= ref_stair - 3.0 and e['dE'] <= ref_dE
+        if ms_ok(ev10['stair_pct'], ev10['dE']):
+            return s_ms
         ab4 = a.copy(); ab4[..., :3] = (a[..., :3] * 0.6 + med3 * 0.4).round().astype(np.uint8)
         s4 = gapfill_r1(ungroup(vtracer.convert_pixels(ab4.tobytes(), W, H, vtracer.Config(hierarchical='cutout', filter_speckle=5, simplify=0.35, optimize=2))), 0.35)
         ev4 = _small_eval(srgb, a, s4, check_edges=True)
         if _ok(ev4):
-            if time.time() - t0 < MS_BUDGET_S4:  # r13: challenge s4 with the mean-shift trace
-                s_ms = _ms_trace(a, W, H); evm = _small_eval(srgb, a, s_ms, check_edges=True)
-                if _ok(evm) and evm['stair_pct'] <= ev4['stair_pct'] - 3.0 and evm['dE'] <= ev4['dE']:
+            if True:  # r14b: reuse early mean-shift result
+                if ms_ok(ev4['stair_pct'], ev4['dE']):
                     return s_ms
             return s4
-        if time.time() - t0 < MS_BUDGET:  # r13: mean-shift trace tried before s2x, kept only if clean and clearly smoother
-            s_ms = _ms_trace(a, W, H); evm = _small_eval(srgb, a, s_ms, check_edges=True)
-            if _ok(evm) and evm['stair_pct'] <= min(ev4['stair_pct'], ev10['stair_pct']) - 3.0 and evm['dE'] <= min(ev4['dE'], ev10['dE']):
+        if True:  # r14b: reuse early mean-shift result
+            if ms_ok(min(ev4['stair_pct'], ev10['stair_pct']), min(ev4['dE'], ev10['dE'])):
                 return s_ms
         a2 = np.array(Image.fromarray(ab4).resize((W * 2, H * 2), Image.LANCZOS))
         svg2x = half(ungroup(vtracer.convert_pixels(a2.tobytes(), W * 2, H * 2, vtracer.Config(hierarchical='cutout', filter_speckle=10, simplify=1.1, optimize=2))), W, H)
@@ -289,8 +317,14 @@ def convert(i):
         if _ok(_small_eval(srgb, a, s2x, check_edges=True)):
             return s2x
         if ev4['seams'] <= 500 and ev4['stair_pct'] <= 20.0 and ev4['stair_ratio'] <= 0.90 and ev4['fringe_ppm'] <= 50.0 and ev4['dspecks'] <= 0 and ev4['dE95'] < ev10['dE95']:
-            return s4
-        return s10
+            return s4 if (max(H, W) > OLD_MAXSIDE or time.time() - t0 >= OLD_SAFETY) else _old_route(i, a, W, H, srgb, s4)
+        if (a[..., 3] == 255).all() and ev10['seams'] > 500 and ev10['dE'] > 4.65 and ev10['dE95'] <= 24.0:  # r15v: noisy-photo near-miss -> Otsu-split mean-shift trace + hue recolour
+            s_sp = _split_trace(a, W, H)
+            if s_sp is not None:
+                evs = _small_eval(srgb, a, s_sp, check_edges=False)  # r15s: only dE/dE95 are used
+                if evs['dE'] <= ev10['dE'] - 0.5 and evs['dE95'] <= 24.0:
+                    return s_sp
+        return s10 if (max(H, W) > OLD_MAXSIDE or time.time() - t0 >= OLD_SAFETY) else _old_route(i, a, W, H, srgb, s10)
     if 1100 < max(H, W) <= 2000 and H * W >= 2_000_000:
         return trace_r8_sil(i)
     s = 1.0; mid = 1100 < max(H, W) < 2000
@@ -314,5 +348,63 @@ def main(a):
     if '--input' in a: i, o = a[a.index('--input') + 1], a[a.index('--output') + 1]
     else: i, o = a[0], a[1]
     open(o, 'w').write(convert(i))
+
+
+def _split_q(b, mask, K):
+    px = np.ascontiguousarray(b[mask].reshape(1, -1, 3))
+    return np.array(Image.fromarray(px).quantize(K, method=Image.Quantize.MEDIANCUT, dither=Image.Dither.NONE).convert('RGB'))[0]
+
+def _recolour_hue(svg, a3, lam=0.05):
+    """r15v: no new outlines; per visible shape pick fill (current / source median / blends toward colourful-pixel median) minimising hue-flipped chromatic px + lam*dE"""
+    H, W = a3.shape[:2]; n = [0]
+    def le(m): n[0] += 1; return FILL.sub('fill="#%06x"' % n[0], m.group(0), count=1)
+    t = PATH.sub(le, svg); t = PATH.sub(lambda m: re.sub(r'stroke="#\w{6}"', 'stroke="#' + re.search(r'fill="#(\w{6})"', m.group(0)).group(1) + '"', m.group(0)), t)
+    t = re.sub(r'<svg\b', '<svg shape-rendering="crispEdges"', t, count=1)
+    with tempfile.TemporaryDirectory() as d:
+        open(d + '/l.svg', 'w').write(t); subprocess.run(['rsvg-convert', '-w', str(W), '-h', str(H), '-o', d + '/l.png', d + '/l.svg'], check=True)
+        r = np.asarray(Image.open(d + '/l.png').convert('RGBA'))
+    lb = (r[..., 0].astype(np.int64) << 16) | (r[..., 1].astype(np.int64) << 8) | r[..., 2]; lb[r[..., 3] < 255] = 0
+    Lg = _lab_cv(a3); hg = np.arctan2(Lg[..., 2], Lg[..., 1]); ch = np.hypot(Lg[..., 1], Lg[..., 2]) > 15
+    fills = [FILL.search(p).group(0)[7:13] for p in PATH.findall(svg)]; new = {}
+    o = np.argsort(lb.ravel(), kind='stable'); fl = lb.ravel()[o]; cuts = np.searchsorted(fl, np.arange(n[0] + 2)); ys, xs = np.unravel_index(o, lb.shape)
+    def cost(c, idx):
+        l = _lab_cv(np.array([[c]], np.uint8))[0, 0]
+        hd = np.degrees(np.abs(np.angle(np.exp(1j * (np.arctan2(l[2], l[1]) - hg[idx])))))
+        return int((ch[idx] & (hd > 30)).sum()), float(np.sqrt(((Lg[idx] - l) ** 2).sum(-1)).mean())
+    for i in range(1, n[0] + 1):
+        s_, e_ = cuts[i], cuts[i + 1]
+        if e_ - s_ < 3: continue
+        idx = (ys[s_:e_], xs[s_:e_]); cur = [int(fills[i - 1][j:j + 2], 16) for j in (0, 2, 4)]
+        b0, d0 = cost(cur, idx)
+        if b0 == 0: continue
+        px = a3[idx].astype(float); m = ch[idx]; md = np.median(px, 0); cands = [md]
+        if m.sum() >= 2:
+            cm = np.median(px[m], 0)
+            for w in (0.25, 0.5, 0.75, 1.0): cands.append(md * (1 - w) + cm * w)
+            lc = _lab_cv(np.array([[cur]], np.uint8))[0, 0]; lm = _lab_cv(np.array([[np.round(cm)]], np.uint8))[0, 0]
+            for w in (0.3, 0.6, 1.0):
+                q = np.array([[[lc[0] * 255 / 100, lc[1] * (1 - w) + lm[1] * w + 128, lc[2] * (1 - w) + lm[2] * w + 128]]]).round().clip(0, 255).astype(np.uint8)
+                cands.append(cv2.cvtColor(q, cv2.COLOR_LAB2RGB)[0, 0].astype(float))
+        best = (b0 + lam * d0 * (e_ - s_), None)
+        for c in cands:
+            c = np.clip(np.round(c), 0, 255).astype(int); b, dd = cost(c, idx); v = b + lam * dd * (e_ - s_)
+            if v < best[0]: best = (v, c)
+        if best[1] is not None: new[i] = '%02X%02X%02X' % tuple(best[1])
+    k = [0]
+    def rep(m):
+        k[0] += 1; c = new.get(k[0]); return m.group(0) if c is None else re.sub(r'(fill|stroke)="#\w{6}"', lambda q: f'{q.group(1)}="#{c}"', m.group(0))
+    return PATH.sub(rep, svg)
+
+def _split_trace(a, W, H):
+    """r15v: mean-shift (5,22) blend 0.85, Otsu-split 16+16 median-cut palette (pixels pushed across the Otsu line restored), cutout fs=6 simplify=0.55, snapfill, hue recolour, 0.35 stroke"""
+    a3 = np.ascontiguousarray(a[..., :3]); ms = cv2.pyrMeanShiftFiltering(a3, 5, 22)
+    g = cv2.cvtColor(a3, cv2.COLOR_RGB2GRAY); thr, _ = cv2.threshold(g, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU); hi = g >= thr
+    b = (ms * 0.85 + a3 * 0.15).round().astype(np.uint8); o = np.zeros_like(b)
+    if hi.sum() < 32 or (~hi).sum() < 32: return None
+    o[hi] = _split_q(b, hi, 16); o[~hi] = _split_q(b, ~hi, 16)
+    go = cv2.cvtColor(o, cv2.COLOR_RGB2GRAY); bad = (hi & (go < thr)) | (~hi & (go >= thr)); o[bad] = a3[bad]
+    c = a.copy(); c[..., :3] = o
+    s = ungroup(vtracer.convert_pixels(c.tobytes(), W, H, vtracer.Config(hierarchical='cutout', filter_speckle=6, simplify=0.55, optimize=2)))
+    return gapfill_r1(_recolour_hue(snapfill(s, a, thin=0.35), a3), 0.35)
 
 if __name__ == '__main__': main(sys.argv[1:])
