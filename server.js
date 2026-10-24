@@ -1242,8 +1242,44 @@ function attachVzSettings(resultOrJob, body) {
   }
 }
 
+// r19q: cap concurrent traces at the usable core count; extra uploads wait in a short line, past that we refuse fast.
+const TRACE_MAX_JOBS = Math.max(1, Number(process.env.TRACE_MAX_JOBS) || (function () {
+  try { return require("os").availableParallelism(); } catch (e) { return require("os").cpus().length || 1; }
+})());
+const TRACE_MAX_QUEUE = Math.max(0, Number(process.env.TRACE_MAX_QUEUE) >= 0 && process.env.TRACE_MAX_QUEUE !== undefined ? Number(process.env.TRACE_MAX_QUEUE) : TRACE_MAX_JOBS);
+let traceRunning = 0;
+const traceWaiting = []; // [{ id, go }]
+function traceQueueStatus(id) {
+  const i = traceWaiting.findIndex(function (w) { return w.id === id; });
+  return { running: traceRunning, waiting: traceWaiting.length, maxJobs: TRACE_MAX_JOBS, maxQueue: TRACE_MAX_QUEUE, position: i < 0 ? 0 : i + 1 };
+}
+function acquireTraceSlot(id) {
+  if (traceRunning < TRACE_MAX_JOBS) { traceRunning++; return Promise.resolve(); }
+  if (traceWaiting.length >= TRACE_MAX_QUEUE) {
+    const e = new Error("Vectorize is busy right now. Try again shortly.");
+    e.status = 503; e.code = "trace_busy"; e.retryAfter = 10;
+    return Promise.reject(e);
+  }
+  return new Promise(function (go) { traceWaiting.push({ id: id, go: go }); });
+}
+function releaseTraceSlot() {
+  const next = traceWaiting.shift();
+  if (next) next.go(); else traceRunning--;
+}
+
 /** vai-trace without blocking the event loop. Large jobs prefer worker; else async spawn. */
 async function runVaiTraceSafe(buf, job, body, sizeMeta) {
+  const t0 = Date.now();
+  await acquireTraceSlot(job && job.id);
+  const t1 = Date.now();
+  try {
+    const result = await runVaiTraceSlot(buf, job, body, sizeMeta);
+    result.meta = Object.assign({}, result.meta || {}, { queue: { waitMs: t1 - t0, traceMs: Date.now() - t1 } });
+    return result;
+  } finally { releaseTraceSlot(); }
+}
+
+async function runVaiTraceSlot(buf, job, body, sizeMeta) {
   const timeoutMs = 180000;
   const norm = body && body._vzSettings ? body : normalizeVectorizeBody(body || {});
   const opts = attachTraceCache({
@@ -3290,9 +3326,14 @@ async function handleApi(req, res, url) {
         throw bezErr;
       }
     } catch (err) {
+      if (err && err.code === "trace_busy") {
+        return send(res, 503, JSON.stringify({ error: err.message, code: "trace_busy", retryAfter: err.retryAfter }), { "Content-Type": "application/json; charset=utf-8", "Retry-After": String(err.retryAfter) });
+      }
       return json(res, 400, { error: clientFacingError(err, "Could not vectorize") });
     }
   }
+  const tqPath = pth.match(/^\/api\/jobs\/([^/]+)\/trace-queue$/);
+  if (tqPath && req.method === "GET") return jsonPrivate(res, 200, traceQueueStatus(tqPath[1]));
   const recPath = pth.match(/^\/api\/jobs\/([^/]+)\/recolor$/);
   if (recPath && method === "POST") {
     if (!canRunFloor(user)) return json(res, 403, { error: "Shop login required" });
@@ -4097,6 +4138,7 @@ const server = http.createServer(async function (req, res) {
         pricing: "ppi",
         traceDeps: TRACE_DEPS,
         traceEngine: TRACE_ENGINE_VER,
+        traceQueue: traceQueueStatus(),
       };
       if (digitizeFor(healthUser)) health.digitizeDeps = DIGITIZE_DEPS;
       return json(res, 200, health);
