@@ -1,5 +1,6 @@
 #!/workspace/vtracer-bakeoff/bakeoff2/venv311_vt1/bin/python
-"""r16s (base r17 e7d58062) = r17 + speck retry: transparent 700-1100 px art whose 1x render has more small specks than the source is re-wrapped with a 0.8 px seam stroke (same paths/colours); kept only if specks drop to <= 0, dE <= 4.65 and dE95 not worse. Every other image runs r17 unchanged.
+"""r18b = r16s17 + isolated-faint-pixel cleanup (_faint_alpha, original alpha kept) on >700 px art with many near-transparent pixels; every other image runs r16s17 unchanged.
+r16s (base r17 e7d58062) = r17 + speck retry: transparent 700-1100 px art whose 1x render has more small specks than the source is re-wrapped with a 0.8 px seam stroke (same paths/colours); kept only if specks drop to <= 0, dE <= 4.65 and dE95 not worse. Every other image runs r17 unchanged.
 r15s = r15vb with the same outputs, less work: mean-shift trace gets a cheap dE-only eval first and the full edge eval only if its dE could pass; split route uses the dE-only eval (only dE/dE95 read); flat-tracer route skipped when unique colours > 10% of pixels (that art always fails it: trace_sb hits its 8 s timeout or gives >1000 seams).
 r14b = r14 with mean-shift checks size-gated (no elapsed-time gate) and flat-tracer route gated on max side <=300 px + opaque (12 s safety).
 r14 = r13 + flat-tracer route: <=700px opaque images that reach the final r13 fallback (fail every _ok) and are under OLD_BUDGET s run trace_sb.py (copy of trace.py 8f9581bc) and lay its paths over a VTracer cutout underlay (fs=8, simplify=0.5, snapfill, no stroke) scaled into the same viewBox; underlay fills slivers with local colours, no background rect; kept only if _ok.
@@ -315,6 +316,29 @@ def _old_route(i, a, W, H, srgb, fallback):
         return fallback
     return so if _ok(_small_eval(srgb, a, so, check_edges=True)) else fallback
 
+FA_FAINT = 0.025; FA_MID = 0.15; FA_LO = 40; FA_D = 2; FA_CC = 64  # r18a: soft-alpha art gate (back-to-school 3.4% / 25.7%; every local image <= 1.5% / 5.2%)
+def _faint_alpha(a):
+    """r18b: art with lots of near-transparent pixels (soft glow/haze): keep the original alpha everywhere except isolated faint pixels: alpha <= FA_LO that lie more than FA_D px from the main art (alpha >= 128) or sit in a small alpha>0 blob (< FA_CC px) with no alpha >= 128 pixel; those become fully transparent so they are not traced as dark blobs; so does the soft outer halo (alpha < 128 connected to the canvas border), so shapes stop at the real alpha edge; enclosed soft areas inside the art keep their alpha (no new gaps). Semi-transparent pixels (alpha >= 128) darker than their nearest solid (alpha >= 224) pixel take its colour (alpha unchanged)."""
+    al = a[..., 3]
+    if not (al < 255).any(): return a
+    if ((al > 0) & (al < 64)).mean() < FA_FAINT and ((al >= 64) & (al < 255)).mean() < FA_MID: return a
+    o = a.copy(); main = (al >= 128).astype(np.uint8)
+    near = cv2.dilate(main, cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (2 * FA_D + 1, 2 * FA_D + 1))) > 0
+    n, lb, st, _ = cv2.connectedComponentsWithStats((al > 0).astype(np.uint8), connectivity=8)
+    hasmain = np.zeros(n, bool); hasmain[np.unique(lb[main > 0])] = True
+    small = (st[:, 4] < FA_CC) & ~hasmain; small[0] = False
+    drop = (al > 0) & (al <= FA_LO) & (~near | small[lb])
+    nt, lt = cv2.connectedComponents((al < 128).astype(np.uint8), connectivity=4)
+    out = np.unique(np.concatenate([lt[0], lt[-1], lt[:, 0], lt[:, -1]])); out = out[out > 0]
+    drop |= (al < 128) & np.isin(lt, out)
+    o[drop] = 0
+    edge = (al >= 128) & (al < 224); solid = al >= 224
+    if edge.any() and solid.any():
+        _, (iy, ix) = ndi.distance_transform_edt(~solid, return_indices=True)
+        nb = a[iy, ix, :3]; L = lambda x: x.astype(np.int32).sum(-1)
+        dk = edge & (L(a[..., :3]) < L(nb)); o[dk, :3] = nb[dk]
+    return o
+
 def convert(i):
     t0 = time.time(); src = Image.open(i); a = np.array(src.convert('RGBA')); H, W = a.shape[:2]
     if max(H, W) <= GATE:
@@ -380,6 +404,7 @@ def convert(i):
     s = 1.0; mid = 1100 < max(H, W) < 2000
     if max(H, W) > MAXSIDE:
         s = MAXSIDE / max(H, W); a = np.array(Image.fromarray(a).resize((round(W * s), round(H * s)), Image.LANCZOS))
+    a = _faint_alpha(a)
     a0 = a.copy(); a = aa_dark(a, dl=30 if mid else 20, bguard=mid)
     cfg = dict(hierarchical='cutout'); tol = RAMPMAX * min(1.0, max(0.0, (max(H, W) - RAMP[0]) / (RAMP[1] - RAMP[0])))
     if tol > 0: cfg.update(simplify=round(tol, 3), optimize=2)

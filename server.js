@@ -367,12 +367,18 @@ function consumeServiceCredit(user, job, service) {
   return { ok: true, consumed: true, remaining: bal - 1 };
 }
 
+function creditCodeFor(service) {
+  if (service === "bgremove") return "bgremove_credits_required";
+  if (service === "upscale") return "upscale_credits_required";
+  if (service === "halftones") return "halftone_credits_required";
+  return "vector_credits_required";
+}
+
 function requireServiceCredit(user, job, service, res, settings) {
   if (canUseService(user, job, service)) return true;
-  const vector = service === "vectorize";
   json(res, 402, {
     error: serviceCreditMessage(service),
-    code: vector ? "vector_credits_required" : "halftone_credits_required",
+    code: creditCodeFor(service),
     service: service,
     freeImage: freeImageStatus(user),
     buy: buyOptions(service, settings),
@@ -1283,10 +1289,10 @@ const TRACE_ENGINE_VER = (function () {
   try { return require("crypto").createHash("md5").update(fs.readFileSync(path.join(__dirname, "lib", "vai-trace", "engine_r3.py"))).digest("hex").slice(0, 8); }
   catch (e) { return "noengine"; }
 })() + (process.env.VECTORIZE_R2 === "1" ? (function () {
-  // Round-2 route on (r17s tracer, approved source md5 prefix d773eabf). The suffix is the live
+  // Round-2 route on (r18b tracer, approved source md5 prefix 98f45f39). The suffix is the live
   // vt1_cut_r2.py hash so a path-resolution edit cannot serve an older trace cache.
-  try { return "-r17s-" + require("crypto").createHash("md5").update(fs.readFileSync(path.join(__dirname, "lib", "vai-trace", "vt1_cut_r2.py"))).digest("hex").slice(0, 8); }
-  catch (e) { return "-r17s-none"; }
+  try { return "-r18b-" + require("crypto").createHash("md5").update(fs.readFileSync(path.join(__dirname, "lib", "vai-trace", "vt1_cut_r2.py"))).digest("hex").slice(0, 8); }
+  catch (e) { return "-r18b-none"; }
 })() : "");
 function traceCacheDir(job) {
   return path.join(DATA, "trace-cache", String(job && job.id || "none") + "-" + TRACE_ENGINE_VER);
@@ -1982,16 +1988,24 @@ function exportEntitled(user, job) {
   if (isHalftoneArt(job)) return halftoneIncluded(user) || !!unlocks.halftones;
   return vectorIncluded(user) || halftoneIncluded(user) || !!(unlocks.vectorize || unlocks.halftones);
 }
+function exportPaywallService(exportName, job) {
+  const file = String(exportName || "").toLowerCase();
+  if (file === "art-nobg.png" || file === "art-cutout.svg") return "bgremove";
+  if (file === "art-upscaled-300dpi.png" || file === "upscale") return "upscale";
+  return isHalftoneArt(job) ? "halftones" : "vectorize";
+}
+
 function requireExportEntitled(user, job, res, settings, exportName) {
   if (exportEntitled(user, job)) return true;
-  const service = isHalftoneArt(job) ? "halftones" : "vectorize";
-  const vector = service === "vectorize";
+  // Credit bucket stays with the job (vectorize vs halftones). The JSON names the tool.
+  const billed = isHalftoneArt(job) ? "halftones" : "vectorize";
+  const service = exportPaywallService(exportName, job);
   json(res, 402, {
     error: exportCreditMessage(exportName, job),
-    code: vector ? "vector_credits_required" : "halftone_credits_required",
+    code: creditCodeFor(service),
     service: service,
     freeImage: freeImageStatus(user),
-    buy: buyOptions(service, settings),
+    buy: buyOptions(billed, settings),
     vectorCredits: vectorCreditBalance(user),
     halftoneCredits: halftoneCreditBalance(user),
   });
