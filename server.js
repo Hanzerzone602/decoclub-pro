@@ -319,6 +319,23 @@ function productAmountCents(product, settings) {
 
 const VECTOR_CREDIT_MSG = "Vectorize needs 1 credit per image — $3 for 1 or $20 for 10.";
 const HALFTONE_CREDIT_MSG = "Halftones Apply needs 1 credit per image — $3 for 1 or $20 for 10. Preview stays free.";
+const UPSCALE_CREDIT_MSG = "300 DPI Upscaler needs 1 credit per image — $3 for 1 or $20 for 10.";
+const REMOVE_BG_CREDIT_MSG = "Remove Background needs 1 credit per image — $3 for 1 or $20 for 10.";
+
+function serviceCreditMessage(service) {
+  if (service === "halftones") return HALFTONE_CREDIT_MSG;
+  if (service === "upscale") return UPSCALE_CREDIT_MSG;
+  if (service === "bgremove") return REMOVE_BG_CREDIT_MSG;
+  return VECTOR_CREDIT_MSG;
+}
+
+/** Wording only. Which credit bucket is charged stays with the caller. */
+function exportCreditMessage(exportName, job) {
+  const file = String(exportName || "").toLowerCase();
+  if (file === "art-nobg.png" || file === "art-cutout.svg") return REMOVE_BG_CREDIT_MSG;
+  if (file === "art-upscaled-300dpi.png" || file === "upscale") return UPSCALE_CREDIT_MSG;
+  return serviceCreditMessage(isHalftoneArt(job) ? "halftones" : "vectorize");
+}
 
 function canUseService(user, job, service) {
   if (!user) return false;
@@ -354,7 +371,7 @@ function requireServiceCredit(user, job, service, res, settings) {
   if (canUseService(user, job, service)) return true;
   const vector = service === "vectorize";
   json(res, 402, {
-    error: vector ? VECTOR_CREDIT_MSG : HALFTONE_CREDIT_MSG,
+    error: serviceCreditMessage(service),
     code: vector ? "vector_credits_required" : "halftone_credits_required",
     service: service,
     freeImage: freeImageStatus(user),
@@ -1628,6 +1645,8 @@ const SAFE_CLIENT_MSGS = [
   "This export is not available right now.",
   "Vectorize needs 1 credit per image — $3 for 1 or $20 for 10.",
   "Halftones Apply needs 1 credit per image — $3 for 1 or $20 for 10. Preview stays free.",
+  "300 DPI Upscaler needs 1 credit per image — $3 for 1 or $20 for 10.",
+  "Remove Background needs 1 credit per image — $3 for 1 or $20 for 10.",
   "Memberships are not offered. Buy image credits instead.",
 ];
 function clientError(err) {
@@ -1963,12 +1982,12 @@ function exportEntitled(user, job) {
   if (isHalftoneArt(job)) return halftoneIncluded(user) || !!unlocks.halftones;
   return vectorIncluded(user) || halftoneIncluded(user) || !!(unlocks.vectorize || unlocks.halftones);
 }
-function requireExportEntitled(user, job, res, settings) {
+function requireExportEntitled(user, job, res, settings, exportName) {
   if (exportEntitled(user, job)) return true;
   const service = isHalftoneArt(job) ? "halftones" : "vectorize";
   const vector = service === "vectorize";
   json(res, 402, {
-    error: vector ? VECTOR_CREDIT_MSG : HALFTONE_CREDIT_MSG,
+    error: exportCreditMessage(exportName, job),
     code: vector ? "vector_credits_required" : "halftone_credits_required",
     service: service,
     freeImage: freeImageStatus(user),
@@ -2623,7 +2642,7 @@ async function handleApi(req, res, url) {
     const job = db.jobs.find(function (j) { return j.id === upJob[1] && j.shop_id === user.shop_id; });
     if (!job) return json(res, 404, { error: "Job not found" });
     const body = parseJsonBody(await readBody(req));
-    if (!requireExportEntitled(user, job, res, ensureSettings(db))) return;
+    if (!requireExportEntitled(user, job, res, ensureSettings(db), "upscale")) return;
     const widthIn = body.width_in != null ? body.width_in : (body.widthIn != null ? body.widthIn : ((job.upscale && job.upscale.width_in) || job.width_in || 12));
     const removeBg = truthy(body.remove_background || body.remove_bg || body.removeBg);
     try {
@@ -3415,7 +3434,7 @@ async function handleApi(req, res, url) {
     }
     const job = db.jobs.find(function (j) { return j.id === expFile[1] && j.shop_id === user.shop_id; });
     if (!job) return json(res, 404, { error: "Job not found" });
-    if (!requireExportEntitled(user, job, res, ensureSettings(db))) return;
+    if (!requireExportEntitled(user, job, res, ensureSettings(db), expFile[2])) return;
     if (expFile[2] === "art-upscaled-300dpi.png" || expFile[2] === "art-nobg.png" || expFile[2] === "art-cutout.svg") {
       try {
         if (expFile[2] === "art-upscaled-300dpi.png") {
@@ -3917,6 +3936,16 @@ function guardPaidRaster(req, base) {
   return 0;
 }
 
+function revealSignedInHome(html) {
+  return String(html)
+    .replace('<body class="home">', '<body class="home is-signed-in">')
+    .replace('id="toolLauncher" hidden', 'id="toolLauncher"')
+    .replace(
+      '<a class="nav-login" href="/login.html">Log in</a>\n      <a class="btn" href="/signup.html">Get started</a>',
+      '<a class="nav-login" href="/app">Studio</a>\n      <a class="btn" href="/app">All Tools</a>'
+    );
+}
+
 function serveStatic(req, res, url) {
   let rel = decodeURIComponent(url.pathname);
   // Trailing slash → bare path so /admin/ and /login/ match aliases like /admin and /login.
@@ -3927,11 +3956,16 @@ function serveStatic(req, res, url) {
   const digitizeAsset = rel === "/digitize-demo.html" || rel === "/digitize-preview.js" || rel === "/digitize-admin.js";
   if (digitizeAsset && !digitizeFor(viewer)) return send(res, 404, "Not found");
   const ALIAS = { "/login": "/login.html", "/app": "/app.html", "/admin": "/admin.html", "/signup": "/signup.html", "/start": "/start.html", "/contact": "/contact.html" };
-  if (rel === "/index.html" && digitizeFor(viewer)) {
-    const html = fs.readFileSync(path.join(PUBLIC, "index.html"), "utf8").replace(
-      "<!-- suite-extra -->",
-      '<a class="suite-card" href="/app?tool=digitize"><span class="suite-kicker">Admin</span><strong>Digitize</strong><span>Stitch preview and machine files. Shown only while this tool is enabled for an admin.</span><span class="suite-go">Open</span></a>'
-    );
+  if (rel === "/index.html") {
+    // Body depends on the session cookie (signed-in launcher). A shared cache must not reuse it.
+    let html = fs.readFileSync(path.join(PUBLIC, "index.html"), "utf8");
+    if (digitizeFor(viewer)) {
+      html = html.replace(
+        "<!-- suite-extra -->",
+        '<a class="suite-card" href="/app?tool=digitize"><span class="suite-kicker">Admin</span><strong>Digitize</strong><span>Stitch preview and machine files. Shown only while this tool is enabled for an admin.</span><span class="suite-go">Open</span></a>'
+      );
+    }
+    if (viewer) html = revealSignedInHome(html);
     return send(res, 200, html, {
       "Content-Type": "text/html; charset=utf-8",
       "Cache-Control": "private, no-store",
@@ -3984,7 +4018,7 @@ function serveStatic(req, res, url) {
   if (!fs.existsSync(file) || fs.statSync(file).isDirectory()) return send(res, 404, "Not found");
   const ext = path.extname(file).toLowerCase();
   const headers = { "Content-Type": MIME[ext] || "application/octet-stream" };
-  if (digitizeAsset || rel === "/app.html" || rel === "/start.html") {
+  if (digitizeAsset || rel === "/app.html" || rel === "/start.html" || rel === "/app.js") {
     headers["Cache-Control"] = "private, no-store";
     headers["Vary"] = "Cookie";
   } else if (ext === ".html" || ext === ".js" || ext === ".css") {
