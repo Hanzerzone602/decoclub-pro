@@ -1242,10 +1242,36 @@ function attachVzSettings(resultOrJob, body) {
   }
 }
 
-// r19q: cap concurrent traces at the usable core count; extra uploads wait in a short line, past that we refuse fast.
-const TRACE_MAX_JOBS = Math.max(1, Number(process.env.TRACE_MAX_JOBS) || (function () {
+// r19q: cap concurrent traces at the container CPU limit; extra uploads wait in a short line, past that we refuse fast.
+function hostParallelism() {
   try { return require("os").availableParallelism(); } catch (e) { return require("os").cpus().length || 1; }
-})());
+}
+// cgroup v2 cpu.max is "quota period". quota "max" means unlimited. null = unlimited or unreadable.
+function jobsFromCpuMax(text, cores) {
+  const parts = String(text == null ? "" : text).trim().split(/\s+/);
+  if (parts.length < 2 || parts[0] === "max") return null;
+  const quota = Number(parts[0]);
+  const period = Number(parts[1]);
+  if (!Number.isFinite(quota) || !Number.isFinite(period) || period <= 0 || quota < 0) return null;
+  const cap = Math.max(1, Math.floor(Number(cores)) || 1);
+  return Math.min(Math.max(1, Math.floor(quota / period)), cap);
+}
+function resolveTraceMaxJobs(envValue, cpuMaxText, cores) {
+  if (envValue !== undefined && envValue !== null && String(envValue).trim() !== "") {
+    const n = Number(envValue);
+    if (Number.isFinite(n)) return Math.max(1, Math.floor(n));
+  }
+  if (cpuMaxText == null) return 2;
+  const jobs = jobsFromCpuMax(cpuMaxText, cores == null ? hostParallelism() : cores);
+  return jobs == null ? 2 : jobs;
+}
+function readTraceMaxJobs() {
+  let text = null;
+  try { text = require("fs").readFileSync("/sys/fs/cgroup/cpu.max", "utf8"); }
+  catch (e) { text = null; }
+  return resolveTraceMaxJobs(process.env.TRACE_MAX_JOBS, text, hostParallelism());
+}
+const TRACE_MAX_JOBS = readTraceMaxJobs();
 const TRACE_MAX_QUEUE = Math.max(0, Number(process.env.TRACE_MAX_QUEUE) >= 0 && process.env.TRACE_MAX_QUEUE !== undefined ? Number(process.env.TRACE_MAX_QUEUE) : TRACE_MAX_JOBS);
 let traceRunning = 0;
 const traceWaiting = []; // [{ id, go }]
