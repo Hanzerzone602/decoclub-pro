@@ -723,9 +723,20 @@ function jobArtworkPng(job) {
   return buf;
 }
 
+/** Identity of the job's current artwork. A replacement upload gets a new name; size and mtime catch an in-place rewrite of the same path. */
+function artworkSourceKey(job) {
+  if (!job || !job.file_path) return "";
+  const base = path.basename(String(job.file_path));
+  const abs = path.join(UPLOADS, base);
+  let st;
+  try { st = fs.statSync(abs); } catch (e) { return ""; }
+  return base + ":" + st.size + ":" + Math.round(st.mtimeMs);
+}
+
 function nobgPngForJob(job) {
+  const srcKey = artworkSourceKey(job);
   const cached = job.nobg_png ? path.join(UPLOADS, path.basename(String(job.nobg_png))) : "";
-  if (cached && fs.existsSync(cached)) return fs.readFileSync(cached);
+  if (srcKey && job.nobg_src === srcKey && cached && fs.existsSync(cached)) return fs.readFileSync(cached);
   let out;
   try {
     out = removeBackground(jobArtworkPng(job), { mode: "auto" });
@@ -742,6 +753,7 @@ function nobgPngForJob(job) {
   const name = Date.now() + "-" + uid() + "-nobg.png";
   fs.writeFileSync(path.join(UPLOADS, name), out);
   job.nobg_png = "/uploads/" + name;
+  job.nobg_src = srcKey;
   return out;
 }
 
