@@ -30,6 +30,22 @@ function tinyPng() {
   return encodePng(32, 32, rgba);
 }
 
+function markedPng(size, rgb) {
+  const rgba = makeRgba(size, size, [255, 255, 255, 255]);
+  const x0 = Math.max(1, Math.floor(size * 0.25));
+  const x1 = Math.min(size - 1, Math.floor(size * 0.75));
+  for (let y = x0; y < x1; y++) {
+    for (let x = x0; x < x1; x++) {
+      const i = (y * size + x) * 4;
+      rgba[i] = rgb[0];
+      rgba[i + 1] = rgb[1];
+      rgba[i + 2] = rgb[2];
+      rgba[i + 3] = 255;
+    }
+  }
+  return encodePng(size, size, rgba);
+}
+
 function multipart(fields, file) {
   const boundary = "----dcpSec" + Date.now();
   const chunks = [];
@@ -159,6 +175,24 @@ async function uploadJob(port, cookie, title, png) {
   return res.json.job;
 }
 
+async function replaceArtwork(port, cookie, jobId, png) {
+  const form = multipart({}, { name: "next.png", buf: png });
+  const res = await req(port, "POST", "/api/jobs/" + jobId + "/artwork", {
+    headers: { Cookie: cookie, "Content-Type": form.contentType },
+    body: form.body,
+  });
+  assert.strictEqual(res.status, 200, "artwork replace " + (res.text || "").slice(0, 300));
+  assert.ok(res.json.job.file_path);
+  return res.json.job;
+}
+
+function transparentPixels(pngBuf) {
+  const img = decodePng(pngBuf);
+  let clear = 0;
+  for (let i = 3; i < img.rgba.length; i += 4) if (img.rgba[i] < 16) clear++;
+  return { img, clear };
+}
+
 
 const FORMATS = ["art.svg", "art.eps", "art.pdf", "art.dxf", "art.tiff", "art-dtf.tiff", "art-300dpi.png", "art-underbase.png", "art.png", "art-upscaled-300dpi.png", "art-nobg.png", "art-cutout.svg", "cut-contour.svg", "packet.json"];
 const EPS = "%!PS-Adobe-3.0 EPSF-3.0\n%%BoundingBox: 0 0 100 100\nnewpath 15 15 moveto 85 15 lineto 85 85 lineto 15 85 lineto closepath fill\n%%EOF\n";
@@ -247,6 +281,30 @@ function plantVector(dir, jobId, tag, extra) {
     const cut = await req(port, "GET", "/api/export/" + aj.id + "/art-cutout.svg", { headers: { Cookie: adminCk } });
     assert.strictEqual(cut.status, 200, "admin cutout " + cut.text.slice(0, 160));
     assert.ok(cut.text.indexOf("<svg") !== -1 && cut.text.indexOf("base64") !== -1);
+
+    // Replacing artwork on the same job must not keep serving the previous cutout.
+    const swap = await uploadJob(port, adminCk, "Nobg cache", markedPng(32, [10, 10, 10]));
+    const nobgA = await req(port, "GET", "/api/export/" + swap.id + "/art-nobg.png", { headers: { Cookie: adminCk } });
+    assert.strictEqual(nobgA.status, 200, "nobg A " + nobgA.text.slice(0, 200));
+    const cutA = transparentPixels(nobgA.buf);
+    assert.ok(cutA.clear > 0, "nobg A left the sheet opaque");
+    const againA = await req(port, "GET", "/api/export/" + swap.id + "/art-nobg.png", { headers: { Cookie: adminCk } });
+    assert.ok(nobgA.buf.equals(againA.buf), "unchanged source should keep the cached nobg");
+    const replaced = await replaceArtwork(port, adminCk, swap.id, markedPng(48, [210, 30, 30]));
+    assert.notStrictEqual(path.basename(replaced.file_path), path.basename(swap.file_path));
+    const nobgB = await req(port, "GET", "/api/export/" + swap.id + "/art-nobg.png", { headers: { Cookie: adminCk } });
+    assert.strictEqual(nobgB.status, 200, "nobg B " + nobgB.text.slice(0, 200));
+    assert.ok(!nobgA.buf.equals(nobgB.buf), "replaced art still served the previous nobg");
+    const rawB = fs.readFileSync(path.join(s.dir, "uploads", path.basename(replaced.file_path)));
+    assert.ok(!nobgB.buf.equals(rawB), "nobg B matched the replacement upload");
+    const cutBimg = transparentPixels(nobgB.buf);
+    assert.ok(cutBimg.clear > 0, "nobg B left the sheet opaque");
+    assert.notStrictEqual(cutBimg.img.width, cutA.img.width, "nobg pixel size did not follow the new source");
+    const cutB = await req(port, "GET", "/api/export/" + swap.id + "/art-cutout.svg", { headers: { Cookie: adminCk } });
+    assert.strictEqual(cutB.status, 200, "cutout B " + cutB.text.slice(0, 160));
+    assert.ok(cutB.text.indexOf('width="' + cutBimg.img.width + '"') !== -1, "cutout svg kept the previous width");
+    assert.ok(cutB.text.indexOf(nobgB.buf.toString("base64")) !== -1, "cutout svg did not embed the new nobg");
+    assert.ok(cutB.text.indexOf(nobgA.buf.toString("base64")) === -1, "cutout svg still embedded the previous nobg");
 
     // Halftone art: a vectorize unlock is not enough; needs the halftones unlock.
     const ht = await uploadJob(port, shop.cookie, "HT gate", tinyPng());
