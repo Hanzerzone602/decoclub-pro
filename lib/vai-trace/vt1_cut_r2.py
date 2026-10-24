@@ -1,5 +1,6 @@
 #!/workspace/vtracer-bakeoff/bakeoff2/venv311_vt1/bin/python
-"""r15s = r15vb with the same outputs, less work: mean-shift trace gets a cheap dE-only eval first and the full edge eval only if its dE could pass; split route uses the dE-only eval (only dE/dE95 read); flat-tracer route skipped when unique colours > 10% of pixels (that art always fails it: trace_sb hits its 8 s timeout or gives >1000 seams).
+"""r16s (base r17 e7d58062) = r17 + speck retry: transparent 700-1100 px art whose 1x render has more small specks than the source is re-wrapped with a 0.8 px seam stroke (same paths/colours); kept only if specks drop to <= 0, dE <= 4.65 and dE95 not worse. Every other image runs r17 unchanged.
+r15s = r15vb with the same outputs, less work: mean-shift trace gets a cheap dE-only eval first and the full edge eval only if its dE could pass; split route uses the dE-only eval (only dE/dE95 read); flat-tracer route skipped when unique colours > 10% of pixels (that art always fails it: trace_sb hits its 8 s timeout or gives >1000 seams).
 r14b = r14 with mean-shift checks size-gated (no elapsed-time gate) and flat-tracer route gated on max side <=300 px + opaque (12 s safety).
 r14 = r13 + flat-tracer route: <=700px opaque images that reach the final r13 fallback (fail every _ok) and are under OLD_BUDGET s run trace_sb.py (copy of trace.py 8f9581bc) and lay its paths over a VTracer cutout underlay (fs=8, simplify=0.5, snapfill, no stroke) scaled into the same viewBox; underlay fills slivers with local colours, no background rect; kept only if _ok.
 bake-off-2 round-12 candidate (vt1_cut_r12):
@@ -10,7 +11,7 @@ bake-off-2 round-12 candidate (vt1_cut_r12):
 - 1100 < max side <= 2000 px (>= 2 Mpx): silhouette-backed trace_r8_sil (72 paths / 72 colours, 0 gaps).
 - all other > 700 px (including 994 and 2600 Carpenters): r10/r2 cutout + greedy Lab fill-merging
   (dE <= 6.0 -> 39 colours on 994px, 122 colours on 2600px, 0 gaps)."""
-import sys, os, io, re, time, subprocess, tempfile, importlib.util, importlib.machinery as _im, numpy as np, cv2, vtracer
+import hashlib, sys, os, io, re, time, subprocess, tempfile, importlib.util, importlib.machinery as _im, numpy as np, cv2, vtracer
 from collections import Counter
 from PIL import Image
 from scipy import ndimage as ndi
@@ -177,13 +178,22 @@ def trace_r8_sil(path):
     _R11._mod('r8')._LC.clear()
     return _R11.trace_busy_r8(path, 10.0)
 
-def _rsvg(svg_str, w, h, bg='white'):
+_RSVGC = {}
+def _rsvg(svg_str, w, h, bg='white'):  # r17: memoised (same svg/size/bg -> same pixels)
+    _k = (hashlib.md5(svg_str.encode()).hexdigest(), w, h, bg)
+    if _k not in _RSVGC:
+        if len(_RSVGC) > 24: _RSVGC.clear()
+        _RSVGC[_k] = _rsvg0(svg_str, w, h, bg)
+    return _RSVGC[_k].copy()
+
+def _rsvg0(svg_str, w, h, bg='white'):
     p = subprocess.run(['rsvg-convert', '-w', str(w), '-h', str(h), '-b', bg], input=svg_str.encode(), capture_output=True, check=True)
     return np.array(Image.open(io.BytesIO(p.stdout)).convert('RGB'))
 
 def _lab_cv(a):
     return cv2.cvtColor(np.ascontiguousarray(a, dtype=np.uint8), cv2.COLOR_RGB2LAB).astype(np.float32) * [100 / 255, 1, 1] - [0, 128, 128]
 
+_GTC = {}
 def _small_eval(srgb, a0, svg_str, check_edges=True):
     gt = np.array(srgb); h, w = gt.shape[:2]; op = a0[..., 3] > 0; k = 4
     im = _rsvg(svg_str, w, h); M1 = _rsvg(svg_str, w, h, '#ff00ff')
@@ -198,21 +208,37 @@ def _small_eval(srgb, a0, svg_str, check_edges=True):
         return dict(dE=de, dE95=de95)
     R4 = _rsvg(svg_str, w * k, h * k)
     im16 = R4.astype(np.int16); L = im16.mean(-1); sm = 0
-    for ax in (0, 1):
-        ra = np.roll(L, 2, ax); rb = np.roll(L, -2, ax); ca = np.roll(im16, 2, ax); cb = np.roll(im16, -2, ax)
-        m = (L - np.maximum(ra, rb) > 40) & (np.abs(ca - cb).sum(-1) > 60)
-        m[:3] = m[-3:] = False; m[:, :3] = m[:, -3:] = False; sm += int(m.sum())
+    for ax in (0, 1):  # r17: slices instead of np.roll; the wrapped rows/cols are the masked 3-px border, so the count is identical
+        if L.shape[0] < 7 or L.shape[1] < 7:
+            ra = np.roll(L, 2, ax); rb = np.roll(L, -2, ax); ca = np.roll(im16, 2, ax); cb = np.roll(im16, -2, ax)
+            m = (L - np.maximum(ra, rb) > 40) & (np.abs(ca - cb).sum(-1) > 60)
+            m[:3] = m[-3:] = False; m[:, :3] = m[:, -3:] = False; sm += int(m.sum()); continue
+        if ax == 0:
+            Lc = L[3:-3, 3:-3]; ra = L[1:-5, 3:-3]; rb = L[5:-1, 3:-3]; ca = im16[1:-5, 3:-3]; cb = im16[5:-1, 3:-3]
+        else:
+            Lc = L[3:-3, 3:-3]; ra = L[3:-3, 1:-5]; rb = L[3:-3, 5:-1]; ca = im16[3:-3, 1:-5]; cb = im16[3:-3, 5:-1]
+        sm += int(((Lc - np.maximum(ra, rb) > 40) & (np.abs(ca - cb).sum(-1) > 60)).sum())
     if sm > 500:
         return dict(seams=sm, stair_pct=99.0, stair_ratio=9.9, fringe_ppm=999.0, dspecks=999, dE=de, dE95=de95)
-    pal = srgb.quantize(12, method=Image.Quantize.MEDIANCUT).convert('RGB').getcolors(1 << 24)
-    pal = np.array([c for _, c in sorted(pal, key=lambda x: -x[0])][:12], np.int32)
-    def q(arr):
-        out = np.empty(arr.shape[:2], np.uint8)
-        for i in range(0, arr.shape[0], 256):
-            out[i:i + 256] = ((arr[i:i + 256, :, None, :].astype(np.int32) - pal[None, None]) ** 2).sum(-1).argmin(-1)
-        return out
+    _key = (gt.shape, hashlib.md5(gt.tobytes()).hexdigest())  # r17: source-side work cached per source image (pure function of srgb)
+    _C = _GTC.setdefault(_key, {})
+    if 'pal' not in _C:
+        pal = srgb.quantize(12, method=Image.Quantize.MEDIANCUT).convert('RGB').getcolors(1 << 24)
+        _C['pal'] = np.array([c for _, c in sorted(pal, key=lambda x: -x[0])][:12], np.int32)
+    pal = _C['pal']
+    def q(arr):  # r17: identical to per-pixel argmin, computed once per unique colour
+        a32 = arr[..., :3].astype(np.int32); pk = (a32[..., 0] << 16) | (a32[..., 1] << 8) | a32[..., 2]
+        if 'lut' not in _C:  # full 24-bit nearest-palette table (same argmin, first index on ties), built once per source
+            lut = np.empty(1 << 24, np.uint8); r = np.arange(256, dtype=np.int32)
+            g2 = ((r[:, None] - pal[None, :, 1]) ** 2); b2 = ((r[:, None] - pal[None, :, 2]) ** 2)
+            gb = (g2[:, None, :] + b2[None, :, :]).reshape(65536, -1)
+            for rv in range(256):
+                lut[rv << 16:(rv + 1) << 16] = (gb + (rv - pal[None, :, 0]) ** 2).argmin(-1)
+            _C['lut'] = lut
+        return _C['lut'][pk]
     ccsmall = lambda qa: sum(int((cv2.connectedComponentsWithStats((qa == v).astype(np.uint8), connectivity=8)[2][1:, 4] < 4).sum()) for v in np.unique(qa))
-    dspk = ccsmall(q(im)) - ccsmall(q(gt))
+    if 'csg' not in _C: _C['csg'] = ccsmall(q(gt))
+    dspk = ccsmall(q(im)) - _C['csg']
     def _jag(qa):
         ds = []
         for v in np.unique(qa):
@@ -225,8 +251,11 @@ def _small_eval(srgb, a0, svg_str, check_edges=True):
         if not ds: return 0.0, 0.0
         d = np.concatenate(ds) / k
         return float(d.mean()), round(float((d > 0.25).mean() * 100), 1)
-    q4 = q(R4); G4 = np.array(srgb.resize((w * k, h * k), Image.BILINEAR)); qg4 = q(G4)
-    jr, st_pct = _jag(q4); jg, _ = _jag(qg4); st_rat = round(jr / max(jg, 1e-3), 2)
+    q4 = q(R4)
+    if 'qg4' not in _C:
+        _C['qg4'] = q(np.array(srgb.resize((w * k, h * k), Image.BILINEAR))); _C['jg'] = _jag(_C['qg4'])[0]
+    qg4 = _C['qg4']; jg = _C['jg']
+    jr, st_pct = _jag(q4); st_rat = round(jr / max(jg, 1e-3), 2)
     fpx = 0; ker = np.ones((4 * k + 1, 4 * k + 1), np.uint8)
     for v in np.unique(q4):
         m = (q4 == v).astype(np.uint8); nc, lb, st, _ = cv2.connectedComponentsWithStats(m, connectivity=8)
@@ -238,6 +267,27 @@ def _small_eval(srgb, a0, svg_str, check_edges=True):
         fpx += int(st[bad, 4].sum())
     fppm = round(1e6 * fpx / (w * h * k * k), 1)
     return dict(seams=sm, stair_pct=st_pct, stair_ratio=st_rat, fringe_ppm=fppm, dspecks=dspk, dE=de, dE95=de95)
+
+W_SPECK = 0.8  # r16s
+def _nfail(ev):
+    return sum([ev['seams'] > 500, ev['stair_pct'] > 20.0, ev['stair_ratio'] > 0.90, ev['fringe_ppm'] > 50.0, ev['dspecks'] > 0, ev['dE'] > 4.65, ev['dE95'] > 20.0])
+
+def _speck_eval(srgb, a0, svg_str):  # r16s: 1x-only dspecks + dE/dE95 (same maths as _small_eval, no 4x render)
+    gt = np.array(srgb); h, w = gt.shape[:2]; op = a0[..., 3] > 0
+    im = _rsvg(svg_str, w, h); M1 = _rsvg(svg_str, w, h, '#ff00ff')
+    mg1 = (np.abs(M1.astype(int) - [255, 0, 255]).sum(-1) < 30).astype(np.uint8)
+    _n, _l = cv2.connectedComponents(mg1, connectivity=4); _e = np.unique(np.concatenate([_l[0], _l[-1], _l[:, 0], _l[:, -1]]))
+    op_art = op & ~(mg1.astype(bool) & np.isin(_l, _e[_e > 0]))
+    dE = np.sqrt(((_lab_cv(im) - _lab_cv(gt)) ** 2).sum(-1))
+    pal = srgb.quantize(12, method=Image.Quantize.MEDIANCUT).convert('RGB').getcolors(1 << 24)
+    pal = np.array([c for _, c in sorted(pal, key=lambda x: -x[0])][:12], np.int32)
+    def q(arr):
+        out = np.empty(arr.shape[:2], np.uint8)
+        for i in range(0, arr.shape[0], 256):
+            out[i:i + 256] = ((arr[i:i + 256, :, None, :].astype(np.int32) - pal[None, None]) ** 2).sum(-1).argmin(-1)
+        return out
+    cc = lambda qa: sum(int((cv2.connectedComponentsWithStats((qa == v).astype(np.uint8), connectivity=8)[2][1:, 4] < 4).sum()) for v in np.unique(qa))
+    return dict(dspecks=cc(q(im)) - cc(q(gt)), dE=round(float(dE[op_art].mean()), 2), dE95=round(float(np.percentile(dE[op_art], 95)), 1))
 
 def _ok(ev):
     return (ev['seams'] <= 500 and ev['stair_pct'] <= 20.0 and ev['stair_ratio'] <= 0.90
@@ -333,8 +383,15 @@ def convert(i):
     a0 = a.copy(); a = aa_dark(a, dl=30 if mid else 20, bguard=mid)
     cfg = dict(hierarchical='cutout'); tol = RAMPMAX * min(1.0, max(0.0, (max(H, W) - RAMP[0]) / (RAMP[1] - RAMP[0])))
     if tol > 0: cfg.update(simplify=round(tol, 3), optimize=2)
-    svg = ungroup(vtracer.convert_pixels(a.tobytes(), a.shape[1], a.shape[0], vtracer.Config(**cfg)))
-    svg = merge_fills(gapfill(snapfill(svg, a0), W_BIG * s, mid=mid), 6.0)
+    svg_raw = ungroup(vtracer.convert_pixels(a.tobytes(), a.shape[1], a.shape[0], vtracer.Config(**cfg)))
+    svg_sn = snapfill(svg_raw, a0)
+    svg = merge_fills(gapfill(svg_sn, W_BIG * s, mid=mid), 6.0)
+    if s == 1.0 and not mid and (a0[..., 3] < 255).any():  # r16s: transparent 700-1100 px art only: speck/edge-AA retry with a wider seam stroke
+        srgb_ = src.convert('RGB'); ev = _speck_eval(srgb_, a0, svg)
+        if ev['dspecks'] > 0:
+            svg_w = merge_fills(gapfill(svg_sn, W_SPECK, mid=mid), 6.0); evw = _speck_eval(srgb_, a0, svg_w)
+            if evw['dspecks'] < min(0, ev['dspecks']) + 1 and evw['dE'] <= 4.65 and evw['dE95'] <= ev['dE95']:
+                svg = svg_w
     if s != 1.0:
         svg = re.sub(r'<svg([^>]*)width="\d+" height="\d+">', lambda m: f'<svg{m.group(1)}width="{W}" height="{H}" viewBox="0 0 {a.shape[1]} {a.shape[0]}">', svg, count=1)
     return svg
