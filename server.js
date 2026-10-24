@@ -733,10 +733,113 @@ function artworkSourceKey(job) {
   return base + ":" + st.size + ":" + Math.round(st.mtimeMs);
 }
 
+/** Transparent PNG and cutout SVG written for background removal. Not source art. */
+function isDerivedNobgName(name) {
+  return /^(?:art-nobg\.png|art-cutout\.svg)$/i.test(String(name || ""))
+    || /-(?:nobg\.png|cutout\.svg)$/i.test(String(name || ""));
+}
+
+function uploadsRootReal() {
+  try { return fs.realpathSync(UPLOADS); } catch (e) { return path.resolve(UPLOADS); }
+}
+
+/** Directory that holds this job's derived no-bg files. Never a parent, sibling, or symlink. */
+function jobNobgDir(job) {
+  const id = job && String(job.id || "");
+  if (!/^[a-f0-9]{32}$/.test(id)) return "";
+  const root = uploadsRootReal();
+  const dir = path.resolve(root, id);
+  if (path.dirname(dir) !== root) return "";
+  return dir;
+}
+
+function uploadBaseProtected(job, name) {
+  const fields = ["file_path", "vector_svg", "vector_eps", "vector_png", "upscale_png"];
+  for (let i = 0; i < fields.length; i++) {
+    const v = job && job[fields[i]];
+    if (v && path.basename(String(v)) === name) return true;
+  }
+  return false;
+}
+
+/** Unlink one regular file in dir. dir must already be the real uploads root or this job's folder. */
+function unlinkDerivedNobgAt(dir, name) {
+  if (!dir || !name || name !== path.basename(name) || !isDerivedNobgName(name)) return;
+  let dirStat;
+  try { dirStat = fs.lstatSync(dir); } catch (e) { return; }
+  if (!dirStat.isDirectory()) return;
+  const abs = path.join(dir, name);
+  if (path.dirname(path.resolve(abs)) !== path.resolve(dir)) return;
+  try {
+    const st = fs.lstatSync(abs);
+    if (!st.isFile()) return;
+    fs.unlinkSync(abs);
+  } catch (e) { /* already gone */ }
+}
+
+/**
+ * Drop derived no-bg files for this job when the source changes.
+ * Only the job directory is scanned. A legacy flat file is removed only when
+ * this job's nobg_png still names that one file.
+ */
+function discardJobNobg(job) {
+  if (!job) return;
+  const dir = jobNobgDir(job);
+  if (dir) {
+    let ents = [];
+    try {
+      const st = fs.lstatSync(dir);
+      if (st.isDirectory()) ents = fs.readdirSync(dir, { withFileTypes: true });
+    } catch (e) { ents = []; }
+    for (let i = 0; i < ents.length; i++) {
+      if (!ents[i].isFile()) continue;
+      if (uploadBaseProtected(job, ents[i].name)) continue;
+      unlinkDerivedNobgAt(dir, ents[i].name);
+    }
+  }
+  const recorded = String(job.nobg_png || "").replace(/\\/g, "/");
+  const parts = recorded.split("/").filter(Boolean);
+  if (parts.length === 2 && parts[0] === "uploads" && isDerivedNobgName(parts[1]) && !uploadBaseProtected(job, parts[1])) {
+    const root = uploadsRootReal();
+    unlinkDerivedNobgAt(root, parts[1]);
+    const stem = parts[1].replace(/-nobg\.png$/i, "");
+    if (stem && stem !== parts[1] && stem === path.basename(stem)) {
+      unlinkDerivedNobgAt(root, stem + "-cutout.svg");
+    }
+  }
+  delete job.nobg_png;
+  delete job.nobg_src;
+}
+
+function cachedNobgAbs(job) {
+  if (!job || !job.nobg_png) return "";
+  const parts = String(job.nobg_png).replace(/\\/g, "/").split("/").filter(Boolean);
+  if (parts[0] !== "uploads") return "";
+  const name = parts[parts.length - 1];
+  if (!isDerivedNobgName(name) || name !== path.basename(name)) return "";
+  if (parts.length === 3 && parts[1] === String(job.id)) {
+    const dir = jobNobgDir(job);
+    if (!dir) return "";
+    return path.join(dir, name);
+  }
+  if (parts.length === 2) return path.join(uploadsRootReal(), name);
+  return "";
+}
+
+function readableNobgFile(job) {
+  const abs = cachedNobgAbs(job);
+  if (!abs) return "";
+  try {
+    const st = fs.lstatSync(abs);
+    if (!st.isFile()) return "";
+  } catch (e) { return ""; }
+  return abs;
+}
+
 function nobgPngForJob(job) {
   const srcKey = artworkSourceKey(job);
-  const cached = job.nobg_png ? path.join(UPLOADS, path.basename(String(job.nobg_png))) : "";
-  if (srcKey && job.nobg_src === srcKey && cached && fs.existsSync(cached)) return fs.readFileSync(cached);
+  const cached = readableNobgFile(job);
+  if (srcKey && job.nobg_src === srcKey && cached) return fs.readFileSync(cached);
   let out;
   try {
     out = removeBackground(jobArtworkPng(job), { mode: "auto" });
@@ -750,9 +853,24 @@ function nobgPngForJob(job) {
     err.status = 500;
     throw err;
   }
+  const dir = jobNobgDir(job);
+  if (!dir) {
+    const err = new Error("Could not remove the background");
+    err.status = 500;
+    throw err;
+  }
+  fs.mkdirSync(dir, { recursive: true });
+  let dirStat;
+  try { dirStat = fs.lstatSync(dir); } catch (e) { dirStat = null; }
+  if (!dirStat || !dirStat.isDirectory()) {
+    const err = new Error("Could not remove the background");
+    err.status = 500;
+    throw err;
+  }
+  discardJobNobg(job);
   const name = Date.now() + "-" + uid() + "-nobg.png";
-  fs.writeFileSync(path.join(UPLOADS, name), out);
-  job.nobg_png = "/uploads/" + name;
+  fs.writeFileSync(path.join(dir, name), out);
+  job.nobg_png = "/uploads/" + job.id + "/" + name;
   job.nobg_src = srcKey;
   return out;
 }
@@ -2426,6 +2544,7 @@ async function handleApi(req, res, url) {
     if (!parsed.file) return json(res, 400, { error: "Artwork file required" });
     clearTraceCache(job);
     job.file_path = applyUploadMatte(parsed.file.path, parsed.fields);
+    discardJobNobg(job);
     job.unlocks = {};
     if (STATUSES.indexOf(job.status) < STATUSES.indexOf("art_in")) job.status = "art_in";
     applyMockup(job);
@@ -2471,6 +2590,7 @@ async function handleApi(req, res, url) {
         const converted = Date.now() + "-" + uid() + ".png";
         fs.writeFileSync(path.join(UPLOADS, converted), srcBuf);
         job.file_path = "/uploads/" + converted;
+        discardJobNobg(job);
       } catch (convErr) {
         return json(res, 400, { error: "Could not convert JPEG/WebP to PNG — export a PNG and drop that" });
       }
@@ -2480,6 +2600,7 @@ async function handleApi(req, res, url) {
       const name = Date.now() + "-" + uid() + ".png";
       fs.writeFileSync(path.join(UPLOADS, name), out);
       job.file_path = "/uploads/" + name;
+      discardJobNobg(job);
       clearTraceCache(job);
       // Greyscale / invert replace the raster preview — drop stale vector so UI shows the PNG
       const skipRevector = !!(body.greyscale || body.invert);
@@ -2628,6 +2749,7 @@ async function handleApi(req, res, url) {
         const converted = Date.now() + "-" + uid() + ".png";
         fs.writeFileSync(path.join(UPLOADS, converted), srcBuf);
         job.file_path = "/uploads/" + converted;
+        discardJobNobg(job);
       } catch (convErr) {
         return json(res, 400, { error: "Could not convert art to PNG for halftone — export a PNG and drop that" });
       }
@@ -2736,6 +2858,7 @@ async function handleApi(req, res, url) {
     try {
       const buf = await generateImage({ prompt: prompt, imageBuf: imageBuf, mime: mime });
       job.file_path = saveImaginePng(buf);
+      discardJobNobg(job);
       if (STATUSES.indexOf(job.status) < STATUSES.indexOf("art_in")) job.status = "art_in";
       applyMockup(job);
       event(db, job, "AI Generate"); save(db);
@@ -3825,9 +3948,26 @@ function serveStatic(req, res, url) {
     });
   }
   if (rel.indexOf("/uploads/") === 0) {
-    const file = path.join(UPLOADS, path.basename(rel));
-    if (!fs.existsSync(file)) return send(res, 404, "Not found");
-    const blocked = guardVectorUpload(req, path.basename(file)) || guardPaidRaster(req, path.basename(file));
+    const nested = /^\/uploads\/([a-f0-9]{32})\/([^/]+)$/.exec(rel);
+    const nestedName = nested ? path.basename(nested[2]) : "";
+    const nestedNobg = !!(nested && nestedName === nested[2] && /^(?:art-nobg\.png|.+-nobg\.png)$/i.test(nestedName));
+    let file;
+    let base;
+    if (nestedNobg) {
+      const root = uploadsRootReal();
+      const dir = path.resolve(root, nested[1]);
+      if (path.dirname(dir) !== root) return send(res, 403, "Forbidden");
+      base = nestedName;
+      file = path.join(dir, base);
+      let st;
+      try { st = fs.lstatSync(file); } catch (e) { st = null; }
+      if (!st || !st.isFile()) return send(res, 404, "Not found");
+    } else {
+      base = path.basename(rel);
+      file = path.join(UPLOADS, base);
+      if (!fs.existsSync(file)) return send(res, 404, "Not found");
+    }
+    const blocked = guardVectorUpload(req, base) || guardPaidRaster(req, base);
     if (blocked) {
       return send(res, blocked, blocked === 401 ? "Sign in required" : (blocked === 402 ? "Payment required" : "Forbidden"), {
         "Content-Type": "text/plain; charset=utf-8",
