@@ -193,6 +193,19 @@ function transparentPixels(pngBuf) {
   return { img, clear };
 }
 
+function jobRow(dir, id) {
+  const db = JSON.parse(fs.readFileSync(path.join(dir, "store.json"), "utf8"));
+  return db.jobs.find((j) => j.id === id);
+}
+
+function storedNobgPath(dir, job) {
+  const parts = String(job && job.nobg_png || "").replace(/\\/g, "/").split("/").filter(Boolean);
+  assert.deepStrictEqual(parts.slice(0, 2), ["uploads", job.id], "nobg left the job directory: " + (job && job.nobg_png));
+  assert.strictEqual(parts.length, 3, "nobg path " + (job && job.nobg_png));
+  assert.ok(/-nobg\.png$/i.test(parts[2]), "nobg filename " + parts[2]);
+  return path.join(dir, parts[0], parts[1], parts[2]);
+}
+
 
 const FORMATS = ["art.svg", "art.eps", "art.pdf", "art.dxf", "art.tiff", "art-dtf.tiff", "art-300dpi.png", "art-underbase.png", "art.png", "art-upscaled-300dpi.png", "art-nobg.png", "art-cutout.svg", "cut-contour.svg", "packet.json"];
 const EPS = "%!PS-Adobe-3.0 EPSF-3.0\n%%BoundingBox: 0 0 100 100\nnewpath 15 15 moveto 85 15 lineto 85 85 lineto 15 85 lineto closepath fill\n%%EOF\n";
@@ -288,10 +301,40 @@ function plantVector(dir, jobId, tag, extra) {
     assert.strictEqual(nobgA.status, 200, "nobg A " + nobgA.text.slice(0, 200));
     const cutA = transparentPixels(nobgA.buf);
     assert.ok(cutA.clear > 0, "nobg A left the sheet opaque");
+    const rowA = jobRow(s.dir, swap.id);
+    const fileA = storedNobgPath(s.dir, rowA);
+    assert.ok(fs.existsSync(fileA), "nobg A was not written");
+    assert.ok(fs.readFileSync(fileA).equals(nobgA.buf), "cached nobg bytes drifted");
     const againA = await req(port, "GET", "/api/export/" + swap.id + "/art-nobg.png", { headers: { Cookie: adminCk } });
     assert.ok(nobgA.buf.equals(againA.buf), "unchanged source should keep the cached nobg");
+    const rowA2 = jobRow(s.dir, swap.id);
+    assert.strictEqual(rowA2.nobg_png, rowA.nobg_png, "unchanged source rewrote the nobg file");
+    const ajFile = storedNobgPath(s.dir, jobRow(s.dir, aj.id));
+    const jobDir = path.dirname(fileA);
+    const staleCut = path.join(jobDir, "art-cutout.svg");
+    const staleExtra = path.join(jobDir, "extra-nobg.png");
+    const keepNote = path.join(jobDir, "keep-art.png");
+    fs.writeFileSync(staleCut, "<svg>old</svg>");
+    fs.writeFileSync(staleExtra, Buffer.from("old-nobg"));
+    fs.writeFileSync(keepNote, Buffer.from("keep"));
+    const decoy = path.join(s.dir, "uploads", "stranger-nobg.png");
+    const decoyCut = path.join(s.dir, "uploads", "art-cutout.svg");
+    fs.writeFileSync(decoy, Buffer.from("other"));
+    fs.writeFileSync(decoyCut, "<svg>other</svg>");
+    const outside = path.join(s.dir, "art-nobg.png");
+    fs.writeFileSync(outside, Buffer.from("outside"));
+    const srcA = path.join(s.dir, "uploads", path.basename(swap.file_path));
     const replaced = await replaceArtwork(port, adminCk, swap.id, markedPng(48, [210, 30, 30]));
     assert.notStrictEqual(path.basename(replaced.file_path), path.basename(swap.file_path));
+    assert.ok(!fs.existsSync(fileA), "old nobg file still in the job directory");
+    assert.ok(!fs.existsSync(staleCut), "old cutout svg still in the job directory");
+    assert.ok(!fs.existsSync(staleExtra), "other derived nobg file still in the job directory");
+    assert.ok(fs.existsSync(keepNote), "non-derived file in the job directory was deleted");
+    assert.ok(fs.existsSync(ajFile), "another job's nobg was deleted");
+    assert.ok(fs.existsSync(decoy), "unrelated nobg in uploads was deleted");
+    assert.ok(fs.existsSync(decoyCut), "unrelated cutout in uploads was deleted");
+    assert.ok(fs.existsSync(outside), "file outside uploads was deleted");
+    assert.ok(fs.existsSync(srcA), "source art was deleted");
     const nobgB = await req(port, "GET", "/api/export/" + swap.id + "/art-nobg.png", { headers: { Cookie: adminCk } });
     assert.strictEqual(nobgB.status, 200, "nobg B " + nobgB.text.slice(0, 200));
     assert.ok(!nobgA.buf.equals(nobgB.buf), "replaced art still served the previous nobg");
@@ -305,6 +348,23 @@ function plantVector(dir, jobId, tag, extra) {
     assert.ok(cutB.text.indexOf('width="' + cutBimg.img.width + '"') !== -1, "cutout svg kept the previous width");
     assert.ok(cutB.text.indexOf(nobgB.buf.toString("base64")) !== -1, "cutout svg did not embed the new nobg");
     assert.ok(cutB.text.indexOf(nobgA.buf.toString("base64")) === -1, "cutout svg still embedded the previous nobg");
+    const fileB = storedNobgPath(s.dir, jobRow(s.dir, swap.id));
+    assert.ok(fs.existsSync(fileB), "new nobg file missing");
+    assert.notStrictEqual(fileB, fileA, "replaced art reused the previous nobg file");
+    assert.ok(!fs.existsSync(fileA), "old nobg file came back");
+    assert.ok(fs.readFileSync(fileB).equals(nobgB.buf), "new nobg file does not match the download");
+    const derivedLeft = fs.readdirSync(jobDir).filter((n) => /nobg|cutout/i.test(n)).sort();
+    assert.deepStrictEqual(derivedLeft, [path.basename(fileB)], "stale derived no-bg files remained: " + derivedLeft.join(","));
+    const rawStored = await req(port, "GET", jobRow(s.dir, swap.id).nobg_png, { headers: { Cookie: adminCk } });
+    assert.strictEqual(rawStored.status, 200, "stored nobg " + rawStored.status);
+    assert.ok(rawStored.buf.equals(nobgB.buf), "stored nobg bytes drifted");
+    const anonStored = await req(port, "GET", jobRow(s.dir, swap.id).nobg_png);
+    assert.strictEqual(anonStored.status, 401, "stored nobg was public");
+    assert.ok(fs.existsSync(keepNote), "non-derived file was deleted after the new nobg");
+    assert.ok(fs.existsSync(ajFile), "another job's nobg was deleted after the new nobg");
+    assert.ok(fs.existsSync(decoy) && fs.existsSync(decoyCut), "unrelated uploads were deleted after the new nobg");
+    assert.ok(fs.existsSync(outside), "file outside uploads was deleted after the new nobg");
+    assert.ok(fs.existsSync(srcA), "source art was deleted after the new nobg");
 
     // Halftone art: a vectorize unlock is not enough; needs the halftones unlock.
     const ht = await uploadJob(port, shop.cookie, "HT gate", tinyPng());
