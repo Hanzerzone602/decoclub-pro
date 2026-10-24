@@ -159,19 +159,41 @@
     <p class="footer-legal">DecoClub Pro. Vector and halftone files for print shops.</p>
   </footer>
   <script>
+    (function () {
+      function applyHomeSession(me) {
+        var box = document.getElementById("toolLauncher");
+        var signedIn = !!(me && me.user);
+        if (signedIn) {
+          if (!box) return false;
+          box.hidden = false;
+          box.removeAttribute("hidden");
+          document.body.classList.add("is-signed-in");
+          var login = document.querySelector(".nav-login");
+          if (login) { login.textContent = "Studio"; login.setAttribute("href", "/app"); }
+          var start = document.querySelector(".nav .btn");
+          if (start) { start.textContent = "All Tools"; start.setAttribute("href", "/app"); }
+          return true;
+        }
+        document.body.classList.remove("is-signed-in");
+        if (box) box.hidden = true;
+        return true;
+      }
+      function loadHomeSession() {
+        fetch("/api/me", { credentials: "same-origin", cache: "no-store" }).then(function (r) { return r.json(); }).then(function (me) {
+          if (applyHomeSession(me)) return;
+          document.addEventListener("DOMContentLoaded", function () { applyHomeSession(me); });
+        }).catch(function () {});
+      }
+      if (document.readyState === "loading") document.addEventListener("DOMContentLoaded", loadHomeSession);
+      else loadHomeSession();
+      window.addEventListener("pageshow", function (ev) { if (ev.persisted) loadHomeSession(); });
+    })();
     fetch("/api/config").then(r => r.json()).then(c => {
-      if (c.demo && c.seed) document.getElementById("demoHint").textContent = "Seed: " + c.seed.owner + " and " + c.seed.client + " / " + c.seed.password;
+      if (c.demo && c.seed) {
+        var hint = document.getElementById("demoHint");
+        if (hint) hint.textContent = "Seed: " + c.seed.owner + " and " + c.seed.client + " / " + c.seed.password;
+      }
     }).catch(() => {});
-    fetch("/api/me", { credentials: "same-origin" }).then(function (r) { return r.json(); }).then(function (me) {
-      if (!me || !me.user) return;
-      document.body.classList.add("is-signed-in");
-      var box = document.getElementById("toolLauncher");
-      if (box) box.hidden = false;
-      var login = document.querySelector(".nav-login");
-      if (login) { login.textContent = "Studio"; login.setAttribute("href", "/app"); }
-      var start = document.querySelector(".nav .btn");
-      if (start) { start.textContent = "All Tools"; start.setAttribute("href", "/app"); }
-    }).catch(function () {});
   </script>
 </body>
 </html>

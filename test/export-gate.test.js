@@ -244,13 +244,49 @@ function plantVector(dir, jobId, tag, extra) {
       assert.strictEqual(r.status, 402, "upload-only " + f + " -> " + r.status);
     }
     plantVector(s.dir, job.id, "101");
+    const namedExport = {
+      "art-nobg.png": "Remove Background",
+      "art-cutout.svg": "Remove Background",
+      "art-upscaled-300dpi.png": "300 DPI Upscaler",
+    };
     for (const f of FORMATS) {
       const r = await req(port, "GET", "/api/export/" + job.id + "/" + f, { headers: { Cookie: shop.cookie } });
       assert.strictEqual(r.status, 402, "unpaid " + f + " -> " + r.status);
       if (f === "packet.json") continue; // already behind the paid-packet gate
-      assert.strictEqual(r.json.error, vzMsg, "same message as vectorize for " + f);
+      if (namedExport[f]) {
+        assert.ok(r.json.error.indexOf(namedExport[f]) !== -1, f + " message: " + r.json.error);
+        assert.ok(r.json.error.indexOf("Vectorize needs") === -1, f + " still names Vectorize: " + r.json.error);
+      } else {
+        assert.strictEqual(r.json.error, vzMsg, "same message as vectorize for " + f);
+      }
       assert.strictEqual(r.json.code, "vector_credits_required");
+      assert.strictEqual(r.json.service, "vectorize");
+      assert.strictEqual(r.json.buy.single.product, "vector_single");
+      assert.strictEqual(r.json.buy.single.cents, 300);
+      assert.strictEqual(r.json.buy.pack10.cents, 2000);
     }
+    const upDenied = await req(port, "POST", "/api/jobs/" + job.id + "/upscale", {
+      headers: { Cookie: shop.cookie, "Content-Type": "application/json" },
+      body: JSON.stringify({ width_in: 10 }),
+    });
+    assert.strictEqual(upDenied.status, 402, "upscale unpaid " + upDenied.text.slice(0, 180));
+    assert.ok(upDenied.json.error.indexOf("300 DPI Upscaler") !== -1, upDenied.json.error);
+    assert.ok(upDenied.json.error.indexOf("Vectorize needs") === -1, upDenied.json.error);
+    assert.strictEqual(upDenied.json.code, "vector_credits_required");
+    assert.strictEqual(upDenied.json.service, "vectorize");
+    assert.strictEqual(upDenied.json.buy.single.product, "vector_single");
+    assert.strictEqual(upDenied.json.buy.single.cents, 300);
+    const htMsg = await req(port, "POST", "/api/jobs/" + job.id + "/halftone", {
+      headers: { Cookie: shop.cookie, "Content-Type": "application/json" },
+      body: JSON.stringify({ style: "classic-round" }),
+    });
+    assert.strictEqual(htMsg.status, 402, "halftone unpaid " + htMsg.text.slice(0, 180));
+    assert.ok(htMsg.json.error.indexOf("Halftones") !== -1, htMsg.json.error);
+    assert.ok(htMsg.json.error.indexOf("Vectorize needs") === -1, htMsg.json.error);
+    assert.strictEqual(htMsg.json.code, "halftone_credits_required");
+    assert.strictEqual(htMsg.json.service, "halftones");
+    assert.strictEqual(htMsg.json.buy.single.product, "halftone_single");
+    assert.strictEqual(htMsg.json.buy.single.cents, 300);
     const pk = await req(port, "GET", "/api/export/" + job.id, { headers: { Cookie: shop.cookie } });
     assert.strictEqual(pk.status, 402, "unpaid packet");
 
@@ -370,10 +406,23 @@ function plantVector(dir, jobId, tag, extra) {
     const ht = await uploadJob(port, shop.cookie, "HT gate", tinyPng());
     plantVector(s.dir, ht.id, "103", { source: "vector-halftone" });
     editStore(s.dir, (db) => { db.jobs.find((j) => j.id === ht.id).unlocks = { vectorize: true }; });
-    for (const f of ["art.svg", "art.pdf", "art-underbase.png", "art-upscaled-300dpi.png", "art-nobg.png", "art-cutout.svg"]) {
+    const htNamed = {
+      "art.svg": "Halftones",
+      "art.pdf": "Halftones",
+      "art-underbase.png": "Halftones",
+      "art-upscaled-300dpi.png": "300 DPI Upscaler",
+      "art-nobg.png": "Remove Background",
+      "art-cutout.svg": "Remove Background",
+    };
+    for (const f of Object.keys(htNamed)) {
       const r = await req(port, "GET", "/api/export/" + ht.id + "/" + f, { headers: { Cookie: shop.cookie } });
       assert.strictEqual(r.status, 402, "halftone unpaid " + f);
       assert.strictEqual(r.json.code, "halftone_credits_required");
+      assert.strictEqual(r.json.service, "halftones");
+      assert.strictEqual(r.json.buy.single.product, "halftone_single");
+      assert.strictEqual(r.json.buy.single.cents, 300);
+      assert.ok(r.json.error.indexOf(htNamed[f]) !== -1, f + " message: " + r.json.error);
+      if (htNamed[f] !== "Halftones") assert.ok(r.json.error.indexOf("Halftones Apply") === -1, f + " " + r.json.error);
     }
     editStore(s.dir, (db) => { db.jobs.find((j) => j.id === ht.id).unlocks = { halftones: true }; });
     const htOk = await req(port, "GET", "/api/export/" + ht.id + "/art.svg", { headers: { Cookie: shop.cookie } });

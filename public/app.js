@@ -1,4 +1,9 @@
-const main = document.getElementById("main");
+let main = null;
+function bindStudioRoot() {
+  const el = document.getElementById("main");
+  if (el) main = el;
+  return main;
+}
 let user = null, shop = null, view = "make", currentJob = null, station = "art", makeMethod = "apparel";
 let cfg = { statuses: [], methods: [], blanks: [], billing: false, demo: false };
 const $ = (s, r = document) => r.querySelector(s);
@@ -307,8 +312,10 @@ function nav() {
     if (b.tagName === "A") return;
     b.onclick = () => { view = b.dataset.view; if (view !== "job") currentJob = null; nav(); render(); };
   });
-  $("#navClients").style.display = "none";
-  $("#navJob").style.display = currentJob ? "block" : "none";
+  const clientsNav = $("#navClients");
+  if (clientsNav) clientsNav.style.display = "none";
+  const jobNav = $("#navJob");
+  if (jobNav) jobNav.style.display = currentJob ? "block" : "none";
   const office = $("#navOffice");
   if (office) office.style.display = user && user.role === "admin" ? "block" : "none";
 }
@@ -363,8 +370,10 @@ async function boot() {
     }
   }
   if (shop) {
-    $("#sideName").textContent = shop.name;
-    if (shop.logo_path) $("#sideLogo").src = shop.logo_path;
+    const sideName = $("#sideName");
+    const sideLogo = $("#sideLogo");
+    if (sideName) sideName.textContent = shop.name;
+    if (shop.logo_path && sideLogo) sideLogo.src = shop.logo_path;
   }
   if (user && cfg && Array.isArray(cfg.adminModules)) await loadAdminScripts(cfg.adminModules);
   const allToolsBtn = document.getElementById("allTools");
@@ -374,7 +383,7 @@ async function boot() {
   consumeStartTool();
   if (!canFloor()) view = "board";
   nav();
-  render();
+  await render();
 }
 
 function consumeStartMethod() {
@@ -631,6 +640,7 @@ function processGridHtml(asButtons) {
 }
 
 async function render() {
+  if (!bindStudioRoot()) return;
   syncSuiteChrome();
   if (view === "job" && currentJob) return renderJob(currentJob);
   if (view === "make") return renderMake();
@@ -2841,4 +2851,18 @@ window.DecoStudio = {
   registerSuiteTool: function (tool) { if (tool && tool.id) this.suiteTools.push(tool); },
 };
 
-boot().catch((err) => { main.innerHTML = `<p class="notice">${escapeHtml(err.message)}</p>`; });
+function startStudio() {
+  bindStudioRoot();
+  boot().catch((err) => {
+    bindStudioRoot();
+    if (!main) return;
+    main.innerHTML = `<p class="notice">${escapeHtml((err && err.message) || "Could not open the studio")}</p>`;
+  });
+}
+if (document.readyState === "loading") document.addEventListener("DOMContentLoaded", startStudio);
+else startStudio();
+window.addEventListener("pageshow", function (ev) {
+  if (!ev.persisted) return;
+  bindStudioRoot();
+  if (user && main && !String(main.textContent || "").trim()) render();
+});
