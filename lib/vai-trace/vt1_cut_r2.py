@@ -1,4 +1,4 @@
-#!/usr/bin/env python3
+#!/workspace/vtracer-bakeoff/bakeoff2/venv311_vt1/bin/python
 """bake-off-2 round-12 candidate (vt1_cut_r12):
 - <= 700 px: locks all r11c passing outputs via _ok(ev) and adds 3 strictly-gated fallbacks:
   (1) Tiger-class near-miss dE95 (edges pass, 20.0 < dE95 <= 22.0): re-wrap svg10_raw with 0.25 px stroke;
@@ -7,13 +7,13 @@
 - 1100 < max side <= 2000 px (>= 2 Mpx): silhouette-backed trace_r8_sil (72 paths / 72 colours, 0 gaps).
 - all other > 700 px (including 994 and 2600 Carpenters): r10/r2 cutout + greedy Lab fill-merging
   (dE <= 6.0 -> 39 colours on 994px, 122 colours on 2600px, 0 gaps)."""
-import sys, os, io, re, subprocess, tempfile, importlib.util, importlib.machinery as _im, numpy as np, cv2, vtracer
+import sys, os, io, re, time, subprocess, tempfile, importlib.util, importlib.machinery as _im, numpy as np, cv2, vtracer
 from collections import Counter
 from PIL import Image
 from scipy import ndimage as ndi
 Image.MAX_IMAGE_PIXELS = None
-os.environ["PATH"] = os.environ.get("PATH", "") + ":" + os.path.expanduser("~/.local/bin")
-os.environ["LD_LIBRARY_PATH"] = os.environ.get("LD_LIBRARY_PATH", "") + ":" + os.path.expanduser("~/.local/lib")
+os.environ["PATH"] = "/home/box/.local/bin:/workspace/egg-qa/r2plumb/pt/usr/bin:" + os.environ.get("PATH", "")
+os.environ["LD_LIBRARY_PATH"] = "/home/box/.local/lib:/workspace/egg-qa/r2plumb/pt/usr/lib/x86_64-linux-gnu:" + os.environ.get("LD_LIBRARY_PATH", "")
 
 GATE = 700; MAXSIDE = 1600; RAMP = (700, 1000); RAMPMAX = 0.7; W_SMALL = 0.5; W_BIG = 0.3
 
@@ -64,6 +64,31 @@ def snapfill(svg, a, thin=0.5):
     for i in range(1, n[0] + 1):
         if ins[i] < thin * tot[i]: continue
         if cuts[i + 1] - cuts[i] >= 3: col[i] = np.median(A[cuts[i]:cuts[i + 1]], 0).round().astype(int)
+    k = [0]
+    def rep(m):
+        k[0] += 1; c = col.get(k[0]); return m.group(0) if c is None else FILL.sub('fill="#%02X%02X%02X"' % tuple(c), m.group(0), count=1)
+    return PATH.sub(rep, svg)
+
+def snapfill_p95(svg, a, thr_de=17.5, pen=20.0):
+    H, W = a.shape[:2]; n = [0]
+    def lab_el(m): n[0] += 1; return FILL.sub('fill="#%06x"' % n[0], m.group(0), count=1)
+    t = PATH.sub(lab_el, svg); t = re.sub(r'<svg\b', '<svg shape-rendering="crispEdges"', t, count=1)
+    with tempfile.TemporaryDirectory() as d:
+        open(d + '/l.svg', 'w').write(t); subprocess.run(['rsvg-convert', '-w', str(W), '-h', str(H), '-o', d + '/l.png', d + '/l.svg'], check=True)
+        r = np.asarray(Image.open(d + '/l.png').convert('RGBA'))
+    lb = (r[..., 0].astype(np.int64) << 16) | (r[..., 1].astype(np.int64) << 8) | r[..., 2]; ok = (r[..., 3] == 255) & (a[..., 3] > 127)
+    Lg = lab(a[..., :3]); flat = lb[ok]; A = a[..., :3][ok]; AL = Lg[ok]
+    o = np.argsort(flat, kind='stable'); fs = flat[o]; A = A[o]; AL = AL[o]
+    cuts = np.searchsorted(fs, np.arange(n[0] + 2))
+    fills = [None] + [np.array([int(h[j:j + 2], 16) for j in (1, 3, 5)], float) for h in (FILL.search(m.group(0)).group(0)[6:13] for m in PATH.finditer(svg))]
+    col = {}
+    for i in range(1, n[0] + 1):
+        if cuts[i + 1] - cuts[i] < 1: continue
+        P = A[cuts[i]:cuts[i + 1]]; PL = AL[cuts[i]:cuts[i + 1]]; oc = fills[i]; md = np.median(P, 0); mn = P.mean(0)
+        cs = [oc, md, mn] + [w * x + (1 - w) * oc for w in (0.25, 0.5, 0.75) for x in (md, mn)]
+        cu = np.clip(np.round(cs), 0, 255).astype(np.uint8); cl = lab(cu.reshape(-1, 1, 3)).reshape(-1, 3)
+        de = np.sqrt(((cl[:, None, :] - PL[None, :, :]) ** 2).sum(-1))
+        col[i] = cu[int(np.argmin(de.mean(1) + pen * (de > thr_de).mean(1)))]
     k = [0]
     def rep(m):
         k[0] += 1; c = col.get(k[0]); return m.group(0) if c is None else FILL.sub('fill="#%02X%02X%02X"' % tuple(c), m.group(0), count=1)
@@ -128,7 +153,7 @@ _R11 = None
 def trace_r8_sil(path):
     global _R11
     if _R11 is None:
-        _l = _im.SourceFileLoader('r11', os.path.join(os.path.dirname(os.path.abspath(__file__)), 'engine_r3.py'))
+        _l = _im.SourceFileLoader('r11', '/workspace/vtracer-bakeoff/fork/engine.py.r11cand-6bc6eb5e')
         spec = importlib.util.spec_from_loader('r11', _l)
         m = importlib.util.module_from_spec(spec)
         sys.modules['r11'] = m
@@ -215,8 +240,11 @@ def _ok(ev):
     return (ev['seams'] <= 500 and ev['stair_pct'] <= 20.0 and ev['stair_ratio'] <= 0.90
             and ev['fringe_ppm'] <= 50.0 and ev['dspecks'] <= 0 and ev['dE'] <= 4.65 and ev['dE95'] <= 20.0)
 
+MS_BUDGET = 7.0
+MS_BUDGET_S4 = 9.5
+
 def convert(i):
-    src = Image.open(i); a = np.array(src.convert('RGBA')); H, W = a.shape[:2]
+    t0 = time.time(); src = Image.open(i); a = np.array(src.convert('RGBA')); H, W = a.shape[:2]
     if max(H, W) <= GATE:
         srgb = src.convert('RGB')
         svg_r2 = ungroup(vtracer.convert_pixels(a.tobytes(), W, H, vtracer.Config(hierarchical='cutout')))
@@ -246,7 +274,15 @@ def convert(i):
         s4 = gapfill_r1(ungroup(vtracer.convert_pixels(ab4.tobytes(), W, H, vtracer.Config(hierarchical='cutout', filter_speckle=5, simplify=0.35, optimize=2))), 0.35)
         ev4 = _small_eval(srgb, a, s4, check_edges=True)
         if _ok(ev4):
+            if time.time() - t0 < MS_BUDGET_S4:  # r13: challenge s4 with the mean-shift trace
+                s_ms = _ms_trace(a, W, H); evm = _small_eval(srgb, a, s_ms, check_edges=True)
+                if _ok(evm) and evm['stair_pct'] <= ev4['stair_pct'] - 3.0 and evm['dE'] <= ev4['dE']:
+                    return s_ms
             return s4
+        if time.time() - t0 < MS_BUDGET:  # r13: mean-shift trace tried before s2x, kept only if clean and clearly smoother
+            s_ms = _ms_trace(a, W, H); evm = _small_eval(srgb, a, s_ms, check_edges=True)
+            if _ok(evm) and evm['stair_pct'] <= min(ev4['stair_pct'], ev10['stair_pct']) - 3.0 and evm['dE'] <= min(ev4['dE'], ev10['dE']):
+                return s_ms
         a2 = np.array(Image.fromarray(ab4).resize((W * 2, H * 2), Image.LANCZOS))
         svg2x = half(ungroup(vtracer.convert_pixels(a2.tobytes(), W * 2, H * 2, vtracer.Config(hierarchical='cutout', filter_speckle=10, simplify=1.1, optimize=2))), W, H)
         s2x = gapfill_r1(svg2x, 0.28)
@@ -268,6 +304,11 @@ def convert(i):
     if s != 1.0:
         svg = re.sub(r'<svg([^>]*)width="\d+" height="\d+">', lambda m: f'<svg{m.group(1)}width="{W}" height="{H}" viewBox="0 0 {a.shape[1]} {a.shape[0]}">', svg, count=1)
     return svg
+
+def _ms_trace(a, W, H, sp=5):
+    ms = a.copy(); ms[..., :3] = cv2.pyrMeanShiftFiltering(np.ascontiguousarray(a[..., :3]), sp, 24)
+    svg = ungroup(vtracer.convert_pixels(ms.tobytes(), W, H, vtracer.Config(hierarchical='cutout', filter_speckle=6, simplify=0.5, optimize=2, corner_threshold=90, length_threshold=6.0)))
+    return gapfill_r1(snapfill_p95(svg, a), 0.3)
 
 def main(a):
     if '--input' in a: i, o = a[a.index('--input') + 1], a[a.index('--output') + 1]

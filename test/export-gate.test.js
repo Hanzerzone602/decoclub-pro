@@ -1,6 +1,6 @@
 "use strict";
 // Exports (svg/eps/pdf/dxf/tiff/png/underbase/packet) need a paid or free-image unlock; admin exempt.
-const { encodePng, makeRgba } = require("../lib/png");
+const { encodePng, decodePng, makeRgba } = require("../lib/png");
 const assert = require("assert");
 const http = require("http");
 const { spawn } = require("child_process");
@@ -160,7 +160,7 @@ async function uploadJob(port, cookie, title, png) {
 }
 
 
-const FORMATS = ["art.svg", "art.eps", "art.pdf", "art.dxf", "art.tiff", "art-dtf.tiff", "art-300dpi.png", "art-underbase.png", "art.png", "cut-contour.svg", "packet.json"];
+const FORMATS = ["art.svg", "art.eps", "art.pdf", "art.dxf", "art.tiff", "art-dtf.tiff", "art-300dpi.png", "art-underbase.png", "art.png", "art-upscaled-300dpi.png", "art-nobg.png", "art-cutout.svg", "cut-contour.svg", "packet.json"];
 const EPS = "%!PS-Adobe-3.0 EPSF-3.0\n%%BoundingBox: 0 0 100 100\nnewpath 15 15 moveto 85 15 lineto 85 85 lineto 15 85 lineto closepath fill\n%%EOF\n";
 
 function plantVector(dir, jobId, tag, extra) {
@@ -225,12 +225,34 @@ function plantVector(dir, jobId, tag, extra) {
       const r = await req(port, "GET", "/api/export/" + aj.id + "/" + f, { headers: { Cookie: adminCk } });
       assert.strictEqual(r.status, 200, "admin " + f + " -> " + r.status + " " + r.text.slice(0, 200));
     }
+    const up = await req(port, "GET", "/api/export/" + aj.id + "/art-upscaled-300dpi.png?width_in=2", { headers: { Cookie: adminCk } });
+    assert.strictEqual(up.status, 200, "admin upscale " + up.text.slice(0, 200));
+    let phys = null;
+    for (let o = 8; o + 12 <= up.buf.length;) {
+      const len = up.buf.readUInt32BE(o);
+      const typ = up.buf.toString("ascii", o + 4, o + 8);
+      if (typ === "pHYs") phys = [up.buf.readUInt32BE(o + 8), up.buf.readUInt32BE(o + 12), up.buf[o + 16]];
+      o += 12 + len;
+      if (typ === "IEND") break;
+    }
+    assert.deepStrictEqual(phys, [11811, 11811, 1]);
+    const nobg = await req(port, "GET", "/api/export/" + aj.id + "/art-nobg.png", { headers: { Cookie: adminCk } });
+    assert.strictEqual(nobg.status, 200, "admin nobg " + nobg.text.slice(0, 200));
+    const cutImg = decodePng(nobg.buf);
+    let clear = 0;
+    for (let i = 3; i < cutImg.rgba.length; i += 4) if (cutImg.rgba[i] < 16) clear++;
+    assert.ok(clear > 0, "background removal left the sheet opaque");
+    const raw = fs.readFileSync(path.join(s.dir, "uploads", path.basename(aj.file_path)));
+    assert.ok(!nobg.buf.equals(raw), "art-nobg.png matched the original upload");
+    const cut = await req(port, "GET", "/api/export/" + aj.id + "/art-cutout.svg", { headers: { Cookie: adminCk } });
+    assert.strictEqual(cut.status, 200, "admin cutout " + cut.text.slice(0, 160));
+    assert.ok(cut.text.indexOf("<svg") !== -1 && cut.text.indexOf("base64") !== -1);
 
     // Halftone art: a vectorize unlock is not enough; needs the halftones unlock.
     const ht = await uploadJob(port, shop.cookie, "HT gate", tinyPng());
     plantVector(s.dir, ht.id, "103", { source: "vector-halftone" });
     editStore(s.dir, (db) => { db.jobs.find((j) => j.id === ht.id).unlocks = { vectorize: true }; });
-    for (const f of ["art.svg", "art.pdf", "art-underbase.png"]) {
+    for (const f of ["art.svg", "art.pdf", "art-underbase.png", "art-upscaled-300dpi.png", "art-nobg.png", "art-cutout.svg"]) {
       const r = await req(port, "GET", "/api/export/" + ht.id + "/" + f, { headers: { Cookie: shop.cookie } });
       assert.strictEqual(r.status, 402, "halftone unpaid " + f);
       assert.strictEqual(r.json.code, "halftone_credits_required");

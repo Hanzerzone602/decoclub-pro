@@ -3,6 +3,10 @@
 body.home {
   background: var(--bg);
 }
+body.home.is-signed-in .announce,
+body.home.is-signed-in .home-market { display: none; }
+.home .tool-launcher { max-width: 1180px; margin: 0 auto; padding: 36px 7vw 72px; }
+.home .tool-launcher h1 { margin: 8px 0 10px; max-width: 16ch; }
 
 .home .announce {
   background: var(--ink);

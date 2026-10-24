@@ -24,7 +24,7 @@ def size_r2(svg, inches):
     return svg[:m.start()] + new + svg[m.end():]
 
 def try_r2(inp, out, inches):
-    """Round-2 tracer (vt1_cut_r2 = cand-bedf48d7) in its own venv, behind VECTORIZE_R2=1 (default-slider auto mode).
+    """Round-2 tracer (vt1_cut_r2.py = r13 cand-7f26129b) in its own venv, behind VECTORIZE_R2=1 (default-slider auto mode).
     Returns True on success; any error, timeout or empty SVG returns False (caller falls back to r11)."""
     py = os.environ.get("VECTORIZE_R2_PYTHON") or "/venv-r2/bin/python3"
     tmp = out + ".r2tmp"
@@ -47,7 +47,7 @@ def try_r2(inp, out, inches):
         return False
     dt = time.perf_counter() - t0
     log("engine=r2 %.2fs" % dt)
-    sys.stdout.write(json.dumps({"mode": "r2", "route": "r2-cut", "engine": "r12-6d7aacec", "seconds": round(dt, 2)}) + "\n")
+    sys.stdout.write(json.dumps({"mode": "r2", "route": "r2-cut", "engine": "r13-7f26129b", "seconds": round(dt, 2)}) + "\n")
     return True
 
 def _engine_ver():

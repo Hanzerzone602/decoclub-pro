@@ -50,11 +50,12 @@ async function waitHealth(port) {
   throw new Error("server did not start");
 }
 
+const TEST_ADMIN_PASSWORD = "ht-admin-pass";
 function startServer(env) {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), "dcp-htsvc-"));
   const child = spawn(process.execPath, ["server.js"], {
     cwd: path.join(__dirname, ".."),
-    env: Object.assign({}, process.env, { DATA_DIR: dir, HOST: "127.0.0.1", ALLOW_DEMO: "1", NODE_ENV: "development" }, env),
+    env: Object.assign({}, process.env, { DATA_DIR: dir, HOST: "127.0.0.1", ALLOW_DEMO: "1", NODE_ENV: "development", ADMIN_PASSWORD: TEST_ADMIN_PASSWORD }, env),
     stdio: ["ignore", "pipe", "pipe"],
   });
   return { child, dir };
@@ -128,7 +129,7 @@ function stop(child) {
     // create a shop user on trial with 0 credits via signup-like store edit:
     // use admin to grant credits + set plan
     const adminLogin = await req(port, "POST", "/api/login", {
-      body: JSON.stringify({ email: "davidhanes2@yahoo.com", password: process.env.ADMIN_PASSWORD || "DecoClub!" }),
+      body: JSON.stringify({ email: "davidhanes2@yahoo.com", password: TEST_ADMIN_PASSWORD }),
     });
     // admin password may differ — try from ensureAdmin default
     let adminCk = cookieFrom(adminLogin);
